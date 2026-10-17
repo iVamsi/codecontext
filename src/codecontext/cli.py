@@ -11,6 +11,9 @@ from typing import Any
 from codecontext import __version__
 from codecontext.errors import CodeContextError
 from codecontext.graph import (
+    DetectChangesRequest,
+    GetArchitectureRequest,
+    GetCodeSnippetRequest,
     QueryGraphRequest,
     SearchGraphRequest,
     TracePathRequest,
@@ -263,6 +266,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_qg.add_argument("query")
     p_qg.add_argument("--limit", type=int, default=50)
 
+    # get-architecture
+    p_arch = subparsers.add_parser("get-architecture", help="Get module/package clusters, cohesion, and hotspots.")
+    p_arch.add_argument("--max-clusters", dest="max_clusters", type=int, default=50)
+
+    # detect-changes
+    p_dc = subparsers.add_parser("detect-changes", help="Detect changed symbols and trace inbound caller impact.")
+    p_dc.add_argument("--since", default=None)
+    p_dc.add_argument("--depth", type=int, default=2)
+    p_dc.add_argument("--limit", type=int, default=50)
+    p_dc.add_argument("--workspace", type=Path, default=None)
+
+    # get-code-snippet
+    p_gcs = subparsers.add_parser("get-code-snippet", help="Read symbol source code by qualified_name.")
+    p_gcs.add_argument("qualified_name")
+    p_gcs.add_argument("--file-path", dest="file_path", default=None)
+    p_gcs.add_argument("--include-neighbors", dest="include_neighbors", action="store_true")
+
     return parser
 
 
@@ -477,6 +497,37 @@ def main(argv: list[str] | None = None) -> int:
             )
             with Memory.open(store_path, read_only=True) as mem:
                 res = mem.query_graph(qg_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "get-architecture":
+            arch_req = GetArchitectureRequest(max_clusters=args.max_clusters)
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.get_architecture(arch_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "detect-changes":
+            dc_req = DetectChangesRequest(
+                since=args.since,
+                depth=args.depth,
+                limit=args.limit,
+            )
+            with Memory.open(store_path, read_only=True) as mem:
+                if args.workspace is not None:
+                    mem.configure_workspace(args.workspace)
+                res = mem.detect_changes(dc_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "get-code-snippet":
+            gcs_req = GetCodeSnippetRequest(
+                qualified_name=args.qualified_name,
+                file_path=args.file_path,
+                include_neighbors=bool(args.include_neighbors),
+            )
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.get_code_snippet(gcs_req)
             _emit_json(res, pretty=pretty)
             return 0
 

@@ -5,7 +5,9 @@ Local project memory for coding agents. CodeContext preserves a repository's cod
 ## Features and scope
 
 - **Three surfaces over one library:** Python SDK (`codecontext.Memory`), CLI (`codecontext` / `python -m codecontext`), and a read-only stdio MCP server (`search`, `get`, `context` tools + `codecontext://status` resource).
-- **Blob-owned syntax extraction:** Tree-sitter syntax extraction for Python, JavaScript, TypeScript, JSX, and TSX. Unchanged blobs are parsed once per `(blob_oid, language, extractor_fingerprint)` rather than duplicated across commits.
+- **Blob-owned syntax extraction (11 AST languages + Gradle DSL):** Tree-sitter syntax extraction for Python, JavaScript, TypeScript, JSX, TSX, Kotlin, Gradle Kotlin DSL (`.gradle.kts`), Java, Go, Rust, C, and C++. Unchanged blobs are parsed once per `(blob_oid, language, extractor_fingerprint)` rather than duplicated across commits.
+- **Structural code graph & Cypher (`--include-graph-tools`):** Import- and receiver-type-aware call resolution across files, exposed through `search_graph`, `trace_path`, `query_graph` (strict Cypher with numeric comparisons, `OR`/`AND`/`NOT`, variable-length paths `*1..3`, `COUNT(...)`, and `ORDER BY`), `get_architecture`, `detect_changes`, and `get_code_snippet`.
+- **GitHub & GitLab history:** Automatic remote detection and ingestion for both GitHub Issues/PRs/Reviews and GitLab Issues/Merge Requests/Discussions.
 - **Owned Git and SQLite/FTS5 store:** Preserves raw Git objects in an owned bare repository (`repository.git/`) and metadata, source versions, claims, summaries, and lexical FTS5 indexes in `memory.sqlite3`.
 - **Conservative rationale and applicability tracking:** Keeps `support`, `lifecycle`, `mapping`, and `applicability` independent. Historical rationale defaults to `historical_only` and is never upgraded to `corroborated` merely because code bytes are unchanged.
 - **Read-only query guarantee:** `search`, `get`, `context`, and `status` never contact GitHub, invoke a model, run a parser, run migrations, or perform durable writes.

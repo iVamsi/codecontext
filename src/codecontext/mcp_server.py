@@ -13,6 +13,12 @@ from mcp.types import ToolAnnotations
 from codecontext import __version__
 from codecontext.errors import CodeContextError
 from codecontext.graph import (
+    DetectChangesRequest,
+    DetectChangesResult,
+    GetArchitectureRequest,
+    GetArchitectureResult,
+    GetCodeSnippetRequest,
+    GetCodeSnippetResult,
     QueryGraphRequest,
     QueryGraphResult,
     SearchGraphRequest,
@@ -361,6 +367,75 @@ def create_mcp_server(
                     sanitized = CodeContextError(
                         code="IO_ERROR",
                         message="Internal error during query_graph.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+        @server.tool(
+            name="get_architecture",
+            description="Get high-level architecture overview: packages/modules, cohesion scores, inter-module call dependencies, language breakdown, and top degree hotspots.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def get_architecture(
+            request: GetArchitectureRequest,
+            ctx: Context,
+        ) -> GetArchitectureResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.get_architecture, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during get_architecture.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+        @server.tool(
+            name="detect_changes",
+            description="Detect code changes (since a Git ref or in the workspace) and trace their inbound caller impact in the code graph.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def detect_changes(
+            request: DetectChangesRequest,
+            ctx: Context,
+        ) -> DetectChangesResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.detect_changes, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during detect_changes.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+        @server.tool(
+            name="get_code_snippet",
+            description="Read exact source code for a function, method, or class by qualified_name (or short name) and optional file_path, with optional direct callers and callees.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def get_code_snippet(
+            request: GetCodeSnippetRequest,
+            ctx: Context,
+        ) -> GetCodeSnippetResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.get_code_snippet, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during get_code_snippet.",
                         retryable=False,
                     )
                     raise ToolError(sanitized.to_json(pretty=False)) from exc

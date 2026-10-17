@@ -74,6 +74,9 @@ DOC_AND_CONFIG_EXTENSIONS: frozenset[str] = frozenset(
         ".ini",
         ".cfg",
         ".conf",
+        ".properties",
+        ".pro",
+        ".gradle",
         ".sh",
         ".bash",
         ".zsh",
@@ -90,6 +93,8 @@ DOC_AND_CONFIG_FILENAMES: frozenset[str] = frozenset(
     {
         "dockerfile",
         "makefile",
+        "gradlew",
+        "gradlew.bat",
         "readme",
         "license",
         "copying",
@@ -680,14 +685,24 @@ def parse_blob(
         elif node.type == "call":
             fn_node = node.child_by_field_name("function")
             if fn_node is not None:
-                callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
-                add_occurrence(
-                    parent_sym.id if parent_sym else None,
-                    "call",
-                    node.start_byte,
-                    node.end_byte,
-                    details={"callee": callee},
-                )
+                raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
+                if "." in raw_callee:
+                    recv, short_c = raw_callee.rsplit(".", 1)
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
+                    )
+                else:
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"callee": raw_callee, "raw_callee": raw_callee},
+                    )
 
         for ch in node.children:
             walk_python(ch, parent_sym, scope)
@@ -726,14 +741,24 @@ def parse_blob(
         elif node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
             if fn_node is not None:
-                callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
-                add_occurrence(
-                    parent_sym.id if parent_sym else None,
-                    "call",
-                    node.start_byte,
-                    node.end_byte,
-                    details={"callee": callee},
-                )
+                raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
+                if "." in raw_callee:
+                    recv, short_c = raw_callee.rsplit(".", 1)
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
+                    )
+                else:
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"callee": raw_callee, "raw_callee": raw_callee},
+                    )
         elif node.type in ("jsx_opening_element", "jsx_self_closing_element"):
             name_n = node.child_by_field_name("name")
             if name_n is not None:
@@ -905,20 +930,61 @@ def parse_blob(
             )
         elif ntype in ("call_expression", "method_invocation"):
             name_n = node.child_by_field_name("name")
+            recv_str: str | None = None
+            obj_n = node.child_by_field_name("object")
+            if obj_n is not None:
+                recv_str = blob_bytes[obj_n.start_byte : obj_n.end_byte].decode("utf-8", errors="replace").strip()
             if name_n is None and node.named_children:
                 first_ch = node.named_children[0]
                 if first_ch.type == "navigation_expression" and first_ch.named_children:
                     name_n = first_ch.named_children[-1]
+                    if len(first_ch.named_children) >= 2:
+                        r_n = first_ch.named_children[0]
+                        recv_str = blob_bytes[r_n.start_byte : r_n.end_byte].decode("utf-8", errors="replace").strip()
                 elif first_ch.type == "identifier":
                     name_n = first_ch
             if name_n is not None:
                 callee = blob_bytes[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace").strip()
+                # Extract top-level Gradle Kotlin DSL blocks (`plugins`, `android`, `dependencies`, `buildTypes`, etc.) as symbols
+                gradle_blocks = {
+                    "plugins",
+                    "android",
+                    "dependencies",
+                    "defaultConfig",
+                    "buildTypes",
+                    "buildFeatures",
+                    "pluginManagement",
+                    "dependencyResolutionManagement",
+                }
+                lambda_body = next(
+                    (c for c in node.named_children if c.type in ("annotated_lambda", "lambda_literal", "call_suffix")),
+                    None,
+                )
+                if language == "kotlin" and callee in gradle_blocks and lambda_body is not None:
+                    sym = add_symbol(
+                        parent_id=parent_sym.id if parent_sym else None,
+                        scope_names=scope,
+                        sym_kind="namespace",
+                        name_node=name_n,
+                        decl_start=node.start_byte,
+                        decl_end=node.end_byte,
+                        body_node=lambda_body,
+                    )
+                    next_sym = sym if sym is not None else parent_sym
+                    next_scope = [*scope, sym.name] if sym is not None else scope
+                    for ch in lambda_body.children:
+                        walk_kotlin_java(ch, next_sym, next_scope)
+                    return
+
+                det_dict: dict[str, Any] = {"callee": callee}
+                if recv_str:
+                    det_dict["receiver"] = recv_str
                 add_occurrence(
                     parent_sym.id if parent_sym else None,
                     "call",
                     node.start_byte,
                     node.end_byte,
-                    details={"callee": callee},
+                    details=det_dict,
                 )
 
         for ch in node.children:
@@ -1723,52 +1789,335 @@ def index_active_snapshot_files(
         if rem_pending == 0:
             Store.resolve_gaps_in_scope(conn, scope="git:snapshot", code="STRUCTURE_PENDING")
 
-        # Resolve cross-file lexical call candidates across active snapshot symbols
-        active_syms = conn.execute(
-            """
-            SELECT DISTINCT s.id, s.name
-            FROM symbols s
-            JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
-            WHERE s.kind IN ('function', 'async_function', 'method', 'async_method', 'class')
-            """
-        ).fetchall()
-        active_by_name: dict[str, list[str]] = {}
-        for as_row in active_syms:
-            active_by_name.setdefault(str(as_row["name"]), []).append(str(as_row["id"]))
-
-        call_occs = conn.execute(
-            """
-            SELECT DISTINCT so.enclosing_symbol_id, so.details_json
-            FROM syntax_occurrences so
-            JOIN snapshot_files sf ON sf.extraction_id = so.extraction_id
-            WHERE so.kind IN ('call', 'jsx_component') AND so.enclosing_symbol_id IS NOT NULL
-            """
-        ).fetchall()
-        for co_row in call_occs:
-            enc_id = str(co_row["enclosing_symbol_id"])
-            det = json.loads(str(co_row["details_json"])) if co_row["details_json"] else {}
-            callee = det.get("callee") or det.get("component")
-            if isinstance(callee, str) and callee in active_by_name:
-                targets = active_by_name[callee]
-                if len(targets) <= 5:
-                    for tgt_id in targets:
-                        if tgt_id != enc_id:
-                            rel_id = make_relation_id(
-                                from_kind="symbol",
-                                from_id=enc_id,
-                                to_kind="symbol",
-                                to_id=tgt_id,
-                                relation_kind="calls_candidate",
-                                method="lexical_snapshot",
-                            )
-                            conn.execute(
-                                """
-                                INSERT INTO relations (
-                                    id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
-                                ) VALUES (?, 'symbol', ?, 'symbol', ?, 'calls_candidate', 'lexical_snapshot', 'candidate', NULL, '{}', 'active')
-                                ON CONFLICT(id) DO NOTHING
-                                """,
-                                (rel_id, enc_id, tgt_id),
-                            )
+        # Resolve cross-file call candidates using import/module/type-aware disambiguation
+        _resolve_cross_file_calls_and_imports(conn)
 
     return (blobs_parsed, cache_hits)
+
+
+PY_FROM_IMPORT_RE = re.compile(
+    r"^\s*from\s+([A-Za-z0-9_.]+)\s+import\s+(.+)$", re.DOTALL
+)
+PY_IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.,\s]+)$")
+JS_IMPORT_RE = re.compile(
+    r"import\s+(?:type\s+)?(.+?)\s+from\s+['\"]([^'\"]+)['\"]", re.DOTALL
+)
+KT_JAVA_IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.]+)\s*;?\s*$")
+PARAM_TYPE_RE = re.compile(
+    r"(?:([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s+([A-Za-z_]\w*))"
+)
+
+
+def _module_spec_matches_path(mod_spec: str, file_path: str) -> bool:
+    """Check whether an import module specifier (`a`, `pkg.a`, `./service.js`, `com.example.Repo`)
+    matches an indexed repository `file_path` (`a.py`, `src/pkg/a.py`, `src/service.ts`, etc.).
+    """
+    clean_spec = mod_spec.strip().strip("'\"").lstrip("./")
+    for ext in EXTENSION_TO_LANGUAGE:
+        if clean_spec.endswith(ext):
+            clean_spec = clean_spec[: -len(ext)]
+            break
+    spec_slash = clean_spec.replace(".", "/").strip("/")
+    if not spec_slash:
+        return False
+
+    fp_no_ext = file_path
+    for ext in EXTENSION_TO_LANGUAGE:
+        if fp_no_ext.endswith(ext):
+            fp_no_ext = fp_no_ext[: -len(ext)]
+            break
+    if fp_no_ext.endswith("/__init__") or fp_no_ext.endswith("/index"):
+        fp_pkg = fp_no_ext.rsplit("/", 1)[0]
+    else:
+        fp_pkg = fp_no_ext
+
+    return (
+        fp_no_ext == spec_slash
+        or fp_no_ext.endswith("/" + spec_slash)
+        or fp_pkg == spec_slash
+        or fp_pkg.endswith("/" + spec_slash)
+    )
+
+
+def _parse_extraction_imports(
+    imp_texts: list[str],
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Parse import statements in a blob into:
+    - `symbol_imports`: `{local_alias_or_name: module_spec}` (e.g. `from a import save` -> `{'save': 'a'}`)
+    - `module_aliases`: `{alias: module_spec}` (e.g. `import a` -> `{'a': 'a'}`, `import pkg.a as mod_a` -> `{'mod_a': 'pkg.a'}`)
+    - `wildcard_modules`: `[module_spec]`
+    """
+    symbol_imports: dict[str, str] = {}
+    module_aliases: dict[str, str] = {}
+    wildcard_modules: list[str] = []
+
+    for raw in imp_texts:
+        txt = raw.strip()
+        m_from = PY_FROM_IMPORT_RE.match(txt)
+        if m_from:
+            mod_spec = m_from.group(1).strip()
+            names_part = m_from.group(2).strip().strip("()")
+            for piece in names_part.split(","):
+                p = piece.strip()
+                if not p:
+                    continue
+                if p == "*":
+                    wildcard_modules.append(mod_spec)
+                elif " as " in p:
+                    orig, alias = p.split(" as ", 1)
+                    symbol_imports[alias.strip()] = f"{mod_spec}.{orig.strip()}"
+                else:
+                    symbol_imports[p] = mod_spec
+                    module_aliases[p] = f"{mod_spec}.{p}"
+            continue
+
+        m_js = JS_IMPORT_RE.search(txt)
+        if m_js:
+            clause = m_js.group(1).strip()
+            mod_spec = m_js.group(2).strip()
+            if "{" in clause and "}" in clause:
+                inside = clause[clause.find("{") + 1 : clause.rfind("}")]
+                for piece in inside.split(","):
+                    p = piece.strip()
+                    if not p:
+                        continue
+                    if " as " in p:
+                        orig, alias = p.split(" as ", 1)
+                        symbol_imports[alias.strip()] = mod_spec
+                    else:
+                        symbol_imports[p] = mod_spec
+            else:
+                default_name = clause.split(",")[0].strip()
+                if default_name.startswith("* as "):
+                    alias = default_name[5:].strip()
+                    module_aliases[alias] = mod_spec
+                elif default_name:
+                    symbol_imports[default_name] = mod_spec
+            continue
+
+        m_kt = KT_JAVA_IMPORT_RE.match(txt)
+        if m_kt:
+            full_imp = m_kt.group(1).strip()
+            if full_imp.endswith(".*"):
+                wildcard_modules.append(full_imp[:-2])
+            elif "." in full_imp:
+                mod_part, sym_part = full_imp.rsplit(".", 1)
+                symbol_imports[sym_part] = mod_part
+            continue
+
+        m_py_imp = PY_IMPORT_RE.match(txt)
+        if m_py_imp:
+            for piece in m_py_imp.group(1).split(","):
+                p = piece.strip()
+                if not p:
+                    continue
+                if " as " in p:
+                    mod_s, alias = p.split(" as ", 1)
+                    module_aliases[alias.strip()] = mod_s.strip()
+                else:
+                    short_m = p.rsplit(".", 1)[-1]
+                    module_aliases[short_m] = p
+
+    return symbol_imports, module_aliases, wildcard_modules
+
+
+def _extract_receiver_types_from_signature(signature: str) -> dict[str, str]:
+    """Extract parameter/property variable -> TypeName mappings from a function or class signature."""
+    var_to_type: dict[str, str] = {}
+    for m in PARAM_TYPE_RE.finditer(signature):
+        if m.group(1) and m.group(2):
+            var_to_type[m.group(1)] = m.group(2)
+        elif m.group(3) and m.group(4):
+            t_cand, v_cand = m.group(3), m.group(4)
+            if t_cand[0].isupper():
+                var_to_type[v_cand] = t_cand
+    return var_to_type
+
+
+def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
+    """Resolve cross-file `calls_candidate` and `imports_candidate` relations using:
+    1. Explicit import target matching (`from a import save` binds `save()` ONLY to `a.py`'s `save`, never `b.py`'s `save`)
+    2. Module alias receiver matching (`a.save()` where `import a` binds to `a.py`'s `save`)
+    3. Parameter/field receiver type matching (`repo.save()` where `repo: UserRepository` binds to `UserRepository.save`)
+    4. Same-directory/package preference
+    5. Global fallback ONLY when the symbol name is globally unique (1 match) across the snapshot.
+    """
+    conn.execute("DELETE FROM relations WHERE method = 'lexical_snapshot'")
+
+    active_rows = conn.execute(
+        """
+        SELECT s.id, s.extraction_id, s.parent_symbol_id, s.kind, s.name, s.qualified_name, s.signature,
+               sf.path
+        FROM symbols s
+        JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+        WHERE s.kind IN ('function', 'async_function', 'method', 'async_method', 'class', 'interface')
+        """
+    ).fetchall()
+
+    # Map symbol metadata and index by short name
+    sym_meta: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    ext_to_path: dict[str, str] = {}
+
+    for r in active_rows:
+        sid = str(r["id"])
+        ext_id = str(r["extraction_id"])
+        disp_p, _ = path_bytes_to_display(bytes(r["path"]))
+        ext_to_path[ext_id] = disp_p
+        info = {
+            "extraction_id": ext_id,
+            "id": sid,
+            "kind": str(r["kind"]),
+            "name": str(r["name"]),
+            "parent_symbol_id": r["parent_symbol_id"],
+            "path": disp_p,
+            "qualified_name": str(r["qualified_name"]),
+            "signature": str(r["signature"]),
+        }
+        sym_meta[sid] = info
+        by_name.setdefault(info["name"], []).append(info)
+
+    # Load imports per active extraction_id
+    imp_rows = conn.execute(
+        """
+        SELECT so.extraction_id, so.text
+        FROM syntax_occurrences so
+        JOIN snapshot_files sf ON sf.extraction_id = so.extraction_id
+        WHERE so.kind IN ('import', 'relative_import', 'type_import')
+        """
+    ).fetchall()
+    ext_raw_imports: dict[str, list[str]] = {}
+    for ir in imp_rows:
+        ext_raw_imports.setdefault(str(ir["extraction_id"]), []).append(str(ir["text"]))
+
+    ext_parsed_imports: dict[str, tuple[dict[str, str], dict[str, str], list[str]]] = {
+        ext_id: _parse_extraction_imports(txts)
+        for ext_id, txts in ext_raw_imports.items()
+    }
+
+    call_rows = conn.execute(
+        """
+        SELECT DISTINCT so.extraction_id, so.enclosing_symbol_id, so.details_json
+        FROM syntax_occurrences so
+        JOIN snapshot_files sf ON sf.extraction_id = so.extraction_id
+        WHERE so.kind IN ('call', 'jsx_component') AND so.enclosing_symbol_id IS NOT NULL
+        """
+    ).fetchall()
+
+    for cr in call_rows:
+        enc_id = str(cr["enclosing_symbol_id"])
+        ext_id = str(cr["extraction_id"])
+        enc_info = sym_meta.get(enc_id)
+        if enc_info is None:
+            continue
+
+        det = json.loads(str(cr["details_json"])) if cr["details_json"] else {}
+        callee = det.get("callee") or det.get("component")
+        receiver = det.get("receiver")
+        if not isinstance(callee, str) or callee not in by_name:
+            continue
+
+        candidates = [c for c in by_name[callee] if c["id"] != enc_id]
+        if not candidates:
+            continue
+
+        sym_imps, mod_aliases, wildcards = ext_parsed_imports.get(ext_id, ({}, {}, []))
+        caller_path = enc_info["path"]
+        caller_dir = caller_path.rsplit("/", 1)[0] if "/" in caller_path else ""
+
+        # Gather receiver type map from enclosing function and its parent class (e.g. constructor injection)
+        recv_types = _extract_receiver_types_from_signature(enc_info["signature"])
+        parent_id = enc_info.get("parent_symbol_id")
+        if parent_id and str(parent_id) in sym_meta:
+            parent_info = sym_meta[str(parent_id)]
+            recv_types.update(_extract_receiver_types_from_signature(parent_info["signature"]))
+
+        resolved_targets: list[dict[str, Any]] = []
+
+        if isinstance(receiver, str) and receiver:
+            clean_recv = receiver.replace("this.", "").replace("self.", "").strip()
+            # 1A. Receiver is an imported module alias (`a.save()` where `import a` or `from pkg import a`)
+            if clean_recv in mod_aliases:
+                mod_spec = mod_aliases[clean_recv]
+                resolved_targets = [
+                    c for c in candidates if _module_spec_matches_path(mod_spec, c["path"])
+                ]
+            elif clean_recv in sym_imps:
+                # Receiver is an imported class or module (`Service.run()`)
+                mod_spec = sym_imps[clean_recv]
+                resolved_targets = [
+                    c
+                    for c in candidates
+                    if c["qualified_name"] == f"{clean_recv}.{callee}"
+                    or _module_spec_matches_path(mod_spec, c["path"])
+                ]
+            # 1B. Receiver is a typed parameter/field (`api.getUser()` where `api: Api`)
+            if not resolved_targets and clean_recv in recv_types:
+                t_name = recv_types[clean_recv]
+                resolved_targets = [
+                    c
+                    for c in candidates
+                    if c["qualified_name"] == f"{t_name}.{callee}"
+                    or c["qualified_name"].endswith(f".{t_name}.{callee}")
+                ]
+            # 1C. Receiver is `self`/`this` -> same class methods only
+            if not resolved_targets and receiver in ("self", "this") and parent_id and str(parent_id) in sym_meta:
+                p_qname = sym_meta[str(parent_id)]["qualified_name"]
+                resolved_targets = [
+                    c for c in candidates if c["qualified_name"] == f"{p_qname}.{callee}"
+                ]
+        else:
+            # Unqualified call `save()`
+            # 2A. Same-file definition takes precedence (already linked by `lexical_same_blob`)
+            same_file = [c for c in candidates if c["extraction_id"] == ext_id]
+            if same_file:
+                continue
+
+            # 2B. Explicitly imported symbol (`from a import save` or `import { save } from './a'`)
+            if callee in sym_imps:
+                mod_spec = sym_imps[callee]
+                resolved_targets = [
+                    c for c in candidates if _module_spec_matches_path(mod_spec, c["path"])
+                ]
+
+            # 2C. Wildcard imports (`from a import *`)
+            if not resolved_targets and wildcards:
+                resolved_targets = [
+                    c
+                    for c in candidates
+                    if any(_module_spec_matches_path(w, c["path"]) for w in wildcards)
+                ]
+
+            # 2D. Same directory/package definition if unique in that directory
+            if not resolved_targets and caller_dir:
+                same_dir = [
+                    c
+                    for c in candidates
+                    if (c["path"].rsplit("/", 1)[0] if "/" in c["path"] else "") == caller_dir
+                ]
+                if len(same_dir) == 1:
+                    resolved_targets = same_dir
+
+            # 2E. Global fallback ONLY when the symbol name is globally unique across the entire snapshot!
+            # (Prevents false edges when multiple modules define common names like `save` or `run`.)
+            if not resolved_targets and len(candidates) == 1:
+                resolved_targets = candidates
+
+        for tgt in resolved_targets:
+            rel_id = make_relation_id(
+                from_kind="symbol",
+                from_id=enc_id,
+                to_kind="symbol",
+                to_id=tgt["id"],
+                relation_kind="calls_candidate",
+                method="lexical_snapshot",
+            )
+            conn.execute(
+                """
+                INSERT INTO relations (
+                    id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                ) VALUES (?, 'symbol', ?, 'symbol', ?, 'calls_candidate', 'lexical_snapshot', 'candidate', NULL, '{}', 'active')
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (rel_id, enc_id, tgt["id"]),
+            )

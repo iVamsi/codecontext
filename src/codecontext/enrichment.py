@@ -1571,7 +1571,18 @@ def compute_snapshot_groups(
         if slash_idx != -1:
             dir_b = p[:slash_idx]
             leaf = p[slash_idx + 1 :]
-            if leaf in (b"pyproject.toml", b"package.json") and dir_b:
+            if (
+                leaf
+                in (
+                    b"pyproject.toml",
+                    b"package.json",
+                    b"build.gradle.kts",
+                    b"build.gradle",
+                    b"Cargo.toml",
+                    b"go.mod",
+                )
+                and dir_b
+            ):
                 package_roots.add(dir_b)
 
     sorted_pkg_roots = sorted(package_roots, key=lambda b: (-b.count(b"/"), -len(b), b))

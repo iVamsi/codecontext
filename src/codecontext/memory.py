@@ -9,12 +9,21 @@ from codecontext.enrichment import execute_enrich
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.graph import (
+    DetectChangesRequest,
+    DetectChangesResult,
+    GetArchitectureRequest,
+    GetArchitectureResult,
+    GetCodeSnippetRequest,
+    GetCodeSnippetResult,
     QueryGraphRequest,
     QueryGraphResult,
     SearchGraphRequest,
     SearchGraphResult,
     TracePathRequest,
     TracePathResult,
+    execute_detect_changes,
+    execute_get_architecture,
+    execute_get_code_snippet,
     execute_query_graph,
     execute_search_graph,
     execute_trace_path,
@@ -239,6 +248,43 @@ class Memory:
         self._ensure_open()
         validated_req = _validate_request_model(QueryGraphRequest, request)
         return execute_query_graph(self._store, validated_req)
+
+    def get_architecture(
+        self,
+        request: GetArchitectureRequest | dict[str, Any] | None = None,
+    ) -> GetArchitectureResult:
+        self._ensure_open()
+        validated_req = (
+            _validate_request_model(GetArchitectureRequest, request)
+            if request is not None
+            else GetArchitectureRequest()
+        )
+        return execute_get_architecture(self._store, validated_req)
+
+    def detect_changes(
+        self,
+        request: DetectChangesRequest | dict[str, Any] | None = None,
+    ) -> DetectChangesResult:
+        self._ensure_open()
+        validated_req = (
+            _validate_request_model(DetectChangesRequest, request)
+            if request is not None
+            else DetectChangesRequest()
+        )
+        return execute_detect_changes(
+            self._store,
+            self._mirror,
+            validated_req,
+            workspace_path=self._workspace_path,
+        )
+
+    def get_code_snippet(
+        self,
+        request: GetCodeSnippetRequest | dict[str, Any],
+    ) -> GetCodeSnippetResult:
+        self._ensure_open()
+        validated_req = _validate_request_model(GetCodeSnippetRequest, request)
+        return execute_get_code_snippet(self._store, self._mirror, validated_req)
 
 
 _INIT_SENTINEL = object()
