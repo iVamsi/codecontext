@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codecontext"
+version = "0.1.0"
+description = "Local project memory for coding agents with provenance and conservative rationale tracking."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.28,<1",
+    "mcp==2.3.0",
+    "pydantic>=2.10,<3",
+    "tree-sitter==0.26.0",
+    "tree-sitter-java>=0.23,<1",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-kotlin>=1.0,<2",
+    "tree-sitter-python==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+]
+
+[project.scripts]
+codecontext = "codecontext.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codecontext"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

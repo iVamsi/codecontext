@@ -1,0 +1,137 @@
+{
+  "$defs": {
+    "AssertionScore": {
+      "additionalProperties": false,
+      "properties": {
+        "cited_evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Cited Evidence Ids",
+          "type": "array"
+        },
+        "material": {
+          "title": "Material",
+          "type": "boolean"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        },
+        "text": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "material",
+        "supported"
+      ],
+      "title": "AssertionScore",
+      "type": "object"
+    },
+    "FactScore": {
+      "additionalProperties": false,
+      "properties": {
+        "fact_id": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Fact Id",
+          "type": "string"
+        },
+        "present": {
+          "title": "Present",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fact_id",
+        "present"
+      ],
+      "title": "FactScore",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "abstention_correct": {
+      "title": "Abstention Correct",
+      "type": "boolean"
+    },
+    "applicability_correct": {
+      "title": "Applicability Correct",
+      "type": "boolean"
+    },
+    "assertions": {
+      "items": {
+        "$ref": "#/$defs/AssertionScore"
+      },
+      "title": "Assertions",
+      "type": "array"
+    },
+    "critical_error": {
+      "title": "Critical Error",
+      "type": "boolean"
+    },
+    "fact_scores": {
+      "items": {
+        "$ref": "#/$defs/FactScore"
+      },
+      "title": "Fact Scores",
+      "type": "array"
+    },
+    "notes": {
+      "default": "",
+      "maxLength": 2000,
+      "title": "Notes",
+      "type": "string"
+    },
+    "question_id": {
+      "maxLength": 100,
+      "minLength": 1,
+      "title": "Question Id",
+      "type": "string"
+    },
+    "retrieved_counterevidence_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retrieved Counterevidence Ids",
+      "type": "array"
+    },
+    "retrieved_source_ids_top10": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retrieved Source Ids Top10",
+      "type": "array"
+    },
+    "reviewer_id": {
+      "maxLength": 100,
+      "minLength": 1,
+      "title": "Reviewer Id",
+      "type": "string"
+    },
+    "run_id": {
+      "maxLength": 100,
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "question_id",
+    "reviewer_id",
+    "assertions",
+    "fact_scores",
+    "applicability_correct",
+    "abstention_correct",
+    "critical_error"
+  ],
+  "title": "QuestionScoreRecord",
+  "type": "object"
+}

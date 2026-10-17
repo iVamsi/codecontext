@@ -1,0 +1,10 @@
+{
+  "command": "/absolute/path/to/environment/bin/codecontext",
+  "args": [
+    "--store",
+    "/absolute/path/to/project-memory",
+    "serve",
+    "--workspace",
+    "/absolute/path/to/project"
+  ]
+}

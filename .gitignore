@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+.venv_*/
+venv/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Pytest and Ruff caches
+.pytest_cache/
+.ruff_cache/
+
+# Local CodeContext runtime stores
+.codecontext/
+
+# OS files
+.DS_Store
