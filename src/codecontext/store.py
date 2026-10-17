@@ -1242,7 +1242,18 @@ class Store:
 
             has_git_objs = (self.git_dir / "objects").exists()
             caps = Capabilities(
-                syntax_languages=["java", "javascript", "kotlin", "python", "tsx", "typescript"],
+                syntax_languages=[
+                    "c",
+                    "cpp",
+                    "go",
+                    "java",
+                    "javascript",
+                    "kotlin",
+                    "python",
+                    "rust",
+                    "tsx",
+                    "typescript",
+                ],
                 text_fallback=True,
                 git_history=commit_cnt > 0,
                 github_history=source_cnt > 0,

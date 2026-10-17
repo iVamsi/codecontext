@@ -1,4 +1,5 @@
 import importlib.metadata
+import json
 import re
 import sqlite3
 import unicodedata
@@ -6,10 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import tree_sitter_c
+import tree_sitter_cpp
+import tree_sitter_go
 import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_kotlin
 import tree_sitter_python
+import tree_sitter_rust
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query
 
@@ -44,6 +49,16 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".kt": "kotlin",
     ".kts": "kotlin",
     ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
 }
 
 DOC_AND_CONFIG_EXTENSIONS: frozenset[str] = frozenset(
@@ -106,6 +121,10 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         "tsx": Language(tree_sitter_typescript.language_tsx()),
         "kotlin": Language(tree_sitter_kotlin.language()),
         "java": Language(tree_sitter_java.language()),
+        "go": Language(tree_sitter_go.language()),
+        "rust": Language(tree_sitter_rust.language()),
+        "c": Language(tree_sitter_c.language()),
+        "cpp": Language(tree_sitter_cpp.language()),
     }
     ts_ver = _pkg_ver("tree-sitter")
     lang_pkg_vers = {
@@ -115,6 +134,10 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         "tsx": _pkg_ver("tree-sitter-typescript"),
         "kotlin": _pkg_ver("tree-sitter-kotlin"),
         "java": _pkg_ver("tree-sitter-java"),
+        "go": _pkg_ver("tree-sitter-go"),
+        "rust": _pkg_ver("tree-sitter-rust"),
+        "c": _pkg_ver("tree-sitter-c"),
+        "cpp": _pkg_ver("tree-sitter-cpp"),
     }
     queries: dict[str, Query] = {}
     fingerprints: dict[str, str] = {}
@@ -901,10 +924,192 @@ def parse_blob(
         for ch in node.children:
             walk_kotlin_java(ch, parent_sym, scope)
 
+    def _find_c_declarator_name(decl: Node | None) -> Node | None:
+        cur = decl
+        while cur is not None:
+            if cur.type in ("identifier", "field_identifier", "type_identifier", "destructor_name"):
+                return cur
+            next_d = cur.child_by_field_name("declarator") or cur.child_by_field_name("name")
+            if next_d is not None:
+                cur = next_d
+                continue
+            found = None
+            for ch in cur.named_children:
+                if ch.type in (
+                    "function_declarator",
+                    "pointer_declarator",
+                    "reference_declarator",
+                    "identifier",
+                    "field_identifier",
+                    "qualified_identifier",
+                ):
+                    found = ch
+                    break
+            cur = found
+        return None
+
+    def walk_go_rust_c_cpp(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
+        ntype = node.type
+
+        # Go type_spec (`type Foo struct{}` / `type Bar interface{}`)
+        if language == "go" and ntype == "type_spec":
+            name_n = node.child_by_field_name("name")
+            type_n = node.child_by_field_name("type")
+            skind = "interface" if (type_n is not None and type_n.type == "interface_type") else "class"
+            add_symbol(
+                parent_id=parent_sym.id if parent_sym else None,
+                scope_names=scope,
+                sym_kind=skind,
+                name_node=name_n,
+                decl_start=node.start_byte,
+                decl_end=node.end_byte,
+                body_node=type_n,
+            )
+            return
+
+        # Go method_declaration with receiver type
+        if language == "go" and ntype == "method_declaration":
+            name_n = node.child_by_field_name("name")
+            body_n = node.child_by_field_name("body")
+            recv_n = node.child_by_field_name("receiver")
+            recv_type_name: str | None = None
+            if recv_n is not None:
+                for ch in recv_n.named_children:
+                    t_node = ch.child_by_field_name("type")
+                    if t_node is not None:
+                        recv_type_name = (
+                            blob_bytes[t_node.start_byte : t_node.end_byte]
+                            .decode("utf-8", errors="replace")
+                            .lstrip("*")
+                            .strip()
+                        )
+                        break
+            m_scope = [*scope, recv_type_name] if recv_type_name else scope
+            sym = add_symbol(
+                parent_id=parent_sym.id if parent_sym else None,
+                scope_names=m_scope,
+                sym_kind="method",
+                name_node=name_n,
+                decl_start=node.start_byte,
+                decl_end=node.end_byte,
+                body_node=body_n,
+            )
+            if body_n is not None:
+                for ch in body_n.children:
+                    walk_go_rust_c_cpp(ch, sym or parent_sym, [*m_scope, sym.name] if sym else m_scope)
+            return
+
+        # Rust impl_item (`impl Foo { ... }`)
+        if language == "rust" and ntype == "impl_item":
+            type_n = node.child_by_field_name("type")
+            body_n = node.child_by_field_name("body")
+            impl_name = (
+                blob_bytes[type_n.start_byte : type_n.end_byte].decode("utf-8", errors="replace").strip()
+                if type_n is not None
+                else None
+            )
+            next_scope = [*scope, impl_name] if impl_name else scope
+            if body_n is not None:
+                for ch in body_n.children:
+                    walk_go_rust_c_cpp(ch, parent_sym, next_scope)
+            return
+
+        # C/C++ function_definition
+        if language in ("c", "cpp") and ntype == "function_definition":
+            decl_n = node.child_by_field_name("declarator")
+            name_n = _find_c_declarator_name(decl_n)
+            body_n = node.child_by_field_name("body")
+            skind = "method" if (parent_sym is not None and parent_sym.kind == "class") else "function"
+            sym = add_symbol(
+                parent_id=parent_sym.id if parent_sym else None,
+                scope_names=scope,
+                sym_kind=skind,
+                name_node=name_n,
+                decl_start=node.start_byte,
+                decl_end=node.end_byte,
+                body_node=body_n,
+                header_end_override=body_n.start_byte if body_n is not None else node.end_byte,
+            )
+            if body_n is not None:
+                for ch in body_n.children:
+                    walk_go_rust_c_cpp(ch, sym or parent_sym, [*scope, sym.name] if sym else scope)
+            return
+
+        # Structs, classes, traits, enums, namespaces, Go/Rust functions
+        if ntype in (
+            "function_declaration",
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "struct_specifier",
+            "class_specifier",
+            "enum_specifier",
+            "namespace_definition",
+        ):
+            name_n = node.child_by_field_name("name")
+            body_n = node.child_by_field_name("body")
+            if ntype in ("struct_specifier", "class_specifier", "enum_specifier") and body_n is None:
+                # Forward declaration without body
+                return
+            kind_map = {
+                "function_declaration": "function",
+                "function_item": "method" if scope else "function",
+                "struct_item": "class",
+                "enum_item": "enum",
+                "trait_item": "interface",
+                "struct_specifier": "class",
+                "class_specifier": "class",
+                "enum_specifier": "enum",
+                "namespace_definition": "namespace",
+            }
+            sym = add_symbol(
+                parent_id=parent_sym.id if parent_sym else None,
+                scope_names=scope,
+                sym_kind=kind_map[ntype],
+                name_node=name_n,
+                decl_start=node.start_byte,
+                decl_end=node.end_byte,
+                body_node=body_n,
+            )
+            target_walk = body_n if body_n is not None else node
+            next_sym = sym if sym is not None else parent_sym
+            next_scope = [*scope, sym.name] if sym is not None else scope
+            for ch in target_walk.children:
+                walk_go_rust_c_cpp(ch, next_sym, next_scope)
+            return
+
+        if ntype in ("import_declaration", "use_declaration", "preproc_include"):
+            add_occurrence(
+                parent_sym.id if parent_sym else None,
+                "import",
+                node.start_byte,
+                node.end_byte,
+            )
+        elif ntype == "call_expression":
+            fn_n = node.child_by_field_name("function")
+            if fn_n is not None:
+                raw_callee = blob_bytes[fn_n.start_byte : fn_n.end_byte].decode("utf-8", errors="replace").strip()
+                # Extract trailing identifier after `.` or `::` or `->`
+                callee = re.split(r"(?:\.|::|->)", raw_callee)[-1].strip()
+                if callee:
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"callee": callee, "raw_callee": raw_callee},
+                    )
+
+        for ch in node.children:
+            walk_go_rust_c_cpp(ch, parent_sym, scope)
+
     if language == "python":
         walk_python(root, None, [])
     elif language in ("kotlin", "java"):
         walk_kotlin_java(root, None, [])
+    elif language in ("go", "rust", "c", "cpp"):
+        walk_go_rust_c_cpp(root, None, [])
     else:
         walk_js_ts(root, None, [])
 
@@ -1517,5 +1722,53 @@ def index_active_snapshot_files(
         )
         if rem_pending == 0:
             Store.resolve_gaps_in_scope(conn, scope="git:snapshot", code="STRUCTURE_PENDING")
+
+        # Resolve cross-file lexical call candidates across active snapshot symbols
+        active_syms = conn.execute(
+            """
+            SELECT DISTINCT s.id, s.name
+            FROM symbols s
+            JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+            WHERE s.kind IN ('function', 'async_function', 'method', 'async_method', 'class')
+            """
+        ).fetchall()
+        active_by_name: dict[str, list[str]] = {}
+        for as_row in active_syms:
+            active_by_name.setdefault(str(as_row["name"]), []).append(str(as_row["id"]))
+
+        call_occs = conn.execute(
+            """
+            SELECT DISTINCT so.enclosing_symbol_id, so.details_json
+            FROM syntax_occurrences so
+            JOIN snapshot_files sf ON sf.extraction_id = so.extraction_id
+            WHERE so.kind IN ('call', 'jsx_component') AND so.enclosing_symbol_id IS NOT NULL
+            """
+        ).fetchall()
+        for co_row in call_occs:
+            enc_id = str(co_row["enclosing_symbol_id"])
+            det = json.loads(str(co_row["details_json"])) if co_row["details_json"] else {}
+            callee = det.get("callee") or det.get("component")
+            if isinstance(callee, str) and callee in active_by_name:
+                targets = active_by_name[callee]
+                if len(targets) <= 5:
+                    for tgt_id in targets:
+                        if tgt_id != enc_id:
+                            rel_id = make_relation_id(
+                                from_kind="symbol",
+                                from_id=enc_id,
+                                to_kind="symbol",
+                                to_id=tgt_id,
+                                relation_kind="calls_candidate",
+                                method="lexical_snapshot",
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO relations (
+                                    id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                                ) VALUES (?, 'symbol', ?, 'symbol', ?, 'calls_candidate', 'lexical_snapshot', 'candidate', NULL, '{}', 'active')
+                                ON CONFLICT(id) DO NOTHING
+                                """,
+                                (rel_id, enc_id, tgt_id),
+                            )
 
     return (blobs_parsed, cache_hits)

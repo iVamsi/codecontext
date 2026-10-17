@@ -12,6 +12,14 @@ from mcp.types import ToolAnnotations
 
 from codecontext import __version__
 from codecontext.errors import CodeContextError
+from codecontext.graph import (
+    QueryGraphRequest,
+    QueryGraphResult,
+    SearchGraphRequest,
+    SearchGraphResult,
+    TracePathRequest,
+    TracePathResult,
+)
 from codecontext.memory import Memory
 from codecontext.models import (
     ContextPack,
@@ -182,6 +190,7 @@ def create_mcp_server(
     store_path: Path | str | None = None,
     *,
     workspace_path: Path | str | None = None,
+    include_graph_tools: bool = False,
 ) -> tuple[MCPServer, Memory | _DynamicMemoryHolder]:
     """Create a read-only MCPServer bound to `store_path` and optional `workspace_path`.
     If both are omitted, resolves the active project dynamically per session/root and
@@ -295,6 +304,67 @@ def create_mcp_server(
                 )
                 raise ResourceError(sanitized.to_json(pretty=False)) from exc
 
+    if include_graph_tools:
+        @server.tool(
+            name="search_graph",
+            description="Search the structural code graph by regex name/qualified_name pattern, label (Function, Method, Class, Interface), and inbound/outbound call degree.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def search_graph(request: SearchGraphRequest, ctx: Context) -> SearchGraphResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.search_graph, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during search_graph.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+        @server.tool(
+            name="trace_path",
+            description="Trace multi-hop inbound callers and outbound callees for a function or method in the code graph.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def trace_path(request: TracePathRequest, ctx: Context) -> TracePathResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.trace_path, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during trace_path.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+        @server.tool(
+            name="query_graph",
+            description="Execute a Cypher pattern query (`MATCH (a)-[r:CALLS]->(b) WHERE ... RETURN ...`) over the structural code graph.",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        async def query_graph(request: QueryGraphRequest, ctx: Context) -> QueryGraphResult:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx)
+                    return await asyncio.to_thread(mem.query_graph, request)
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during query_graph.",
+                        retryable=False,
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
     return server, pinned_memory if pinned_memory is not None else holder
 
 
@@ -302,8 +372,13 @@ def run_stdio_server(
     store_path: Path | str | None = None,
     *,
     workspace_path: Path | str | None = None,
+    include_graph_tools: bool = False,
 ) -> None:
-    server, mem_or_holder = create_mcp_server(store_path, workspace_path=workspace_path)
+    server, mem_or_holder = create_mcp_server(
+        store_path,
+        workspace_path=workspace_path,
+        include_graph_tools=include_graph_tools,
+    )
     try:
         server.run(transport="stdio")
     finally:

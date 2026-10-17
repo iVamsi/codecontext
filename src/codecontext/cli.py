@@ -10,6 +10,11 @@ from typing import Any
 
 from codecontext import __version__
 from codecontext.errors import CodeContextError
+from codecontext.graph import (
+    QueryGraphRequest,
+    SearchGraphRequest,
+    TracePathRequest,
+)
 from codecontext.identity import parse_iso_utc
 from codecontext.memory import Memory
 from codecontext.models import (
@@ -226,6 +231,37 @@ def build_parser() -> argparse.ArgumentParser:
     # serve
     p_serve = subparsers.add_parser("serve", help="Run the read-only stdio MCP server.")
     p_serve.add_argument("--workspace", type=Path, default=None)
+    p_serve.add_argument(
+        "--include-graph-tools",
+        dest="include_graph_tools",
+        action="store_true",
+        help="Also expose search_graph, trace_path, and query_graph (Cypher) MCP tools.",
+    )
+
+    # search-graph
+    p_sg = subparsers.add_parser("search-graph", help="Search the structural code graph by regex, label, or degree.")
+    p_sg.add_argument("--name-pattern", dest="name_pattern", default=None)
+    p_sg.add_argument("--qn-pattern", dest="qn_pattern", default=None)
+    p_sg.add_argument("--label", default=None)
+    p_sg.add_argument("--relationship", choices=["CALLS", "CONTAINS", "ALL"], default="CALLS")
+    p_sg.add_argument("--direction", choices=["inbound", "outbound", "both"], default="both")
+    p_sg.add_argument("--min-degree", dest="min_degree", type=int, default=None)
+    p_sg.add_argument("--max-degree", dest="max_degree", type=int, default=None)
+    p_sg.add_argument("--exclude-entry-points", dest="exclude_entry_points", action="store_true")
+    p_sg.add_argument("--limit", type=int, default=20)
+    p_sg.add_argument("--offset", type=int, default=0)
+
+    # trace-path
+    p_tp = subparsers.add_parser("trace-path", help="Trace inbound/outbound call chains in the code graph.")
+    p_tp.add_argument("function_name")
+    p_tp.add_argument("--direction", choices=["inbound", "outbound", "both"], default="both")
+    p_tp.add_argument("--depth", type=int, default=2)
+    p_tp.add_argument("--limit", type=int, default=50)
+
+    # query-graph
+    p_qg = subparsers.add_parser("query-graph", help="Run a Cypher pattern query over the code graph.")
+    p_qg.add_argument("query")
+    p_qg.add_argument("--limit", type=int, default=50)
 
     return parser
 
@@ -255,7 +291,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from codecontext.mcp_server import run_stdio_server
 
-            run_stdio_server(args.store, workspace_path=args.workspace)
+            run_stdio_server(
+                args.store,
+                workspace_path=args.workspace,
+                include_graph_tools=bool(args.include_graph_tools),
+            )
             return 0
         except KeyboardInterrupt:
             return 130
@@ -397,6 +437,46 @@ def main(argv: list[str] | None = None) -> int:
             )
             with Memory.open(store_path, read_only=False) as mem:
                 res = mem.purge(p_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "search-graph":
+            sg_req = SearchGraphRequest(
+                name_pattern=args.name_pattern,
+                qn_pattern=args.qn_pattern,
+                label=args.label,
+                relationship=args.relationship,
+                direction=args.direction,
+                min_degree=args.min_degree,
+                max_degree=args.max_degree,
+                exclude_entry_points=bool(args.exclude_entry_points),
+                limit=args.limit,
+                offset=args.offset,
+            )
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.search_graph(sg_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "trace-path":
+            tp_req = TracePathRequest(
+                function_name=args.function_name,
+                direction=args.direction,
+                depth=args.depth,
+                limit=args.limit,
+            )
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.trace_path(tp_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "query-graph":
+            qg_req = QueryGraphRequest(
+                query=args.query,
+                limit=args.limit,
+            )
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.query_graph(qg_req)
             _emit_json(res, pretty=pretty)
             return 0
 

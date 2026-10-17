@@ -8,6 +8,17 @@ from codecontext.archive import execute_export, execute_purge
 from codecontext.enrichment import execute_enrich
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
+from codecontext.graph import (
+    QueryGraphRequest,
+    QueryGraphResult,
+    SearchGraphRequest,
+    SearchGraphResult,
+    TracePathRequest,
+    TracePathResult,
+    execute_query_graph,
+    execute_search_graph,
+    execute_trace_path,
+)
 from codecontext.identity import default_token_estimator
 from codecontext.models import (
     ContextPack,
@@ -213,6 +224,21 @@ class Memory:
         self._ensure_open()
         validated_req = _validate_request_model(PurgeRequest, request)
         return execute_purge(self._store, validated_req)
+
+    def search_graph(self, request: SearchGraphRequest | dict[str, Any]) -> SearchGraphResult:
+        self._ensure_open()
+        validated_req = _validate_request_model(SearchGraphRequest, request)
+        return execute_search_graph(self._store, validated_req)
+
+    def trace_path(self, request: TracePathRequest | dict[str, Any]) -> TracePathResult:
+        self._ensure_open()
+        validated_req = _validate_request_model(TracePathRequest, request)
+        return execute_trace_path(self._store, validated_req)
+
+    def query_graph(self, request: QueryGraphRequest | dict[str, Any]) -> QueryGraphResult:
+        self._ensure_open()
+        validated_req = _validate_request_model(QueryGraphRequest, request)
+        return execute_query_graph(self._store, validated_req)
 
 
 _INIT_SENTINEL = object()
