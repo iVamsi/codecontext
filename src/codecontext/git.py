@@ -618,8 +618,7 @@ class GitMirror:
     def __init__(self, store: Store) -> None:
         self.store = store
         self.git_dir = store.git_dir
-        self.empty_hooks_dir = store.tmp_dir / "_empty_hooks"
-        self.empty_hooks_dir.mkdir(parents=True, exist_ok=True)
+        self.empty_hooks_dir = Path(os.devnull)
         self._empty_tree_oid: str | None = None
         self._empty_blob_oid: str | None = None
 

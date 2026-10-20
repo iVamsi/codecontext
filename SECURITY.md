@@ -4,7 +4,7 @@
 
 CodeContext indexes source repositories, Git histories, and GitHub/GitLab discussions locally for AI coding agents.
 
-1. **Untrusted repository content:** Source code, commit messages, file paths, and issue/PR comments are treated strictly as untrusted data. CodeContext never executes repository code, Git hooks (`core.hooksPath` is pinned to an empty directory), `core.fsmonitor`, external diff tools, or clean/smudge filters (`protocol.allow=never` by default).
+1. **Untrusted repository content:** Source code, commit messages, file paths, and issue/PR comments are treated strictly as untrusted data. CodeContext never executes repository code, Git hooks (`core.hooksPath` is set to `/dev/null`), `core.fsmonitor`, external diff tools, or clean/smudge filters (`protocol.allow=never` by default).
 2. **Read-only MCP boundary:** The stdio MCP server opens the store in read-only mode (`?mode=ro`) and never runs network requests, parsers, migrations, or model calls during `search`, `get`, `context`, `search_graph`, `trace_path`, `query_graph`, `get_architecture`, `detect_changes`, or `get_code_snippet`.
 3. **Credential isolation & principal binding:**
    - Runtime credentials (`GITHUB_TOKEN`, `GITLAB_TOKEN`, or CLI tokens) are never persisted in `store.json`, `memory.sqlite3`, error details, model prompts, or exported archives.

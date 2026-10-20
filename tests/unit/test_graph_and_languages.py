@@ -18,6 +18,7 @@ from tests.fixtures.builders import (
     GitCommitSpec,
     commit_fixture_spec,
     init_fixture_repo,
+    run_git_fixture,
 )
 
 
@@ -189,7 +190,7 @@ def test_import_and_type_disambiguated_call_resolution_and_strict_cypher(tmp_pat
         assert exc_info.value.code == "INVALID_REQUEST"
 
         # 3. Verify ReDoS (nested quantifiers / backreferences) is rejected in search_graph and query_graph
-        for redos_pat in ["(a+)+$", "([a-zA-Z]+)*", r"(a+)\1+"]:
+        for redos_pat in ["(a+)+$", "([a-zA-Z]+)*", r"(a+)\1+", "(a|aa)+$", "((a|aa))+$", "(((a|aa)))+$"]:
             with pytest.raises(CodeContextError) as exc_info:
                 mem.search_graph(SearchGraphRequest(name_pattern=redos_pat))
             assert exc_info.value.code == "INVALID_REQUEST"
@@ -309,6 +310,20 @@ async def test_search_graph_trace_path_architecture_detect_changes_and_snippet(
         assert dc_res.changed_files == ["src/db.py"]
         assert [s.name for s in dc_res.directly_modified_symbols] == ["save_record"]
         assert {s.name for s in dc_res.affected_callers} == {"process_order", "handle_request"}
+
+        same = mem.detect_changes(DetectChangesRequest(since="HEAD"))
+        assert same.changed_files == []
+
+        (repo_dir / "src" / "controller.py").write_bytes(
+            (repo_dir / "src" / "controller.py").read_bytes() + b"\n"
+        )
+        (repo_dir / "src" / "service.py").write_bytes(
+            (repo_dir / "src" / "service.py").read_bytes() + b"\n"
+        )
+        run_git_fixture(repo_dir, ["add", "--", "src/service.py"])
+        mem.configure_workspace(repo_dir)
+        dirty = mem.detect_changes(DetectChangesRequest())
+        assert dirty.changed_files == ["src/controller.py", "src/service.py"]
 
         # 7. get_code_snippet with neighbors
         snip = mem.get_code_snippet(

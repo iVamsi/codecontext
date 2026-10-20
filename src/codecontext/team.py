@@ -8,11 +8,13 @@ replaces the snapshot only after this store has joined the latest publish.
 import json
 import os
 import shutil
+import sqlite3
+import tempfile
 import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from codecontext.archive import execute_export
+from codecontext.archive import execute_export, sanitized_bare_git_config
 from codecontext.errors import CodeContextError
 from codecontext.git import run_safe_git
 from codecontext.identity import sha256_bytes
@@ -237,19 +239,118 @@ def execute_publish(store: Store, destination: Path) -> ExportReport:
     return report.model_copy(update={"destination": str(dest)})
 
 
-def _copy_share(share_dir: Path, store_path: Path) -> None:
-    if store_path.exists() or store_path.is_symlink():
-        if store_path.is_symlink():
-            raise CodeContextError(
-                code="INVALID_REQUEST",
-                message="Refusing to replace a symlinked store path.",
-                retryable=False,
-            )
-        shutil.rmtree(store_path)
-    shutil.copytree(share_dir, store_path, symlinks=False)
-    manifest = store_path / "manifest.json"
-    if manifest.exists() and not manifest.is_symlink():
-        manifest.unlink()
+def _refuse_symlink(path: Path, message: str) -> None:
+    if path.is_symlink():
+        raise CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
+
+
+def _copy_regular_file(src: Path, dst: Path) -> None:
+    _refuse_symlink(src, "Shared snapshot contains a symlink.")
+    if not src.is_file():
+        raise CodeContextError(
+            code="STORE_NOT_INITIALIZED",
+            message="Shared snapshot is missing a required file.",
+            retryable=False,
+        )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _copy_regular_tree(src: Path, dst: Path) -> None:
+    _refuse_symlink(src, "Shared snapshot contains a symlink.")
+    if not src.is_dir():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        current = dst / Path(dirpath).relative_to(src)
+        kept: list[str] = []
+        for name in dirnames:
+            child = Path(dirpath) / name
+            _refuse_symlink(child, "Shared snapshot contains a symlink.")
+            kept.append(name)
+            (current / name).mkdir(parents=True, exist_ok=True)
+        dirnames[:] = kept
+        for name in filenames:
+            child = Path(dirpath) / name
+            _refuse_symlink(child, "Shared snapshot contains a symlink.")
+            if not child.is_file():
+                continue
+            shutil.copyfile(child, current / name)
+
+
+def _import_share(share_dir: Path, store_path: Path) -> None:
+    """Copy only the snapshot database, identity, and git objects. Runtime dirs are created empty."""
+    store_path.mkdir(parents=True, exist_ok=True)
+    _copy_regular_file(share_dir / "store.json", store_path / "store.json")
+    _copy_regular_file(share_dir / "memory.sqlite3", store_path / "memory.sqlite3")
+    _copy_regular_file(share_dir / TEAM_FILE, store_path / TEAM_FILE)
+    overview = share_dir / "OVERVIEW.md"
+    if overview.is_file() and not overview.is_symlink():
+        _copy_regular_file(overview, store_path / "OVERVIEW.md")
+
+    src_git = share_dir / "repository.git"
+    if src_git.exists():
+        _refuse_symlink(src_git, "Shared snapshot contains a symlink.")
+        dest_git = store_path / "repository.git"
+        dest_git.mkdir(parents=True, exist_ok=True)
+        for name in ("HEAD", "packed-refs"):
+            src = src_git / name
+            if src.exists():
+                _copy_regular_file(src, dest_git / name)
+        for name in ("objects", "refs"):
+            src = src_git / name
+            if src.exists():
+                _copy_regular_tree(src, dest_git / name)
+        alternates = dest_git / "objects" / "info" / "alternates"
+        if alternates.exists() and not alternates.is_symlink():
+            alternates.unlink()
+        with sqlite3.connect(store_path / "memory.sqlite3") as conn:
+            row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
+        obj_fmt = str(row[0]) if row else "sha1"
+        (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
+    (store_path / "tmp").mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_checkout_ignore(store_dir: Path, final_dest: Path, resolved_repo: Path) -> None:
+    if final_dest.name != ".codecontext" or final_dest.parent != resolved_repo:
+        return
+    ignore = store_dir / ".gitignore"
+    if ignore.is_symlink():
+        ignore.unlink()
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+
+
+def _dir_is_empty(path: Path) -> bool:
+    return next(path.iterdir(), None) is None
+
+
+def _matching_store(dest: Path, repository_id: str) -> bool:
+    store_json = dest / "store.json"
+    db_file = dest / "memory.sqlite3"
+    if not store_json.exists() and not db_file.exists():
+        return False
+    if store_json.is_symlink() or db_file.is_symlink() or not store_json.is_file() or not db_file.is_file():
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Refusing to replace a directory that is not a CodeContext store.",
+            retryable=False,
+        )
+    try:
+        raw = json.loads(store_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Refusing to replace a directory that is not a CodeContext store.",
+            retryable=False,
+        ) from exc
+    if not isinstance(raw, dict) or raw.get("repository_id") != repository_id:
+        raise CodeContextError(
+            code="REPOSITORY_MISMATCH",
+            message="Local store belongs to a different project memory.",
+            retryable=False,
+        )
+    return True
 
 
 def _rebind(store_path: Path, repo_path: Path) -> None:
@@ -318,33 +419,50 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
             retryable=False,
         )
 
-    if (dest / "store.json").is_file():
-        raw = json.loads((dest / "store.json").read_text(encoding="utf-8"))
-        if raw.get("repository_id") != team["repository_id"]:
-            raise CodeContextError(
-                code="REPOSITORY_MISMATCH",
-                message="Local store belongs to a different project memory.",
-                retryable=False,
-            )
-        existing = Store.open(dest, read_only=True)
-        try:
-            local_gen = _store_generation(existing)
-        finally:
-            existing.close()
-        local_published = None
-        local_team = dest / TEAM_FILE
-        if local_team.is_file() and not local_team.is_symlink():
-            local_published = str(_read_team(dest)["published_at"])
-        share_published = str(team["published_at"])
-        if local_published is not None and local_published > share_published:
-            raise CodeContextError(
-                code="INVALID_REQUEST",
-                message="Shared memory is older than this store. Publish the newer memory.",
-                retryable=False,
-            )
-        if local_published == share_published and local_gen >= int(team["generation"]):
-            _rebind(dest, repo_path)
-            return
+    if dest.exists():
+        if not _dir_is_empty(dest):
+            if not _matching_store(dest, str(team["repository_id"])):
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Refusing to replace a nonempty directory that is not this project's store.",
+                    retryable=False,
+                )
+            existing = Store.open(dest, read_only=True)
+            try:
+                local_gen = _store_generation(existing)
+            finally:
+                existing.close()
+            local_published = None
+            local_team = dest / TEAM_FILE
+            if local_team.is_file() and not local_team.is_symlink():
+                local_published = str(_read_team(dest)["published_at"])
+            share_published = str(team["published_at"])
+            if local_published is not None and local_published > share_published:
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Shared memory is older than this store. Publish the newer memory.",
+                    retryable=False,
+                )
+            if local_published == share_published and local_gen >= int(team["generation"]):
+                _rebind(dest, repo_path)
+                _ensure_checkout_ignore(dest, dest, resolved_repo)
+                return
 
-    _copy_share(share, dest)
-    _rebind(dest, repo_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}.joining-", dir=dest.parent))
+    try:
+        _import_share(share, staging)
+        _rebind(staging, repo_path)
+        _ensure_checkout_ignore(staging, dest, resolved_repo)
+        if dest.exists():
+            if _dir_is_empty(dest):
+                dest.rmdir()
+                os.rename(staging, dest)
+            else:
+                _replace_tree(staging, dest)
+        else:
+            os.rename(staging, dest)
+    except Exception:
+        if staging.exists() and not staging.is_symlink():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise

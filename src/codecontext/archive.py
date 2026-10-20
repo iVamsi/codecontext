@@ -286,6 +286,15 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
     )
 
 
+def sanitized_bare_git_config(obj_fmt: str) -> str:
+    fmt_version = "1" if obj_fmt == "sha256" else "0"
+    ext_section = "\n[extensions]\n\tobjectFormat = sha256\n" if obj_fmt == "sha256" else ""
+    return (
+        f"[core]\n\trepositoryformatversion = {fmt_version}\n\tfilemode = true\n\tbare = true\n"
+        f"[gc]\n\tauto = 0\n{ext_section}"
+    )
+
+
 def execute_export(store: Store, request: ExportRequest) -> ExportReport:
     """Create a portable, read-only offline archive at `request.destination` (which must not exist).
     Scrubs machine-specific paths and credentials from SQLite (`secure_delete=ON` + `VACUUM`),
@@ -408,14 +417,7 @@ def execute_export(store: Store, request: ExportRequest) -> ExportReport:
                     elif src_sub.is_file():
                         shutil.copy2(src_sub, dst_sub)
 
-                # Write minimal sanitized bare Git config
-                fmt_version = "1" if obj_fmt == "sha256" else "0"
-                ext_section = "\n[extensions]\n\tobjectFormat = sha256\n" if obj_fmt == "sha256" else ""
-                sanitized_git_config = (
-                    f"[core]\n\trepositoryformatversion = {fmt_version}\n\tfilemode = true\n\tbare = true\n"
-                    f"[gc]\n\tauto = 0\n{ext_section}"
-                )
-                (dest_git / "config").write_text(sanitized_git_config, encoding="utf-8")
+                (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
             elif not request.include_git_objects:
                 warnings.append(
                     "Git objects were omitted (--metadata-only); offline source/code expansion is not guaranteed."

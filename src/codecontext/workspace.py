@@ -209,8 +209,7 @@ def inspect_workspace(
         )
 
     observed_iso = us_to_iso_z(now_us())
-    empty_hooks = store.tmp_dir / "_empty_hooks"
-    empty_hooks.mkdir(parents=True, exist_ok=True)
+    empty_hooks = Path(os.devnull)
     gaps: list[Gap] = []
 
     try:

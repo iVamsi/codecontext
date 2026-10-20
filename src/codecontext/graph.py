@@ -167,24 +167,78 @@ def _kind_to_label(sym_kind: str) -> str:
 
 
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
-UNSAFE_NESTED_QUANTIFIER_RE = re.compile(
-    r"\([^)]*[+*?}][^)]*\)\s*(?:[+*?]|\{\d)"
-)
+
+
+def _quantified_group_can_backtrack(pattern: str) -> bool:
+    """Reject a group that is itself quantified and contains `|` or another quantifier."""
+    stack: list[list[bool]] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        char = pattern[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":
+            i += 1
+            if i < n and pattern[i] == "^":
+                i += 1
+            if i < n and pattern[i] == "]":
+                i += 1
+            while i < n and pattern[i] != "]":
+                if pattern[i] == "\\":
+                    i += 2
+                else:
+                    i += 1
+            i += 1
+            continue
+        if char == "(":
+            stack.append([False, False])
+            i += 1
+            continue
+        if char == "|" and stack:
+            stack[-1][0] = True
+            i += 1
+            continue
+        if char == ")" and stack:
+            has_alt, has_quant = stack.pop()
+            i += 1
+            quantified = False
+            if i < n and pattern[i] in "*+?":
+                quantified = True
+                i += 1
+                if i < n and pattern[i] in "?+":
+                    i += 1
+            elif i < n and pattern[i] == "{":
+                quantified = True
+                while i < n and pattern[i] != "}":
+                    i += 1
+                i += 1
+            if quantified and (has_alt or has_quant):
+                return True
+            if stack and has_alt:
+                stack[-1][0] = True
+            if stack and (quantified or has_quant):
+                stack[-1][1] = True
+            continue
+        if char in "*+?" or char == "{":
+            if stack:
+                stack[-1][1] = True
+            i += 1
+            continue
+        i += 1
+    return False
 
 
 def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
-    """Compile a user-supplied regex while rejecting catastrophic backtracking (ReDoS) constructs:
-    - Length > `max_length`
-    - Backreferences or lookaround assertions
-    - Quantified groups containing inner quantifiers (`(a+)+`, `(.*)*`, `(a|aa)+`).
-    """
+    """Compile a user regex, rejecting backreferences, lookaround, and quantified groups that can backtrack."""
     if len(pattern) > max_length:
         raise CodeContextError(
             code="INVALID_REQUEST",
             message=f"Regex pattern exceeds maximum allowed length ({max_length}).",
             retryable=False,
         )
-    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or UNSAFE_NESTED_QUANTIFIER_RE.search(pattern):
+    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or _quantified_group_can_backtrack(pattern):
         raise CodeContextError(
             code="INVALID_REQUEST",
             message="Unsafe regex pattern rejected (nested quantifiers, lookarounds, or backreferences are forbidden).",
@@ -978,7 +1032,9 @@ def execute_detect_changes(
             )
 
     changed_paths: set[str] = set()
+    compared = False
     if request.since:
+        compared = True
         src_repo = mirror.verify_source_binding()
         base_oid = mirror.resolve_source_revision(src_repo, request.since)
         raw_changes = mirror.diff_tree_parent(base_oid, active_rev, parent_index=0)
@@ -988,7 +1044,7 @@ def execute_detect_changes(
             if rc.old_path is not None:
                 changed_paths.add(path_bytes_to_display(rc.old_path)[0])
     elif workspace_path is not None and workspace_path.exists():
-        # Compare workspace HEAD tree against active_rev tree without touching or refreshing the index
+        compared = True
         ws_head_proc = run_safe_git(
             ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
             cwd=workspace_path,
@@ -1004,9 +1060,23 @@ def execute_detect_changes(
                         changed_paths.add(path_bytes_to_display(rc.new_path)[0])
                     if rc.old_path is not None:
                         changed_paths.add(path_bytes_to_display(rc.old_path)[0])
+        for diff_args in (
+            ["diff-index", "-z", "--name-only", "--cached", "HEAD"],
+            ["diff-files", "-z", "--name-only"],
+        ):
+            diff_proc = run_safe_git(
+                diff_args,
+                cwd=workspace_path,
+                empty_hooks_dir=mirror.empty_hooks_dir,
+                check=False,
+            )
+            if diff_proc.returncode != 0:
+                continue
+            for part in diff_proc.stdout.split(b"\0"):
+                if part:
+                    changed_paths.add(path_bytes_to_display(part)[0])
 
-    if not changed_paths:
-        # Fallback: changes in the latest active commit (`active_rev`)
+    if not changed_paths and not compared:
         with store.connect_read() as conn:
             c_rows = conn.execute(
                 "SELECT new_path, old_path FROM changes WHERE commit_oid = ?",

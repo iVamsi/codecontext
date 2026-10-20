@@ -385,6 +385,35 @@ def verify_and_bind_gitlab_project(
     return f"gitlab:{proj_num_id}"
 
 
+def _gitlab_cursor(store: Store, key: str) -> dict[str, Any]:
+    with store.connect_read() as conn:
+        row = conn.execute(
+            "SELECT cursor_json FROM checkpoints WHERE stream_key = ?",
+            (key,),
+        ).fetchone()
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(str(row["cursor_json"]))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_gitlab_cursor(store: Store, key: str, payload: dict[str, Any]) -> None:
+    with store.write_transaction(bump_generation=False) as conn:
+        conn.execute(
+            """
+            INSERT INTO checkpoints (stream_key, cursor_json, last_success_at_us)
+            VALUES (?, ?, ?)
+            ON CONFLICT(stream_key) DO UPDATE SET
+                cursor_json = excluded.cursor_json,
+                last_success_at_us = excluded.last_success_at_us
+            """,
+            (key, canonical_json(payload), now_us()),
+        )
+
+
 def collect_gitlab_merge_requests_and_issues(
     store: Store,
     client: GitLabClient,
@@ -411,177 +440,222 @@ def collect_gitlab_merge_requests_and_issues(
         project_path=project_path,
         remaining_requests=budget_left(),
     )
+    stream_key = f"gitlab:{proj_id_str}:collection"
+    cursor = _gitlab_cursor(store, stream_key)
+    if cursor.get("phase") == "done":
+        cursor = {}
+
+    phase = str(cursor.get("phase") or "merge_requests")
+    page = str(cursor.get("page") or "1")
+    skip_iid = cursor.get("skip_iid") if isinstance(cursor.get("skip_iid"), int) else None
+    discussion_iid = cursor.get("discussion_iid") if isinstance(cursor.get("discussion_iid"), int) else None
+    discussion_page = str(cursor.get("discussion_page") or "1")
+
+    def paused(payload: dict[str, Any]) -> tuple[int, int, int, bool]:
+        _save_gitlab_cursor(store, stream_key, payload)
+        return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
 
     # 1. Enumerate Merge Requests (`/projects/{id}/merge_requests?state=all&per_page=100`)
-    page = "1"
-    while page:
-        if budget_left() <= 0:
-            return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
-        st_mr, mrs_data, next_p = client.get_json(
-            f"/projects/{encoded_proj}/merge_requests?state=all&per_page=100&page={page}",
-            remaining_requests=budget_left(),
-        )
-        if st_mr == 404 or not isinstance(mrs_data, list):
-            break
+    if phase != "issues":
+        passed_skip = skip_iid is None
+        while page:
+            if budget_left() <= 0:
+                return paused({"phase": "merge_requests", "page": page, "skip_iid": skip_iid,
+                               "discussion_iid": discussion_iid, "discussion_page": discussion_page})
+            st_mr, mrs_data, next_p = client.get_json(
+                f"/projects/{encoded_proj}/merge_requests?state=all&per_page=100&page={page}",
+                remaining_requests=budget_left(),
+            )
+            if st_mr == 404 or not isinstance(mrs_data, list):
+                break
 
-        for mr in mrs_data:
-            if not isinstance(mr, dict) or "iid" not in mr:
-                continue
-            iid = int(mr["iid"])
-            merge_sha = mr.get("merge_commit_sha") or mr.get("squash_commit_sha")
-            head_sha = mr.get("sha")
-            author_raw = mr.get("author") or {}
-            author_dict = {
-                "id": author_raw.get("id"),
-                "login": author_raw.get("username") or author_raw.get("name"),
-            }
-            with store.write_transaction(bump_generation=True) as conn:
-                mr_src_id, mr_ver_id, s_a, v_a = upsert_github_source_and_version(
-                    conn,
-                    repository_id=repo_uuid,
-                    repository_provider_id=proj_id_str,
-                    kind="pull_request",
-                    provider_id=str(iid),
-                    parent_source_id=None,
-                    title=mr.get("title"),
-                    body=mr.get("description"),
-                    author_dict=author_dict,
-                    source_url=mr.get("web_url"),
-                    authored_at_us=_parse_opt_time_us(mr.get("created_at")),
-                    updated_at_us=_parse_opt_time_us(mr.get("updated_at")),
-                    anchors={
-                        "commit_id": head_sha,
-                        "merge_commit_sha": merge_sha,
-                        "number": iid,
-                    },
-                    lifecycle_fields={
-                        "merged_at": mr.get("merged_at"),
-                        "state": mr.get("state"),
-                    },
-                    raw_payload=mr,
-                )
-                if s_a:
-                    sources_added += 1
-                if v_a:
-                    versions_added += 1
+            for mr in mrs_data:
+                if not isinstance(mr, dict) or "iid" not in mr:
+                    continue
+                iid = int(mr["iid"])
+                if not passed_skip:
+                    if iid == skip_iid:
+                        passed_skip = True
+                    continue
+                merge_sha = mr.get("merge_commit_sha") or mr.get("squash_commit_sha")
+                head_sha = mr.get("sha")
+                author_raw = mr.get("author") or {}
+                author_dict = {
+                    "id": author_raw.get("id"),
+                    "login": author_raw.get("username") or author_raw.get("name"),
+                }
+                with store.write_transaction(bump_generation=True) as conn:
+                    mr_src_id, mr_ver_id, s_a, v_a = upsert_github_source_and_version(
+                        conn,
+                        repository_id=repo_uuid,
+                        repository_provider_id=proj_id_str,
+                        kind="pull_request",
+                        provider_id=str(iid),
+                        parent_source_id=None,
+                        title=mr.get("title"),
+                        body=mr.get("description"),
+                        author_dict=author_dict,
+                        source_url=mr.get("web_url"),
+                        authored_at_us=_parse_opt_time_us(mr.get("created_at")),
+                        updated_at_us=_parse_opt_time_us(mr.get("updated_at")),
+                        anchors={
+                            "commit_id": head_sha,
+                            "merge_commit_sha": merge_sha,
+                            "number": iid,
+                        },
+                        lifecycle_fields={
+                            "merged_at": mr.get("merged_at"),
+                            "state": mr.get("state"),
+                        },
+                        raw_payload=mr,
+                    )
+                    if s_a:
+                        sources_added += 1
+                    if v_a:
+                        versions_added += 1
 
-                ep_id = make_episode_id(repository_id=repo_uuid, pr_source_id=mr_src_id)
-                cand_c = merge_sha or head_sha
-                ep_c_oid: str | None = None
-                if cand_c:
-                    has_c = conn.execute("SELECT 1 FROM commits WHERE oid = ?", (cand_c,)).fetchone()
-                    if has_c:
-                        ep_c_oid = str(cand_c)
-                conn.execute(
-                    """
-                    INSERT INTO episodes (id, kind, primary_source_id, commit_oid, input_fingerprint, state)
-                    VALUES (?, 'pr', ?, ?, ?, 'pending')
-                    ON CONFLICT(id) DO UPDATE SET
-                        commit_oid = COALESCE(episodes.commit_oid, excluded.commit_oid),
-                        input_fingerprint = excluded.input_fingerprint
-                    """,
-                    (ep_id, mr_src_id, ep_c_oid, mr_ver_id),
-                )
-                for c_sha in [s for s in (merge_sha, head_sha) if s]:
-                    conn.execute(
-                        "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
-                        (c_sha,),
-                    )
-                    rel_id = make_relation_id(
-                        from_kind="commit",
-                        from_id=c_sha,
-                        to_kind="source",
-                        to_id=mr_src_id,
-                        relation_kind="associated_pr",
-                        method="gitlab_mr_association",
-                    )
+                    ep_id = make_episode_id(repository_id=repo_uuid, pr_source_id=mr_src_id)
+                    cand_c = merge_sha or head_sha
+                    ep_c_oid: str | None = None
+                    if cand_c:
+                        has_c = conn.execute("SELECT 1 FROM commits WHERE oid = ?", (cand_c,)).fetchone()
+                        if has_c:
+                            ep_c_oid = str(cand_c)
                     conn.execute(
                         """
-                        INSERT INTO relations (
-                            id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
-                        ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'gitlab_mr_association', 'exact', NULL, '{}', 'active')
-                        ON CONFLICT(id) DO NOTHING
+                        INSERT INTO episodes (id, kind, primary_source_id, commit_oid, input_fingerprint, state)
+                        VALUES (?, 'pr', ?, ?, ?, 'pending')
+                        ON CONFLICT(id) DO UPDATE SET
+                            commit_oid = COALESCE(episodes.commit_oid, excluded.commit_oid),
+                            input_fingerprint = excluded.input_fingerprint
                         """,
-                        (rel_id, c_sha, mr_src_id),
+                        (ep_id, mr_src_id, ep_c_oid, mr_ver_id),
                     )
-
-            # Fetch MR discussions/notes (`/projects/{id}/merge_requests/{iid}/discussions`)
-            if budget_left() > 0:
-                st_d, discs_data, _ = client.get_json(
-                    f"/projects/{encoded_proj}/merge_requests/{iid}/discussions?per_page=100",
-                    remaining_requests=budget_left(),
-                )
-                if st_d == 200 and isinstance(discs_data, list):
-                    with store.write_transaction(bump_generation=True) as conn:
-                        for disc in discs_data:
-                            if not isinstance(disc, dict):
-                                continue
-                            notes = disc.get("notes")
-                            if not isinstance(notes, list):
-                                continue
-                            for note in notes:
-                                if not isinstance(note, dict) or note.get("system") is True or "id" not in note:
-                                    continue
-                                n_auth = note.get("author") or {}
-                                pos = note.get("position")
-                                is_diff_note = isinstance(pos, dict) and bool(pos.get("new_path") or pos.get("old_path"))
-                                n_kind = "review_comment" if is_diff_note else "issue_comment"
-                                n_anchors = (
-                                    {
-                                        "commit_id": pos.get("head_sha"),
-                                        "line": pos.get("new_line") or pos.get("old_line"),
-                                        "original_commit_id": pos.get("start_sha") or pos.get("base_sha"),
-                                        "original_line": pos.get("old_line") or pos.get("new_line"),
-                                        "path": pos.get("new_path") or pos.get("old_path"),
-                                        "side": "RIGHT" if pos.get("new_line") else "LEFT",
-                                    }
-                                    if is_diff_note and isinstance(pos, dict)
-                                    else {"mr_iid": iid}
-                                )
-                                _, _, sa, va = upsert_github_source_and_version(
-                                    conn,
-                                    repository_id=repo_uuid,
-                                    repository_provider_id=proj_id_str,
-                                    kind=n_kind,
-                                    provider_id=str(note["id"]),
-                                    parent_source_id=mr_src_id,
-                                    title=None,
-                                    body=note.get("body"),
-                                    author_dict={
-                                        "id": n_auth.get("id"),
-                                        "login": n_auth.get("username") or n_auth.get("name"),
-                                    },
-                                    source_url=None,
-                                    authored_at_us=_parse_opt_time_us(note.get("created_at")),
-                                    updated_at_us=_parse_opt_time_us(note.get("updated_at")),
-                                    anchors=n_anchors,
-                                    lifecycle_fields={},
-                                    raw_payload=note,
-                                )
-                                if sa:
-                                    sources_added += 1
-                                if va:
-                                    versions_added += 1
-
-                        child_vers = conn.execute(
-                            "SELECT current_version_id FROM sources WHERE id = ? OR parent_source_id = ? ORDER BY id ASC",
-                            (mr_src_id, mr_src_id),
-                        ).fetchall()
-                        ep_fp = canonical_sha256(
-                            [str(r["current_version_id"]) for r in child_vers if r["current_version_id"]]
+                    for c_sha in [s for s in (merge_sha, head_sha) if s]:
+                        conn.execute(
+                            "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
+                            (c_sha,),
+                        )
+                        rel_id = make_relation_id(
+                            from_kind="commit",
+                            from_id=c_sha,
+                            to_kind="source",
+                            to_id=mr_src_id,
+                            relation_kind="associated_pr",
+                            method="gitlab_mr_association",
                         )
                         conn.execute(
-                            "UPDATE episodes SET input_fingerprint = ? WHERE id = ?",
-                            (ep_fp, ep_id),
+                            """
+                            INSERT INTO relations (
+                                id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                            ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'gitlab_mr_association', 'exact', NULL, '{}', 'active')
+                            ON CONFLICT(id) DO NOTHING
+                            """,
+                            (rel_id, c_sha, mr_src_id),
                         )
 
-        page = next_p
+                disc_page = discussion_page if discussion_iid == iid else "1"
+                while disc_page:
+                    if budget_left() <= 0:
+                        return paused(
+                            {
+                                "discussion_iid": iid,
+                                "discussion_page": disc_page,
+                                "page": page,
+                                "phase": "merge_requests",
+                                "skip_iid": skip_iid,
+                            }
+                        )
+                    st_d, discs_data, next_d = client.get_json(
+                        f"/projects/{encoded_proj}/merge_requests/{iid}/discussions?per_page=100&page={disc_page}",
+                        remaining_requests=budget_left(),
+                    )
+                    if st_d == 200 and isinstance(discs_data, list):
+                        with store.write_transaction(bump_generation=True) as conn:
+                            for disc in discs_data:
+                                if not isinstance(disc, dict):
+                                    continue
+                                notes = disc.get("notes")
+                                if not isinstance(notes, list):
+                                    continue
+                                for note in notes:
+                                    if not isinstance(note, dict) or note.get("system") is True or "id" not in note:
+                                        continue
+                                    n_auth = note.get("author") or {}
+                                    pos = note.get("position")
+                                    is_diff_note = isinstance(pos, dict) and bool(pos.get("new_path") or pos.get("old_path"))
+                                    n_kind = "review_comment" if is_diff_note else "issue_comment"
+                                    n_anchors = (
+                                        {
+                                            "commit_id": pos.get("head_sha"),
+                                            "line": pos.get("new_line") or pos.get("old_line"),
+                                            "original_commit_id": pos.get("start_sha") or pos.get("base_sha"),
+                                            "original_line": pos.get("old_line") or pos.get("new_line"),
+                                            "path": pos.get("new_path") or pos.get("old_path"),
+                                            "side": "RIGHT" if pos.get("new_line") else "LEFT",
+                                        }
+                                        if is_diff_note and isinstance(pos, dict)
+                                        else {"mr_iid": iid}
+                                    )
+                                    _, _, sa, va = upsert_github_source_and_version(
+                                        conn,
+                                        repository_id=repo_uuid,
+                                        repository_provider_id=proj_id_str,
+                                        kind=n_kind,
+                                        provider_id=str(note["id"]),
+                                        parent_source_id=mr_src_id,
+                                        title=None,
+                                        body=note.get("body"),
+                                        author_dict={
+                                            "id": n_auth.get("id"),
+                                            "login": n_auth.get("username") or n_auth.get("name"),
+                                        },
+                                        source_url=None,
+                                        authored_at_us=_parse_opt_time_us(note.get("created_at")),
+                                        updated_at_us=_parse_opt_time_us(note.get("updated_at")),
+                                        anchors=n_anchors,
+                                        lifecycle_fields={},
+                                        raw_payload=note,
+                                    )
+                                    if sa:
+                                        sources_added += 1
+                                    if va:
+                                        versions_added += 1
+
+                            child_vers = conn.execute(
+                                "SELECT current_version_id FROM sources WHERE id = ? OR parent_source_id = ? ORDER BY id ASC",
+                                (mr_src_id, mr_src_id),
+                            ).fetchall()
+                            ep_fp = canonical_sha256(
+                                [str(r["current_version_id"]) for r in child_vers if r["current_version_id"]]
+                            )
+                            conn.execute(
+                                "UPDATE episodes SET input_fingerprint = ? WHERE id = ?",
+                                (ep_fp, ep_id),
+                            )
+                    disc_page = next_d if st_d == 200 else None
+                skip_iid = iid
+                discussion_iid = None
+                discussion_page = "1"
+                _save_gitlab_cursor(
+                    store,
+                    stream_key,
+                    {"page": page, "phase": "merge_requests", "skip_iid": iid},
+                )
+
+            page = next_p
+            skip_iid = None
+            passed_skip = True
+            if page:
+                _save_gitlab_cursor(store, stream_key, {"page": page, "phase": "merge_requests"})
+        phase = "issues"
+        page = "1"
 
     # 2. Enumerate GitLab Issues (`/projects/{id}/issues?state=all&per_page=100`)
-    iss_page = "1"
+    iss_page = page if phase == "issues" else "1"
     while iss_page:
         if budget_left() <= 0:
-            return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
+            return paused({"page": iss_page, "phase": "issues"})
         st_i, issues_data, next_ip = client.get_json(
             f"/projects/{encoded_proj}/issues?state=all&per_page=100&page={iss_page}",
             remaining_requests=budget_left(),
@@ -618,15 +692,8 @@ def collect_gitlab_merge_requests_and_issues(
                 if va:
                     versions_added += 1
         iss_page = next_ip
+        if iss_page:
+            _save_gitlab_cursor(store, stream_key, {"page": iss_page, "phase": "issues"})
 
-    with store.write_transaction(bump_generation=False) as conn:
-        conn.execute(
-            """
-            INSERT INTO checkpoints (stream_key, cursor_json, last_success_at_us)
-            VALUES (?, ?, ?)
-            ON CONFLICT(stream_key) DO UPDATE SET cursor_json = excluded.cursor_json, last_success_at_us = excluded.last_success_at_us
-            """,
-            (f"github:{proj_id_str}:issues_all", canonical_json({"done": True}), now_us()),
-        )
-
+    _save_gitlab_cursor(store, stream_key, {"phase": "done"})
     return (client.requests_attempted - start_reqs, sources_added, versions_added, True)
