@@ -80,6 +80,61 @@ def parse_gitlab_remote_url(raw_url: str) -> tuple[str, str] | None:
     return None
 
 
+def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
+    """Resolve GitLab token from `GITLAB_TOKEN`, `glab` CLI config, or configured MCP servers (`~/.cursor/mcp.json`, `~/.claude.json`)."""
+    env_tok = os.environ.get("GITLAB_TOKEN") or os.environ.get("GLAB_TOKEN")
+    if env_tok:
+        return env_tok.strip()
+
+    import shutil
+    import subprocess
+
+    host = urllib.parse.urlparse(base_url).netloc or "gitlab.com"
+    glab_bin = shutil.which("glab") or "/opt/homebrew/bin/glab"
+    if os.path.isfile(glab_bin) and os.access(glab_bin, os.X_OK):
+        try:
+            proc = subprocess.run(
+                [glab_bin, "config", "get", "token", "--host", host],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except OSError:
+            pass
+
+    for cfg_path in (Path.home() / ".cursor" / "mcp.json", Path.home() / ".claude.json"):
+        try:
+            if not cfg_path.is_file():
+                continue
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") if isinstance(data, dict) else None
+            if not isinstance(servers, dict):
+                continue
+            for srv_name, srv_cfg in servers.items():
+                if "gitlab" not in str(srv_name).lower() or not isinstance(srv_cfg, dict):
+                    continue
+                env_map = srv_cfg.get("env")
+                if isinstance(env_map, dict):
+                    for k in ("GITLAB_PERSONAL_ACCESS_TOKEN", "GITLAB_TOKEN", "GLAB_TOKEN"):
+                        if env_map.get(k):
+                            return str(env_map[k]).strip()
+                headers = srv_cfg.get("headers")
+                if isinstance(headers, dict):
+                    pt = headers.get("PRIVATE-TOKEN") or headers.get("private-token")
+                    if pt:
+                        return str(pt).strip()
+                    auth_h = str(headers.get("Authorization") or headers.get("authorization") or "").strip()
+                    if auth_h.lower().startswith("bearer "):
+                        return auth_h[7:].strip()
+        except Exception:
+            pass
+
+    return None
+
+
 class GitLabClient:
     """Synchronous GET client for GitLab REST API v4 (`/api/v4/...`) with streaming 32 MiB limit."""
 
@@ -91,7 +146,11 @@ class GitLabClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token if token is not None else os.environ.get("GITLAB_TOKEN")
+        self.token = (
+            token
+            if token is not None
+            else (os.environ.get("GITLAB_TOKEN") if transport is not None else resolve_gitlab_token(self.base_url))
+        )
         headers = {
             "Accept": "application/json",
             "User-Agent": USER_AGENT,

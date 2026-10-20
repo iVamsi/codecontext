@@ -96,6 +96,62 @@ class HttpFetchResult:
     body_too_large: bool = False
 
 
+def resolve_github_token() -> str | None:
+    """Resolve GitHub token from `GITHUB_TOKEN`, `gh auth token` CLI, or configured MCP servers (`~/.cursor/mcp.json`, `~/.claude.json`)."""
+    env_tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if env_tok:
+        return env_tok.strip()
+
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    # 1. Try `gh auth token` CLI
+    gh_bin = shutil.which("gh") or "/opt/homebrew/bin/gh"
+    if os.path.isfile(gh_bin) and os.access(gh_bin, os.X_OK):
+        try:
+            proc = subprocess.run(
+                [gh_bin, "auth", "token"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except OSError:
+            pass
+
+    # 2. Check configured GitHub MCP server in `~/.cursor/mcp.json` or `~/.claude.json`
+    for cfg_path in (Path.home() / ".cursor" / "mcp.json", Path.home() / ".claude.json"):
+        try:
+            if not cfg_path.is_file():
+                continue
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") if isinstance(data, dict) else None
+            if not isinstance(servers, dict):
+                continue
+            for srv_name, srv_cfg in servers.items():
+                if "github" not in str(srv_name).lower() or not isinstance(srv_cfg, dict):
+                    continue
+                env_map = srv_cfg.get("env")
+                if isinstance(env_map, dict):
+                    for k in ("GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+                        if env_map.get(k):
+                            return str(env_map[k]).strip()
+                headers = srv_cfg.get("headers")
+                if isinstance(headers, dict):
+                    auth_h = str(headers.get("Authorization") or headers.get("authorization") or "").strip()
+                    if auth_h.lower().startswith("bearer "):
+                        return auth_h[7:].strip()
+                    if auth_h.lower().startswith("token "):
+                        return auth_h[6:].strip()
+        except Exception:
+            pass
+
+    return None
+
+
 class GitHubClient:
     """Synchronous GET client for `https://api.github.com` with streaming 32 MiB enforcement,
     ETag/Last-Modified support, budget accounting, and rate-limit handling.
@@ -108,7 +164,11 @@ class GitHubClient:
         transport: httpx.BaseTransport | None = None,
         sleep_fn: Any = time.sleep,
     ) -> None:
-        self.token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+        self.token = (
+            token
+            if token is not None
+            else (os.environ.get("GITHUB_TOKEN") if transport is not None else resolve_github_token())
+        )
         self._sleep_fn = sleep_fn
         headers = {
             "Accept": "application/vnd.github+json",
