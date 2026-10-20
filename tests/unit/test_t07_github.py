@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from codecontext.github import (
     collect_focused_github_evidence,
     verify_and_bind_github_repository,
 )
-from codecontext.gitlab import parse_gitlab_remote_url
+from codecontext.gitlab import GitLabClient, parse_gitlab_remote_url, resolve_gitlab_token
 from codecontext.models import InitRequest
 from codecontext.store import Store
 from tests.fixtures.builders import build_f01_fixture
@@ -274,5 +275,31 @@ def test_principal_binding_api_caps_and_error_handling(tmp_path: Path) -> None:
         "team/service",
     )
     assert parse_gitlab_remote_url("http://gitlab.example.internal/team/service.git") is None
+    assert parse_gitlab_remote_url("https://gitlab.com@evil.example/org/proj.git") is None
+    assert parse_gitlab_remote_url("https://user:secret@gitlab.com/org/proj.git") is None
+    assert parse_gitlab_remote_url("https://notgitlab.com/org/proj.git") is None
 
     store.close()
+
+
+def test_gitlab_env_token_stays_on_named_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+    monkeypatch.delenv("GLAB_TOKEN", raising=False)
+    monkeypatch.delenv("GITLAB_HOST", raising=False)
+    monkeypatch.setattr("codecontext.gitlab.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "codecontext.gitlab.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
+    )
+    assert resolve_gitlab_token("https://gitlab.com") == "glpat-test"
+    assert resolve_gitlab_token("https://gitlab.example.internal") is None
+    assert resolve_gitlab_token("https://gitlab.com@evil.example") is None
+    monkeypatch.setenv("GITLAB_HOST", "gitlab.example.internal")
+    assert resolve_gitlab_token("https://gitlab.example.internal") == "glpat-test"
+    with pytest.raises(CodeContextError) as exc_info:
+        GitLabClient(base_url="https://oauth2:secret@gitlab.com@evil.example/org/proj.git", token="dummy-token")
+    assert exc_info.value.code == "INVALID_REQUEST"
+    assert "secret" not in exc_info.value.message
+    assert "dummy-token" not in exc_info.value.message

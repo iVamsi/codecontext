@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -31,8 +33,6 @@ def detect_gitlab_repository_from_git(repo_path: Path) -> tuple[str, str] | None
         "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
     }
-    import subprocess
-
     try:
         proc = subprocess.run(
             ["git", "-c", "core.fsmonitor=false", "config", "--get", "remote.origin.url"],
@@ -50,54 +50,102 @@ def detect_gitlab_repository_from_git(repo_path: Path) -> tuple[str, str] | None
     return None
 
 
+def _host_and_port(parsed: urllib.parse.ParseResult) -> tuple[str, int | None] | None:
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or parsed.username or parsed.password:
+        return None
+    return host, parsed.port
+
+
+def _is_gitlab_host(host: str) -> bool:
+    # ponytail: a DNS label equal to "gitlab" treats self-hosted hosts as GitLab. Upgrade: an explicit host allowlist.
+    return host == "gitlab.com" or host.endswith(".gitlab.com") or "gitlab" in host.split(".")
+
+
+def _https_origin(host: str, port: int | None) -> str:
+    if port not in (None, 443):
+        return f"https://{host}:{port}"
+    return f"https://{host}"
+
+
+def _gitlab_origin(url: str) -> tuple[str, int | None] | None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        return None
+    ident = _host_and_port(parsed)
+    if ident is None or not _is_gitlab_host(ident[0]):
+        return None
+    return ident
+
+
+def _norm_port(port: int | None) -> int:
+    return 443 if port in (None, 443) else port
+
+
+def _same_endpoint(left: tuple[str, int | None], right: tuple[str, int | None]) -> bool:
+    return left[0] == right[0] and _norm_port(left[1]) == _norm_port(right[1])
+
+
+def _env_token_allowed(host: str, port: int | None) -> bool:
+    if (host == "gitlab.com" or host.endswith(".gitlab.com")) and _norm_port(port) == 443:
+        return True
+    raw = os.environ.get("GITLAB_HOST", "").strip()
+    if not raw:
+        return False
+    configured = _gitlab_origin(raw if "://" in raw else f"https://{raw}")
+    return configured is not None and _same_endpoint(configured, (host, port))
+
+
 def parse_gitlab_remote_url(raw_url: str) -> tuple[str, str] | None:
     """Parse a GitLab SSH or HTTPS remote URL into `(https_base_url, namespace/project)`."""
     url = raw_url.strip()
     if not url or "github.com" in url.lower():
         return None
     if url.startswith("git@"):
-        # git@gitlab.com:group/sub/repo.git
-        colon_idx = url.find(":")
-        if colon_idx == -1:
+        host, sep, proj = url[4:].partition(":")
+        host = host.lower().rstrip(".")
+        if not sep or "@" in host or not _is_gitlab_host(host):
             return None
-        host = url[4:colon_idx]
-        if "gitlab" not in host.lower():
-            return None
-        proj = url[colon_idx + 1 :].strip("/")
+        proj = proj.strip("/")
         if proj.endswith(".git"):
             proj = proj[:-4]
-        if "/" in proj:
-            return (f"https://{host}", proj)
+        if "/" in proj and ".." not in proj.split("/"):
+            return (_https_origin(host, None), proj)
         return None
 
-    parsed = urllib.parse.urlparse(url)
-    # Enforce HTTPS-only so PRIVATE-TOKEN is never transmitted over cleartext HTTP
-    if parsed.scheme == "https" and parsed.netloc and "gitlab" in parsed.netloc.lower():
-        proj = parsed.path.strip("/")
-        if proj.endswith(".git"):
-            proj = proj[:-4]
-        if "/" in proj:
-            return (f"https://{parsed.netloc}", proj)
+    ident = _gitlab_origin(url)
+    if ident is None:
+        return None
+    proj = urllib.parse.urlparse(url).path.strip("/")
+    if proj.endswith(".git"):
+        proj = proj[:-4]
+    if "/" in proj and ".." not in proj.split("/"):
+        return (_https_origin(*ident), proj)
     return None
 
 
 def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
-    """Resolve GitLab token from `GITLAB_TOKEN`, `glab` CLI config for the exact host,
-    or configured MCP servers matching `base_url`.
+    """Resolve a GitLab token for this exact host.
+
+    `GITLAB_TOKEN` and `GLAB_TOKEN` are used only for gitlab.com, its subdomains,
+    or the host named by `GITLAB_HOST`. Other hosts use `glab --host` or an MCP
+    config whose URL host matches exactly.
     """
-    env_tok = os.environ.get("GITLAB_TOKEN") or os.environ.get("GLAB_TOKEN")
-    if env_tok:
-        return env_tok.strip()
+    ident = _gitlab_origin(base_url)
+    if ident is None:
+        return None
+    host, port = ident
+    if _env_token_allowed(host, port):
+        env_tok = os.environ.get("GITLAB_TOKEN") or os.environ.get("GLAB_TOKEN")
+        if env_tok:
+            return env_tok.strip()
 
-    import shutil
-    import subprocess
-
-    host = (urllib.parse.urlparse(base_url).netloc or "gitlab.com").lower()
+    glab_host = host if port in (None, 443) else f"{host}:{port}"
     glab_bin = shutil.which("glab") or "/opt/homebrew/bin/glab"
     if os.path.isfile(glab_bin) and os.access(glab_bin, os.X_OK):
         try:
             proc = subprocess.run(
-                [glab_bin, "config", "get", "token", "--host", host],
+                [glab_bin, "config", "get", "token", "--host", glab_host],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -120,9 +168,13 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
                 if "gitlab" not in str(srv_name).lower() or not isinstance(srv_cfg, dict):
                     continue
                 # Verify MCP server targets the same GitLab host (defaults to gitlab.com)
-                srv_url = str(srv_cfg.get("url") or (srv_cfg.get("env") or {}).get("GITLAB_API_URL") or "https://gitlab.com")
-                srv_host = (urllib.parse.urlparse(srv_url).netloc or "gitlab.com").lower()
-                if srv_host != host and not srv_host.endswith("." + host):
+                srv_url = str(
+                    srv_cfg.get("url")
+                    or (srv_cfg.get("env") or {}).get("GITLAB_API_URL")
+                    or "https://gitlab.com"
+                )
+                srv_ident = _gitlab_origin(srv_url if "://" in srv_url else f"https://{srv_url}")
+                if srv_ident is None or not _same_endpoint(srv_ident, (host, port)):
                     continue
                 env_map = srv_cfg.get("env")
                 if isinstance(env_map, dict):
@@ -153,18 +205,15 @@ class GitLabClient:
         token: str | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        if not self.base_url.startswith("https://"):
+        ident = _gitlab_origin(base_url)
+        if ident is None:
             raise CodeContextError(
                 code="INVALID_REQUEST",
-                message=f"GitLab base_url must use https:// scheme, got {base_url!r}.",
+                message="GitLab base_url must be https on a GitLab host.",
                 retryable=False,
             )
-        self.token = (
-            token
-            if token is not None
-            else (os.environ.get("GITLAB_TOKEN") if transport is not None else resolve_gitlab_token(self.base_url))
-        )
+        self.base_url = _https_origin(*ident)
+        self.token = token if token is not None else resolve_gitlab_token(self.base_url)
         headers = {
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
