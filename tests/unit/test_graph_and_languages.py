@@ -188,6 +188,20 @@ def test_import_and_type_disambiguated_call_resolution_and_strict_cypher(tmp_pat
             )
         assert exc_info.value.code == "INVALID_REQUEST"
 
+        # 3. Verify ReDoS (nested quantifiers / backreferences) is rejected in search_graph and query_graph
+        for redos_pat in ["(a+)+$", "([a-zA-Z]+)*", r"(a+)\1+"]:
+            with pytest.raises(CodeContextError) as exc_info:
+                mem.search_graph(SearchGraphRequest(name_pattern=redos_pat))
+            assert exc_info.value.code == "INVALID_REQUEST"
+
+            with pytest.raises(CodeContextError) as exc_info:
+                mem.query_graph(
+                    QueryGraphRequest(
+                        query=f"MATCH (f:Function) WHERE f.name =~ '{redos_pat}' RETURN f.name"
+                    )
+                )
+            assert exc_info.value.code == "INVALID_REQUEST"
+
 
 async def test_search_graph_trace_path_architecture_detect_changes_and_snippet(
     tmp_path: Path,

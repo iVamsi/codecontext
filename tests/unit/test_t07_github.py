@@ -264,7 +264,7 @@ def test_principal_binding_api_caps_and_error_handling(tmp_path: Path) -> None:
             verify_and_bind_github_repository(store, client)
         assert exc_info.value.code == "AUTH_REQUIRED"
 
-    # 5. GitLab SSH and HTTPS remote URL parsing
+    # 5. GitLab SSH and HTTPS remote URL parsing (rejects cleartext http://)
     assert parse_gitlab_remote_url("git@gitlab.com:org/sub/project.git") == (
         "https://gitlab.com",
         "org/sub/project",
@@ -273,5 +273,6 @@ def test_principal_binding_api_caps_and_error_handling(tmp_path: Path) -> None:
         "https://gitlab.example.internal",
         "team/service",
     )
+    assert parse_gitlab_remote_url("http://gitlab.example.internal/team/service.git") is None
 
     store.close()

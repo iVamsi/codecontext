@@ -137,22 +137,23 @@ def _auto_bootstrap_store_if_needed(
 class _DynamicMemoryHolder:
     """Manages read-only `Memory` instances when `codecontext serve` is launched globally
     or with an explicit store. When launched globally (no `--store`/`--workspace`),
-    auto-detects the active project root via MCP `list_roots()` or `Path.cwd()` and
-    auto-initializes `<repo>/.codecontext` on first use.
+    locks to the initial Git repository root (from `Path.cwd()` or the first verified
+    MCP client root owned by the current OS user) and auto-initializes `<repo>/.codecontext`.
     """
 
     def __init__(self, pinned_memory: Memory | None) -> None:
         self._pinned = pinned_memory
-        self._by_root: dict[Path, Memory] = {}
+        self._initial_cwd_top = _find_git_toplevel(Path.cwd().resolve())
 
     async def get_memory(self, ctx: Context | None = None) -> Memory:
         if self._pinned is not None:
             return self._pinned
 
-        candidate_ws: Path | None = None
-        if ctx is not None and ctx.session is not None:
+        candidate_ws: Path | None = self._initial_cwd_top
+        if candidate_ws is None and ctx is not None and ctx.session is not None:
             try:
                 roots_res = await ctx.session.list_roots()
+                current_uid = os.getuid() if hasattr(os, "getuid") else None
                 for root in roots_res.roots:
                     uri_str = str(root.uri)
                     if uri_str.startswith("file://"):
@@ -161,35 +162,27 @@ class _DynamicMemoryHolder:
                         if p.exists():
                             git_top = _find_git_toplevel(p)
                             if git_top is not None:
+                                if current_uid is not None and git_top.stat().st_uid != current_uid:
+                                    continue
                                 candidate_ws = git_top
                                 break
             except Exception:
                 pass
 
-        if candidate_ws is None:
-            candidate_ws = _find_git_toplevel(Path.cwd().resolve())
-
-        if candidate_ws is not None and candidate_ws in self._by_root:
-            return self._by_root[candidate_ws]
-
-        def _bootstrap_sync() -> tuple[Path, Memory]:
+        def _bootstrap_sync() -> Memory:
             st_path, ws_path = _auto_bootstrap_store_if_needed(None, candidate_ws)
             mem = Memory.open(st_path, read_only=True)
             if ws_path is not None:
                 mem.configure_workspace(ws_path)
-            key = ws_path if ws_path is not None else st_path
-            return key, mem
+            return mem
 
-        root_key, mem = await asyncio.to_thread(_bootstrap_sync)
-        self._by_root[root_key] = mem
-        return mem
+        self._pinned = await asyncio.to_thread(_bootstrap_sync)
+        return self._pinned
 
     def close(self) -> None:
         if self._pinned is not None:
             self._pinned.close()
-        for mem in self._by_root.values():
-            mem.close()
-        self._by_root.clear()
+            self._pinned = None
 
 
 def create_mcp_server(

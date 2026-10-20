@@ -71,17 +71,20 @@ def parse_gitlab_remote_url(raw_url: str) -> tuple[str, str] | None:
         return None
 
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme in ("http", "https") and parsed.netloc and "gitlab" in parsed.netloc.lower():
+    # Enforce HTTPS-only so PRIVATE-TOKEN is never transmitted over cleartext HTTP
+    if parsed.scheme == "https" and parsed.netloc and "gitlab" in parsed.netloc.lower():
         proj = parsed.path.strip("/")
         if proj.endswith(".git"):
             proj = proj[:-4]
         if "/" in proj:
-            return (f"{parsed.scheme}://{parsed.netloc}", proj)
+            return (f"https://{parsed.netloc}", proj)
     return None
 
 
 def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
-    """Resolve GitLab token from `GITLAB_TOKEN`, `glab` CLI config, or configured MCP servers (`~/.cursor/mcp.json`, `~/.claude.json`)."""
+    """Resolve GitLab token from `GITLAB_TOKEN`, `glab` CLI config for the exact host,
+    or configured MCP servers matching `base_url`.
+    """
     env_tok = os.environ.get("GITLAB_TOKEN") or os.environ.get("GLAB_TOKEN")
     if env_tok:
         return env_tok.strip()
@@ -89,7 +92,7 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
     import shutil
     import subprocess
 
-    host = urllib.parse.urlparse(base_url).netloc or "gitlab.com"
+    host = (urllib.parse.urlparse(base_url).netloc or "gitlab.com").lower()
     glab_bin = shutil.which("glab") or "/opt/homebrew/bin/glab"
     if os.path.isfile(glab_bin) and os.access(glab_bin, os.X_OK):
         try:
@@ -115,6 +118,11 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
                 continue
             for srv_name, srv_cfg in servers.items():
                 if "gitlab" not in str(srv_name).lower() or not isinstance(srv_cfg, dict):
+                    continue
+                # Verify MCP server targets the same GitLab host (defaults to gitlab.com)
+                srv_url = str(srv_cfg.get("url") or (srv_cfg.get("env") or {}).get("GITLAB_API_URL") or "https://gitlab.com")
+                srv_host = (urllib.parse.urlparse(srv_url).netloc or "gitlab.com").lower()
+                if srv_host != host and not srv_host.endswith("." + host):
                     continue
                 env_map = srv_cfg.get("env")
                 if isinstance(env_map, dict):
@@ -146,6 +154,12 @@ class GitLabClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        if not self.base_url.startswith("https://"):
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message=f"GitLab base_url must use https:// scheme, got {base_url!r}.",
+                retryable=False,
+            )
         self.token = (
             token
             if token is not None
@@ -224,8 +238,102 @@ class GitLabClient:
                     )
                 chunks.append(ch)
             data = json.loads(b"".join(chunks).decode("utf-8"))
-            next_page = resp.headers.get("X-Next-Page") or resp.headers.get("x-next-page")
-            return (status, data, next_page if next_page and next_page.strip() else None)
+            raw_next = (resp.headers.get("X-Next-Page") or resp.headers.get("x-next-page") or "").strip()
+            if raw_next:
+                if not raw_next.isdigit() or int(raw_next) < 1:
+                    raise CodeContextError(
+                        code="IO_ERROR",
+                        message=f"Invalid GitLab X-Next-Page header: {raw_next!r}",
+                        retryable=False,
+                    )
+                next_page: str | None = raw_next
+            else:
+                next_page = None
+            return (status, data, next_page)
+
+
+def verify_and_bind_gitlab_project(
+    store: Store,
+    client: GitLabClient,
+    *,
+    project_path: str,
+    remaining_requests: int = 1000,
+) -> str:
+    """Verify `/api/v4/user` when authenticated and `/api/v4/projects/{encoded_proj}`,
+    enforcing principal binding (`store_meta.principal_id`) and immutable project ID.
+    Returns `proj_id_str` (`gitlab:<numeric_id>`).
+    """
+    encoded_proj = urllib.parse.quote(project_path, safe="")
+    start_reqs = client.requests_attempted
+
+    with store.connect_read() as conn:
+        meta = conn.execute(
+            "SELECT github_repository_id, principal_id FROM store_meta WHERE singleton = 1"
+        ).fetchone()
+        assert meta is not None
+        stored_proj_id = meta["github_repository_id"]
+        stored_principal = meta["principal_id"]
+
+    current_principal: str | None = None
+    if client.token:
+        st_u, user_data, _ = client.get_json("/user", remaining_requests=remaining_requests)
+        if st_u == 404 or not isinstance(user_data, dict) or "id" not in user_data:
+            raise CodeContextError(
+                code="AUTH_REQUIRED",
+                message="Unable to verify GitLab user principal via GET /api/v4/user.",
+                retryable=False,
+            )
+        current_principal = f"gitlab:user:{user_data['id']}"
+        if stored_principal is not None and stored_principal != current_principal:
+            raise CodeContextError(
+                code="REPOSITORY_MISMATCH",
+                message="Configured GitLab principal differs from the principal bound to this store.",
+                retryable=False,
+            )
+    elif stored_principal is not None:
+        raise CodeContextError(
+            code="AUTH_REQUIRED",
+            message="Store is bound to an authenticated principal; GITLAB_TOKEN is required.",
+            retryable=False,
+        )
+
+    rem = remaining_requests - (client.requests_attempted - start_reqs)
+    status, proj_data, _ = client.get_json(f"/projects/{encoded_proj}", remaining_requests=rem)
+    if status == 404 or not isinstance(proj_data, dict) or "id" not in proj_data:
+        raise CodeContextError(
+            code="ACCESS_BLOCKED",
+            message=f"GitLab project {project_path!r} is unavailable or inaccessible.",
+            retryable=False,
+        )
+
+    proj_num_id = int(proj_data["id"])
+    visibility = str(proj_data.get("visibility") or "public").lower()
+    if visibility != "public" and current_principal is None:
+        raise CodeContextError(
+            code="AUTH_REQUIRED",
+            message="Non-public GitLab project requires a verified user principal.",
+            retryable=False,
+        )
+
+    if stored_proj_id is not None and int(stored_proj_id) != proj_num_id:
+        raise CodeContextError(
+            code="REPOSITORY_MISMATCH",
+            message=f"GitLab project numeric ID changed ({stored_proj_id} != {proj_num_id}).",
+            retryable=False,
+        )
+
+    with store.write_transaction(bump_generation=False) as conn:
+        conn.execute(
+            """
+            UPDATE store_meta
+            SET github_repository_id = ?,
+                principal_id = COALESCE(principal_id, ?)
+            WHERE singleton = 1
+            """,
+            (proj_num_id, current_principal),
+        )
+
+    return f"gitlab:{proj_num_id}"
 
 
 def collect_gitlab_merge_requests_and_issues(
@@ -248,17 +356,12 @@ def collect_gitlab_merge_requests_and_issues(
     def budget_left() -> int:
         return remaining_requests - (client.requests_attempted - start_reqs)
 
-    status, proj_data, _ = client.get_json(
-        f"/projects/{encoded_proj}", remaining_requests=budget_left()
+    proj_id_str = verify_and_bind_gitlab_project(
+        store,
+        client,
+        project_path=project_path,
+        remaining_requests=budget_left(),
     )
-    if status == 404 or not isinstance(proj_data, dict) or "id" not in proj_data:
-        raise CodeContextError(
-            code="ACCESS_BLOCKED",
-            message=f"GitLab project {project_path!r} is unavailable or inaccessible.",
-            retryable=False,
-        )
-
-    proj_id_str = f"gitlab:{proj_data['id']}"
 
     # 1. Enumerate Merge Requests (`/projects/{id}/merge_requests?state=all&per_page=100`)
     page = "1"

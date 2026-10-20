@@ -166,12 +166,47 @@ def _kind_to_label(sym_kind: str) -> str:
     return "Variable"
 
 
+UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
+UNSAFE_NESTED_QUANTIFIER_RE = re.compile(
+    r"\([^)]*[+*?}][^)]*\)\s*(?:[+*?]|\{\d)"
+)
+
+
+def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
+    """Compile a user-supplied regex while rejecting catastrophic backtracking (ReDoS) constructs:
+    - Length > `max_length`
+    - Backreferences or lookaround assertions
+    - Quantified groups containing inner quantifiers (`(a+)+`, `(.*)*`, `(a|aa)+`).
+    """
+    if len(pattern) > max_length:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"Regex pattern exceeds maximum allowed length ({max_length}).",
+            retryable=False,
+        )
+    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or UNSAFE_NESTED_QUANTIFIER_RE.search(pattern):
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Unsafe regex pattern rejected (nested quantifiers, lookarounds, or backreferences are forbidden).",
+            retryable=False,
+        )
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"Invalid regex pattern: {exc}",
+            retryable=False,
+        ) from exc
+
+
 def _load_active_graph(
     store: Store,
-) -> tuple[dict[str, GraphNode], list[tuple[str, str, str, str]]]:
-    """Load active snapshot symbols and active symbol-to-symbol edges (`CALLS`, `CONTAINS`)."""
+) -> tuple[dict[str, GraphNode], list[tuple[str, str, str, str]], int]:
+    """Load active snapshot symbols, active symbol-to-symbol edges (`CALLS`, `CONTAINS`), and `access_epoch`."""
     with store.read_snapshot() as snap:
         conn = snap.conn
+        expected_epoch = snap.access_epoch
         sym_rows = conn.execute(
             """
             SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
@@ -251,23 +286,16 @@ def _load_active_graph(
         )
         for sid, d in raw_nodes.items()
     }
-    return nodes, edges
+    return nodes, edges, expected_epoch
 
 
 def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGraphResult:
     """Search symbols in the active code knowledge graph by regex pattern, label, and degree."""
-    nodes, edges = _load_active_graph(store)
+    name_re = compile_safe_regex(request.name_pattern) if request.name_pattern else None
+    qn_re = compile_safe_regex(request.qn_pattern) if request.qn_pattern else None
+    file_re = compile_safe_regex(request.file_pattern) if request.file_pattern else None
 
-    try:
-        name_re = re.compile(request.name_pattern) if request.name_pattern else None
-        qn_re = re.compile(request.qn_pattern) if request.qn_pattern else None
-        file_re = re.compile(request.file_pattern) if request.file_pattern else None
-    except re.error as exc:
-        raise CodeContextError(
-            code="INVALID_REQUEST",
-            message=f"Invalid regex pattern in search_graph: {exc}",
-            retryable=False,
-        ) from exc
+    nodes, edges, expected_epoch = _load_active_graph(store)
 
     in_deg: dict[str, int] = {nid: 0 for nid in nodes}
     out_deg: dict[str, int] = {nid: 0 for nid in nodes}
@@ -320,12 +348,13 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
     total = len(matched)
     sliced = matched[request.offset : request.offset + request.limit]
     has_more = (request.offset + len(sliced)) < total
+    store.verify_access_epoch_and_authorize(expected_epoch)
     return SearchGraphResult(nodes=sliced, total_matched=total, has_more=has_more)
 
 
 def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResult:
     """Perform multi-hop BFS call-graph traversal (`inbound`, `outbound`, or `both`) up to `request.depth`."""
-    nodes, edges = _load_active_graph(store)
+    nodes, edges, expected_epoch = _load_active_graph(store)
 
     q_name = request.function_name.strip()
     roots = [
@@ -394,6 +423,7 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
                     visited[caller_id] = nodes[caller_id]
                     queue.append((caller_id, next_depth))
 
+    store.verify_access_epoch_and_authorize(expected_epoch)
     return TracePathResult(
         root_nodes=roots,
         visited_nodes=list(visited.values()),
@@ -588,14 +618,8 @@ def _eval_where_atom(bindings: dict[str, Any], atom_str: str) -> bool:
         elif op == "ENDS WITH":
             res = lhs_s.endswith(rhs_s)
         elif op == "=~":
-            try:
-                res = bool(re.search(rhs_s, lhs_s))
-            except re.error as exc:
-                raise CodeContextError(
-                    code="INVALID_REQUEST",
-                    message=f"Invalid regex in Cypher WHERE clause: {exc}",
-                    retryable=False,
-                ) from exc
+            compiled_re = compile_safe_regex(rhs_s)
+            res = bool(compiled_re.search(lhs_s))
         else:
             raise CodeContextError(
                 code="INVALID_REQUEST",
@@ -699,7 +723,7 @@ def _apply_order_by_and_count(
 
 def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphResult:
     """Execute a validated read-only Cypher query over the active snapshot symbol/relation graph."""
-    nodes, edges = _load_active_graph(store)
+    nodes, edges, expected_epoch = _load_active_graph(store)
     q = request.query.strip().rstrip(";")
 
     m_edge = CYPHER_EDGE_RE.match(q)
@@ -790,6 +814,7 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
         cols_out, rows_out, truncated = _apply_order_by_and_count(
             matched_bindings, ret_cols, order_c, cap
         )
+        store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
             columns=cols_out,
             rows=rows_out,
@@ -821,6 +846,7 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
         cols_out, rows_out, truncated = _apply_order_by_and_count(
             matched_bindings, ret_cols, order_c, cap
         )
+        store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
             columns=cols_out,
             rows=rows_out,
@@ -842,7 +868,7 @@ def execute_get_architecture(
     """Compute structural architecture overview: package/directory clusters, cohesion scores,
     inter-cluster call dependencies, language breakdown, and top degree hotspots.
     """
-    nodes, edges = _load_active_graph(store)
+    nodes, edges, expected_epoch = _load_active_graph(store)
     with store.read_snapshot() as snap:
         conn = snap.conn
         rev = snap.revision
@@ -919,6 +945,7 @@ def execute_get_architecture(
         key=lambda n: (-(n.inbound_degree + n.outbound_degree), -n.line_count, n.id),
     )[:15]
 
+    store.verify_access_epoch_and_authorize(expected_epoch)
     return GetArchitectureResult(
         revision=rev,
         total_files=total_files,
@@ -940,7 +967,7 @@ def execute_detect_changes(
     """Map git changes (either since a ref/commit `request.since` or dirty workspace files)
     to directly modified symbols and trace inbound callers up to `request.depth`.
     """
-    nodes, edges = _load_active_graph(store)
+    nodes, edges, expected_epoch = _load_active_graph(store)
     with store.read_snapshot() as snap:
         active_rev = snap.revision
         if not active_rev:
@@ -961,17 +988,22 @@ def execute_detect_changes(
             if rc.old_path is not None:
                 changed_paths.add(path_bytes_to_display(rc.old_path)[0])
     elif workspace_path is not None and workspace_path.exists():
-        # Check diff between workspace HEAD and active_rev, or staged/unstaged files
-        proc = run_safe_git(
-            ["diff-index", "--name-only", "-z", "HEAD"],
+        # Compare workspace HEAD tree against active_rev tree without touching or refreshing the index
+        ws_head_proc = run_safe_git(
+            ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
             cwd=workspace_path,
             empty_hooks_dir=mirror.empty_hooks_dir,
             check=False,
         )
-        if proc.returncode == 0 and proc.stdout:
-            for p_b in proc.stdout.split(b"\x00"):
-                if p_b:
-                    changed_paths.add(path_bytes_to_display(p_b)[0])
+        if ws_head_proc.returncode == 0:
+            ws_head_oid = ws_head_proc.stdout.decode("ascii", errors="replace").strip()
+            if ws_head_oid and ws_head_oid != active_rev:
+                raw_changes = mirror.diff_tree_parent(active_rev, ws_head_oid, parent_index=0)
+                for rc in raw_changes:
+                    if rc.new_path is not None:
+                        changed_paths.add(path_bytes_to_display(rc.new_path)[0])
+                    if rc.old_path is not None:
+                        changed_paths.add(path_bytes_to_display(rc.old_path)[0])
 
     if not changed_paths:
         # Fallback: changes in the latest active commit (`active_rev`)
@@ -1027,6 +1059,7 @@ def execute_detect_changes(
                 visited.add(caller_id)
                 queue.append((caller_id, nd))
 
+    store.verify_access_epoch_and_authorize(expected_epoch)
     return DetectChangesResult(
         changed_files=sorted(changed_paths),
         directly_modified_symbols=modified_syms[: request.limit],
@@ -1043,7 +1076,7 @@ def execute_get_code_snippet(
     """Retrieve exact symbol source code by `qualified_name` (or short `name`) and optional `file_path`,
     along with direct callers and callees when `include_neighbors=True`.
     """
-    nodes, edges = _load_active_graph(store)
+    nodes, edges, expected_epoch = _load_active_graph(store)
     q = request.qualified_name.strip()
 
     candidates = [
@@ -1107,6 +1140,7 @@ def execute_get_code_snippet(
             elif f_id == target_node.id and t_id in nodes:
                 callees.append(nodes[t_id])
 
+    store.verify_access_epoch_and_authorize(expected_epoch)
     return GetCodeSnippetResult(
         node=target_node,
         code=code_text,

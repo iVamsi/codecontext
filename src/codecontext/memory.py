@@ -293,7 +293,7 @@ _INIT_SENTINEL = object()
 def _validate_archive_manifest(store_dir: Path, manifest_file: Path) -> None:
     import json
 
-    from codecontext.identity import sha256_bytes
+    from codecontext.identity import sha256_bytes, validate_relative_repo_path_bytes
 
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -306,15 +306,36 @@ def _validate_archive_manifest(store_dir: Path, manifest_file: Path) -> None:
         files_map = manifest.get("files")
         if not isinstance(files_map, dict):
             raise ValueError("Missing files map in manifest")
+        store_root = store_dir.resolve()
         for rel_path, expected_sha in files_map.items():
-            fp = store_dir / rel_path
-            if not fp.exists():
+            if not isinstance(rel_path, str):
+                raise CodeContextError(
+                    code="STORE_VERSION_UNSUPPORTED",
+                    message="Invalid path entry in archive manifest.json.",
+                    retryable=False,
+                )
+            validate_relative_repo_path_bytes(rel_path.encode("utf-8"))
+            fp = store_root / rel_path
+            if fp.is_symlink():
+                raise CodeContextError(
+                    code="STORE_VERSION_UNSUPPORTED",
+                    message=f"Archive manifest references a symlink: {rel_path}.",
+                    retryable=False,
+                )
+            resolved_fp = fp.resolve()
+            if not resolved_fp.is_relative_to(store_root) or resolved_fp == store_root:
+                raise CodeContextError(
+                    code="STORE_VERSION_UNSUPPORTED",
+                    message=f"Archive manifest path escapes store directory: {rel_path}.",
+                    retryable=False,
+                )
+            if not resolved_fp.is_file():
                 raise CodeContextError(
                     code="STORE_NOT_INITIALIZED",
                     message=f"Archive is missing expected file {rel_path}.",
                     retryable=False,
                 )
-            actual_sha = sha256_bytes(fp.read_bytes())
+            actual_sha = sha256_bytes(resolved_fp.read_bytes())
             if actual_sha != expected_sha:
                 raise CodeContextError(
                     code="STORE_VERSION_UNSUPPORTED",

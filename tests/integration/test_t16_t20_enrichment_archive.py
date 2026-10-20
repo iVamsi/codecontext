@@ -269,3 +269,14 @@ def test_t18_t20_f11_i10_i12_purge_race_and_portable_export_sanitization(tmp_pat
         code_ev_id = exp_pack.code[0].evidence_id
         code_page = exp_mem.get(GetRequest(id=code_ev_id))
         assert "MAX_RETRIES" in code_page.content[0].text
+
+    # 5. Tamper with export manifest.json to inject path traversal (`../../etc/passwd`) -> rejected!
+    import json
+
+    manifest_file = export_dir / "manifest.json"
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["files"]["../../outside_file.txt"] = "a" * 64
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+    with pytest.raises(CodeContextError) as exc_info:
+        Memory.open(export_dir, read_only=True)
+    assert exc_info.value.code in ("INVALID_REQUEST", "STORE_VERSION_UNSUPPORTED")
