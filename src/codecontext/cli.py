@@ -225,6 +225,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--destination", required=True, type=Path)
     p_export.add_argument("--metadata-only", dest="metadata_only", action="store_true")
 
+    p_publish = subparsers.add_parser(
+        "publish",
+        help="Publish scrubbed project memory for teammates to join and update.",
+    )
+    p_publish.add_argument(
+        "--to",
+        required=True,
+        type=Path,
+        help="Shared directory. Replaced only after you join its latest snapshot.",
+    )
+
+    p_join = subparsers.add_parser(
+        "join",
+        help="Copy shared project memory into a personal store bound to this checkout.",
+    )
+    p_join.add_argument("--from", dest="share", required=True, type=Path, help="Shared directory from publish.")
+    p_join.add_argument("--repo", required=True, type=Path, help="Local checkout whose origin matches the share.")
+
     # purge
     p_purge = subparsers.add_parser("purge", help="Purge a discussion source or the entire store.")
     g_purge = p_purge.add_mutually_exclusive_group(required=True)
@@ -447,6 +465,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             with Memory.open(store_path, read_only=True) as mem:
                 res = mem.export(e_req)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "publish":
+            with Memory.open(store_path, read_only=True) as mem:
+                res = mem.publish(args.to)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "join":
+            res = Memory.join(store_path, args.share, args.repo)
             _emit_json(res, pretty=pretty)
             return 0
 

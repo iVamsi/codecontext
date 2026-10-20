@@ -51,6 +51,7 @@ from codecontext.models import (
 from codecontext.retrieval import execute_context, execute_get, execute_search
 from codecontext.store import Store
 from codecontext.sync import execute_sync
+from codecontext.team import execute_join, execute_publish
 from codecontext.workspace import validate_workspace_binding
 
 
@@ -228,6 +229,16 @@ class Memory:
         self._ensure_open()
         validated_req = _validate_request_model(ExportRequest, request)
         return execute_export(self._store, validated_req)
+
+    def publish(self, destination: Path | str) -> ExportReport:
+        self._ensure_open()
+        return execute_publish(self._store, Path(destination))
+
+    @classmethod
+    def join(cls, store_path: Path | str, share_dir: Path | str, repo_path: Path | str) -> Status:
+        execute_join(Path(store_path), Path(share_dir), Path(repo_path))
+        with cls.open(store_path) as mem:
+            return mem.status()
 
     def purge(self, request: PurgeRequest | dict[str, Any]) -> PurgeReport:
         self._ensure_open()
