@@ -455,6 +455,7 @@ def parse_blob(
         check_deadline()
         return blob_bytes[offset:offset + 32768]
 
+    # Use blob slices for node text: Node.text re-enters this fallible callback in native code.
     tree = parser.parse(read_source)
     check_deadline()
     if tree is None or tree.root_node is None:
@@ -936,9 +937,10 @@ def parse_blob(
             if variable is not None and variable.named_children:
                 type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
                 if type_node is not None:
+                    name_node = variable.named_children[0]
                     add_occurrence(parent_sym.id, "property_type", node.start_byte, node.end_byte,
-                                   details={"name": variable.named_children[0].text.decode("utf-8"),
-                                            "type": type_node.text.decode("utf-8").rstrip("?")})
+                                   details={"name": blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8"),
+                                            "type": blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?")})
         if ntype in ("import", "import_declaration"):
             add_occurrence(
                 parent_sym.id if parent_sym else None,
@@ -1008,12 +1010,13 @@ def parse_blob(
                                 variable = next((c for c in declaration.named_children if c.type == "variable_declaration"), None)
                                 if variable is None or not variable.named_children:
                                     continue
-                                var_name = variable.named_children[0].text.decode("utf-8")
+                                name_node = variable.named_children[0]
+                                var_name = blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8")
                                 if var_name != re.split(r"[?.!]", recv_str)[0]:
                                     continue
                                 type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
                                 # An untyped local still shadows a typed parameter or field.
-                                det_dict["receiver_type"] = type_node.text.decode("utf-8").rstrip("?") if type_node else ""
+                                det_dict["receiver_type"] = blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?") if type_node else ""
                                 break
                             ancestor = ancestor.parent
                 add_occurrence(

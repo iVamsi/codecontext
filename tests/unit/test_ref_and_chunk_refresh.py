@@ -143,7 +143,8 @@ def test_many_unchanged_refs_allow_source_refresh(
         stdin_bytes="".join(f"update refs/tags/tag{i} {oid}\n" for i in range(3161)).encode(),
     )
     with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
-        mem.sync(SyncRequest(offline=True))
+        initial = mem.sync(SyncRequest(offline=True, max_seconds=120))
+        assert initial.coverage.structure.state == "complete", initial
         writes = []
         original = git.run_safe_git
 
@@ -154,11 +155,13 @@ def test_many_unchanged_refs_allow_source_refresh(
 
         monkeypatch.setattr(git, "run_safe_git", record_writes)
         (repo / "main.py").write_text("def updated(): pass\n")
-        mem.sync(SyncRequest(offline=True, max_seconds=5))
+        refreshed = mem.sync(SyncRequest(offline=True, max_seconds=120))
+        assert refreshed.coverage.structure.state == "complete", refreshed
         assert mem.search_graph({"name_pattern": "^updated$"}).nodes
         assert len(writes) == 1  # Only the new workspace snapshot needs retaining.
         writes.clear()
-        mem.sync(SyncRequest(offline=True, max_seconds=5))
+        unchanged = mem.sync(SyncRequest(offline=True, max_seconds=120))
+        assert unchanged.coverage.structure.state == "complete", unchanged
         assert not writes
 
 
