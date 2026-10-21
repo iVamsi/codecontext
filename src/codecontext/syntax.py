@@ -1620,6 +1620,24 @@ def index_active_snapshot_files(
                 manifest = {bytes(r["path"]).hex(): [r["blob_oid"], r["extraction_id"], r["content_state"]] for r in current_files}
                 checkpoint = conn.execute("SELECT cursor_json FROM checkpoints WHERE stream_key = 'syntax:documents'").fetchone()
                 previous = json.loads(checkpoint[0]) if checkpoint else {}
+                if not conn.execute("SELECT 1 FROM checkpoints WHERE stream_key = 'syntax:chunk_dedup:v1'").fetchone():
+                    # Repair chunk duplicates created by earlier shared-extraction refreshes.
+                    conn.execute("""
+                        DELETE FROM search_documents WHERE rowid IN (
+                            SELECT rowid FROM (
+                                SELECT rowid, ROW_NUMBER() OVER (
+                                    PARTITION BY json_extract(metadata_json, '$.path'),
+                                                 json_extract(metadata_json, '$.path_bytes_b64'),
+                                                 chunk_ordinal
+                                    ORDER BY rowid DESC
+                                ) AS position
+                                FROM search_documents
+                                WHERE record_kind = 'code'
+                                  AND json_extract(metadata_json, '$.evidence_id') IS NOT NULL
+                            ) WHERE position > 1
+                        )
+                    """)
+                    conn.execute("INSERT INTO checkpoints (stream_key, cursor_json) VALUES ('syntax:chunk_dedup:v1', '{}')")
                 dirty_paths = {p for p in manifest.keys() | previous.keys() if manifest.get(p) != previous.get(p)}
                 if not dirty_paths and checkpoint:
                     Store.resolve_gaps_in_scope(conn, scope="syntax:documents", code="STRUCTURE_PENDING")
@@ -1765,6 +1783,8 @@ def index_active_snapshot_files(
                     for r in indexed_files:
                         check_deadline()
                         p_bytes = bytes(r["path"])
+                        if p_bytes.hex() not in dirty_paths:
+                            continue
                         disp_p, b64_p = path_bytes_to_display(p_bytes)
                         b_oid = str(r["blob_oid"])
                         e_id = r["extraction_id"]

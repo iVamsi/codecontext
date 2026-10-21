@@ -778,14 +778,35 @@ class GitMirror:
         return refs
 
     def pin_retained_oid(self, oid: str) -> None:
-        if not HEX_OID_RE.match(oid):
+        self.pin_retained_oids({oid})
+
+    def pin_retained_oids(self, oids: set[str]) -> None:
+        oids = {oid for oid in oids if HEX_OID_RE.match(oid)}
+        if not oids:
             return
-        run_safe_git(
-            ["update-ref", f"refs/codecontext/retained/{oid}", oid],
+        retained = run_safe_git(
+            ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/codecontext/retained/"],
             git_dir=self.git_dir,
             empty_hooks_dir=self.empty_hooks_dir,
-            check=False,
         )
+        for line in retained.stdout.splitlines():
+            refname, _, oid = line.decode("ascii", errors="replace").partition("\x00")
+            if refname == f"refs/codecontext/retained/{oid}":
+                oids.discard(oid)
+        missing = sorted(oids)
+        # Completed batches remain pinned if the sync budget expires before the next batch.
+        for start in range(0, len(missing), 128):
+            check_deadline()
+            updates = "".join(
+                f"update refs/codecontext/retained/{oid} {oid}\n"
+                for oid in missing[start : start + 128]
+            )
+            run_safe_git(
+                ["update-ref", "--stdin"],
+                stdin_bytes=updates.encode("ascii"),
+                git_dir=self.git_dir,
+                empty_hooks_dir=self.empty_hooks_dir,
+            )
 
     def import_local_refs_and_revision(
         self,
@@ -807,11 +828,13 @@ class GitMirror:
             git_dir=self.git_dir,
             empty_hooks_dir=self.empty_hooks_dir,
         )
+        old_oids = set()
         for line in existing_proc.stdout.splitlines():
             parts = line.split(b"\x00")
             if len(parts) == 2:
                 old_oid = parts[1].decode("ascii", errors="replace").strip()
-                self.pin_retained_oid(old_oid)
+                old_oids.add(old_oid)
+        self.pin_retained_oids(old_oids)
 
         refspecs = [
             "+refs/heads/*:refs/codecontext/local/heads/*",
