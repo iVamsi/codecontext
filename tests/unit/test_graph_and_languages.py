@@ -24,6 +24,47 @@ from tests.fixtures.builders import (
 )
 
 
+def test_kotlin_unqualified_calls_use_nearest_scope(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Kotlin lexical scopes", files={
+        "Main.kt": b"""fun save() {}
+fun topLevel() { save() }
+fun unrelated() { privateToB() }
+class A {
+ fun save() {}
+ fun save(value: Int) {}
+ fun run() { save() }
+ fun local() {
+  fun save() {}
+  save()
+ }
+}
+class B {
+ fun save() {}
+ fun privateToB() {}
+ fun run() { save() }
+}
+class C {
+ fun run() { save() }
+}
+""",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        for caller, expected in {
+            "A.run": {"A.save"},
+            "B.run": {"B.save"},
+            "A.local": {"A.local.save"},
+            "C.run": {"save"},
+            "topLevel": {"save"},
+            "unrelated": set(),
+        }.items():
+            trace = mem.trace_path(TracePathRequest(function_name=caller, direction="outbound", depth=1))
+            assert {e.to_name for e in trace.edges} == expected, caller
+        trace = mem.trace_path(TracePathRequest(function_name="A.run", direction="outbound", depth=1))
+        assert len(trace.edges) == 2  # Both overloads remain candidates.
+
+
 def test_kotlin_receiver_does_not_link_unrelated_same_file_method(tmp_path: Path) -> None:
     repo = init_fixture_repo(tmp_path / "repo")
     commit_fixture_spec(repo, GitCommitSpec(message="Kotlin receivers", files={

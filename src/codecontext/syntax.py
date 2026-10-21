@@ -151,7 +151,8 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         q_bytes = q_file.read_bytes()
         q_hash = sha256_bytes(q_bytes)[:16]
         queries[name] = Query(lang, q_bytes.decode("utf-8"))
-        fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}:walker2"
+        walker_version = 3 if name == "kotlin" else 2
+        fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}:walker{walker_version}"
     return langs, queries, fingerprints
 
 
@@ -1199,6 +1200,7 @@ def parse_blob(
         walk_js_ts(root, None, [])
 
     # Resolve same-file lexical call candidates where a named definition exists
+    symbols_by_id = {s.id: s for s in symbols}
     by_simple_name: dict[str, list[ExtractedSymbol]] = {}
     for s in symbols:
         by_simple_name.setdefault(s.name, []).append(s)
@@ -1210,7 +1212,16 @@ def parse_blob(
                 continue
             callee = occ.details.get("callee") or occ.details.get("component")
             if isinstance(callee, str) and callee in by_simple_name:
-                for target_sym in by_simple_name[callee]:
+                targets = by_simple_name[callee]
+                if language == "kotlin":
+                    scope_id = occ.enclosing_symbol_id
+                    while True:
+                        scoped_targets = [s for s in targets if s.parent_symbol_id == scope_id]
+                        if scoped_targets or scope_id is None:
+                            targets = scoped_targets
+                            break
+                        scope_id = symbols_by_id[scope_id].parent_symbol_id
+                for target_sym in targets:
                     if target_sym.id != occ.enclosing_symbol_id:
                         relations.append(
                             CandidateRelation(
