@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from codecontext._deps import verify_runtime_dependencies
+from codecontext.deadline import check_deadline, expired, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import (
     canonical_json,
@@ -163,10 +164,11 @@ def inspect_local_git_repository(repo_path: Path) -> tuple[Path, Path, int, int,
             env=env,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=remaining_timeout(10),
             check=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        check_deadline()
         raise CodeContextError(
             code="INVALID_REQUEST",
             message=f"Path is not a valid Git repository: {resolved}",
@@ -563,6 +565,7 @@ class Store:
 
     def _open_raw_connection(self, *, for_write: bool) -> sqlite3.Connection:
         self._ensure_open()
+        check_deadline()
         if for_write and self.read_only:
             raise CodeContextError(
                 code="INVALID_REQUEST",
@@ -571,18 +574,20 @@ class Store:
             )
         try:
             if for_write:
-                conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
+                conn = sqlite3.connect(str(self.db_path), timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA foreign_keys=ON")
-                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute(f"PRAGMA busy_timeout={int(remaining_timeout(5.0) * 1000)}")
+                conn.set_progress_handler(lambda: int(expired()), 1000)
                 return conn
             else:
                 quoted = urllib.parse.quote(str(self.db_path))
                 uri = f"file:{quoted}?mode=ro"
-                conn = sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None)
+                conn = sqlite3.connect(uri, uri=True, timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                conn.set_progress_handler(lambda: int(expired()), 1000)
                 return conn
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
@@ -772,7 +777,7 @@ class Store:
         bump_access_epoch: bool = False,
         lock_timeout: float = 5.0,
     ) -> Iterator[sqlite3.Connection]:
-        with self.acquire_writer_lock(timeout_seconds=lock_timeout):
+        with self.acquire_writer_lock(timeout_seconds=remaining_timeout(lock_timeout)):
             conn = self._open_raw_connection(for_write=True)
             try:
                 try:
@@ -792,6 +797,7 @@ class Store:
                     conn.execute("UPDATE store_meta SET access_epoch = access_epoch + 1 WHERE singleton = 1")
                 conn.execute("COMMIT")
             except Exception as exc:
+                conn.set_progress_handler(None, 0)
                 try:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:

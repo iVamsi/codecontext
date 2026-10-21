@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from codecontext.deadline import check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import (
     byte_span_to_lines,
@@ -114,7 +115,7 @@ def resolve_github_token() -> str | None:
                 [gh_bin, "auth", "token"],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=remaining_timeout(3),
                 check=False,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -234,7 +235,7 @@ class GitHubClient:
 
         while attempts_this_call < max_attempts:
             if deadline_monotonic is not None:
-                rem_sec = deadline_monotonic - time.monotonic()
+                rem_sec = min(deadline_monotonic - time.monotonic(), remaining_timeout(30))
                 if rem_sec <= 0:
                     raise CodeContextError(
                         code="BUDGET_EXHAUSTED",
@@ -248,7 +249,7 @@ class GitHubClient:
                     pool=min(10.0, rem_sec),
                 )
             else:
-                req_timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+                req_timeout = httpx.Timeout(connect=remaining_timeout(10), read=remaining_timeout(30), write=remaining_timeout(10), pool=remaining_timeout(10))
 
             attempts_this_call += 1
             self.requests_attempted += 1
@@ -306,7 +307,7 @@ class GitHubClient:
                         if attempts_this_call < max_attempts:
                             delay = float(attempts_this_call) + random.uniform(0.0, 0.25)
                             if deadline_monotonic is None or (time.monotonic() + delay) < deadline_monotonic:
-                                self._sleep_fn(delay)
+                                self._sleep_fn(remaining_timeout(delay))
                                 continue
                         raise CodeContextError(
                             code="IO_ERROR",
@@ -338,6 +339,7 @@ class GitHubClient:
                     total_bytes = 0
                     too_large = False
                     for chunk in resp.iter_bytes():
+                        check_deadline()
                         total_bytes += len(chunk)
                         if total_bytes > MAX_HTTP_BODY_BYTES:
                             too_large = True
@@ -378,7 +380,7 @@ class GitHubClient:
                 if attempts_this_call < max_attempts:
                     delay = float(attempts_this_call) + random.uniform(0.0, 0.25)
                     if deadline_monotonic is None or (time.monotonic() + delay) < deadline_monotonic:
-                        self._sleep_fn(delay)
+                        self._sleep_fn(remaining_timeout(delay))
                         continue
                 raise CodeContextError(
                     code="IO_ERROR",

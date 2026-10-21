@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from codecontext.deadline import check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.github import (
     MAX_HTTP_BODY_BYTES,
@@ -40,7 +41,7 @@ def detect_gitlab_repository_from_git(repo_path: Path) -> tuple[str, str] | None
             env=env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=remaining_timeout(5),
             check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
@@ -148,7 +149,7 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
                 [glab_bin, "config", "get", "token", "--host", glab_host],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=remaining_timeout(3),
                 check=False,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -247,7 +248,7 @@ class GitLabClient:
             )
         self.requests_attempted += 1
         target = path if path.startswith("/") else f"/{path}"
-        with self._client.stream("GET", target) as resp:
+        with self._client.stream("GET", target, timeout=remaining_timeout(30)) as resp:
             status = resp.status_code
             if status == 401:
                 raise CodeContextError(
@@ -278,6 +279,7 @@ class GitLabClient:
             chunks: list[bytes] = []
             total = 0
             for ch in resp.iter_bytes():
+                check_deadline()
                 total += len(ch)
                 if total > MAX_HTTP_BODY_BYTES:
                     raise CodeContextError(

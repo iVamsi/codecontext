@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import re
+import select
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -9,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codecontext.deadline import check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import HEX_OID_RE
 from codecontext.store import Store, inspect_local_git_repository, now_us
@@ -113,12 +116,14 @@ def run_safe_git(
         stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     ) as proc:
         try:
-            stdout, stderr = proc.communicate(input=stdin_bytes, timeout=timeout)
+            stdout, stderr = proc.communicate(input=stdin_bytes, timeout=remaining_timeout(timeout))
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
+            check_deadline()
             raise CodeContextError(
                 code="IO_ERROR",
                 message="Git command timed out.",
@@ -126,7 +131,7 @@ def run_safe_git(
                 details={"command": args[0] if args else "git"},
             ) from exc
         except BaseException:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
             raise
 
@@ -534,9 +539,24 @@ class CatFileBatchSession:
                 env=build_safe_git_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
             )
         return self._proc
+
+    def _read(self, size: int) -> bytes:
+        assert self._proc is not None and self._proc.stdout is not None
+        data = bytearray()
+        while len(data) < size:
+            ready, _, _ = select.select([self._proc.stdout], [], [], remaining_timeout(30.0))
+            if not ready:
+                check_deadline()
+                raise CodeContextError(code="IO_ERROR", message="Git object read timed out.", retryable=True)
+            chunk = os.read(self._proc.stdout.fileno(), min(size - len(data), 65536))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
 
     def read_object(self, oid: str) -> tuple[str, int, bytes] | None:
         """Return (obj_type, size, content_bytes) or None if missing."""
@@ -546,12 +566,18 @@ class CatFileBatchSession:
                 message=f"Invalid Git object ID for cat-file: {oid!r}",
                 retryable=False,
             )
+        check_deadline()
         proc = self._ensure_proc()
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(oid.encode("ascii") + b"\n")
         proc.stdin.flush()
 
-        header_line = proc.stdout.readline()
+        header_line = bytearray()
+        while not header_line.endswith(b"\n"):
+            part = self._read(1)
+            if not part:
+                break
+            header_line.extend(part)
         if not header_line:
             self.close()
             raise CodeContextError(
@@ -572,7 +598,7 @@ class CatFileBatchSession:
             )
         _, obj_type, size_str = parts[:3]
         size = int(size_str)
-        data = proc.stdout.read(size)
+        data = self._read(size)
         if len(data) != size:
             self.close()
             raise CodeContextError(
@@ -580,7 +606,7 @@ class CatFileBatchSession:
                 message=f"Truncated cat-file --batch object payload for {oid}",
                 retryable=False,
             )
-        framing = proc.stdout.read(1)
+        framing = self._read(1)
         if framing != b"\n":
             self.close()
             raise CodeContextError(
@@ -803,6 +829,7 @@ class GitMirror:
                 "--no-tags",
                 "--no-write-fetch-head",
                 "--no-auto-maintenance",
+                "--update-shallow",
                 "--end-of-options",
                 str(source_repo),
                 *refspecs,
@@ -929,6 +956,7 @@ class GitMirror:
         for path in original.keys() - tracked:
             updates.append(b"0 " + zero_oid.encode() + b"\t" + path + b"\0")
         for mode, staged_oid, _, path in staged:
+            check_deadline()
             previous = original.get(path)
             if mode == 0o160000:
                 if previous is None or previous.oid != staged_oid or previous.mode != mode:
@@ -1003,12 +1031,52 @@ class GitMirror:
         all_tips = list(dict.fromkeys([resolved_oid, *source_refs.values()]))
         all_reachable = self.list_reachable_commits_with_parents(all_tips)
 
-        parsed_commits: list[ParsedCommit] = []
+        with self.store.connect_read() as conn:
+            known_commits = {r[0] for r in conn.execute("SELECT oid FROM commits")}
+        missing_commits = [oid for oid, _ in all_reachable if oid not in known_commits]
+        ts = now_us()
         with self.open_batch_session() as batch:
-            for c_oid, _ in all_reachable:
-                obj = batch.read_object(c_oid)
-                if obj is not None and obj[0] == "commit":
-                    parsed_commits.append(parse_raw_commit_object(c_oid, obj[2]))
+            for offset in range(0, len(missing_commits), 64):
+                parsed_commits = []
+                for c_oid in missing_commits[offset:offset + 64]:
+                    check_deadline()
+                    obj = batch.read_object(c_oid)
+                    if obj is not None and obj[0] == "commit":
+                        parsed_commits.append(parse_raw_commit_object(c_oid, obj[2]))
+                with self.store.write_transaction(bump_generation=True) as conn:
+                    # Upsert reachable commits and parents
+                    for pc in parsed_commits:
+                        check_deadline()
+                        conn.execute(
+                            """
+                            INSERT INTO commits (
+                                oid, tree_oid, authored_at_us, committed_at_us,
+                                author_name, author_email, message, first_seen_at_us, diff_state
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                            ON CONFLICT(oid) DO NOTHING
+                            """,
+                            (
+                                pc.oid,
+                                pc.tree_oid,
+                                pc.authored_at_us,
+                                pc.committed_at_us,
+                                pc.author_name,
+                                pc.author_email,
+                                pc.message_text,
+                                ts,
+                            ),
+                        )
+                        for p_idx, p_oid in enumerate(pc.parent_oids):
+                            conn.execute(
+                                """
+                                INSERT INTO commit_parents (commit_oid, parent_index, parent_oid)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(commit_oid, parent_index) DO NOTHING
+                                """,
+                                (pc.oid, p_idx, p_oid),
+                            )
+                            # Check if parent object exists in mirror; if not, record MISSING_PARENT gap
+                            # (Checked when shallow or missing)
 
         ts = now_us()
         with self.store.write_transaction(bump_generation=True) as conn:
@@ -1043,39 +1111,6 @@ class GitMirror:
                     (ref_name, ref_oid, ts),
                 )
 
-            # Upsert reachable commits and parents
-            for pc in parsed_commits:
-                conn.execute(
-                    """
-                    INSERT INTO commits (
-                        oid, tree_oid, authored_at_us, committed_at_us,
-                        author_name, author_email, message, first_seen_at_us, diff_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-                    ON CONFLICT(oid) DO NOTHING
-                    """,
-                    (
-                        pc.oid,
-                        pc.tree_oid,
-                        pc.authored_at_us,
-                        pc.committed_at_us,
-                        pc.author_name,
-                        pc.author_email,
-                        pc.message_text,
-                        ts,
-                    ),
-                )
-                for p_idx, p_oid in enumerate(pc.parent_oids):
-                    conn.execute(
-                        """
-                        INSERT INTO commit_parents (commit_oid, parent_index, parent_oid)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(commit_oid, parent_index) DO NOTHING
-                        """,
-                        (pc.oid, p_idx, p_oid),
-                    )
-                    # Check if parent object exists in mirror; if not, record MISSING_PARENT gap
-                    # (Checked when shallow or missing)
-
             if is_shallow:
                 Store.upsert_gap(
                     conn,
@@ -1088,24 +1123,37 @@ class GitMirror:
                 )
 
             # Find existing extractions for blobs in the new snapshot so unchanged blobs reuse extraction_id
-            from codecontext.syntax import EXTRACTOR_FINGERPRINTS
+            from codecontext.syntax import EXTRACTOR_FINGERPRINTS, detect_language_for_path
 
             existing_ext_rows = conn.execute(
                 "SELECT blob_oid, id, state, language, extractor_fingerprint FROM extractions"
             ).fetchall()
-            blob_to_ext: dict[str, tuple[str, str]] = {
-                str(r["blob_oid"]): (str(r["id"]), str(r["state"])) for r in existing_ext_rows
+            blob_to_ext = {
+                (str(r["blob_oid"]), str(r["language"])): (str(r["id"]), str(r["state"])) for r in existing_ext_rows
                 if r["extractor_fingerprint"] == EXTRACTOR_FINGERPRINTS.get(r["language"])
             }
 
-            # Atomically replace snapshot_commits and snapshot_files
-            conn.execute("DELETE FROM snapshot_commits")
-            for c_oid, _ in snapshot_reachable:
-                conn.execute("INSERT INTO snapshot_commits (commit_oid) VALUES (?)", (c_oid,))
-
-            conn.execute("DELETE FROM snapshot_files")
+            # Preserve unchanged rows, including unsupported text and metadata-only files.
+            old_commits = {r[0] for r in conn.execute("SELECT commit_oid FROM snapshot_commits")}
+            new_commits = {oid for oid, _ in snapshot_reachable}
+            conn.executemany("DELETE FROM snapshot_commits WHERE commit_oid = ?", [(oid,) for oid in old_commits - new_commits])
+            conn.executemany("INSERT INTO snapshot_commits (commit_oid) VALUES (?)", [(oid,) for oid in new_commits - old_commits])
+            old_files = {bytes(r["path"]): r for r in conn.execute("SELECT * FROM snapshot_files")}
+            new_paths = {entry.path for entry in tree_entries}
+            conn.executemany("DELETE FROM snapshot_files WHERE path = ?", [(p,) for p in old_files.keys() - new_paths])
+            snapshot_changed = old_files.keys() != new_paths
             pending_structure_count = 0
             for entry in tree_entries:
+                check_deadline()
+                ext_key = (entry.oid, detect_language_for_path(entry.path))
+                previous = old_files.get(entry.path)
+                if (previous is not None and previous["blob_oid"] == entry.oid and previous["mode"] == entry.mode
+                    and (previous["extraction_id"] is None or
+                         previous["extraction_id"] == blob_to_ext.get(ext_key, (None, None))[0])):
+                    pending_structure_count += previous["content_state"] == "pending"
+                    continue
+                snapshot_changed = True
+                conn.execute("DELETE FROM snapshot_files WHERE path = ?", (entry.path,))
                 # Gitlink (submodule mode 0o160000 = 57344) or symlink (0o120000 = 40960)
                 if entry.mode == 0o160000:
                     conn.execute(
@@ -1135,8 +1183,8 @@ class GitMirror:
                         retryable=False,
                         observed_us=ts,
                     )
-                elif entry.oid in blob_to_ext:
-                    ext_id, ext_state = blob_to_ext[entry.oid]
+                elif ext_key in blob_to_ext:
+                    ext_id, ext_state = blob_to_ext[ext_key]
                     c_state = (
                         "indexed"
                         if ext_state in ("complete", "partial")
@@ -1153,6 +1201,9 @@ class GitMirror:
                         (entry.path, entry.oid, entry.mode),
                     )
 
+            if snapshot_changed:
+                Store.upsert_gap(conn, repository_id=self.store.config.repository_id, code="STRUCTURE_PENDING",
+                                 scope="syntax:documents", message="Code search and call relationships are awaiting refresh.", retryable=True)
             if pending_structure_count > 0:
                 Store.upsert_gap(
                     conn,

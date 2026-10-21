@@ -18,6 +18,7 @@ import tree_sitter_rust
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query
 
+from codecontext.deadline import check_deadline
 from codecontext.git import GitMirror
 from codecontext.identity import (
     byte_span_to_lines,
@@ -151,7 +152,7 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         q_bytes = q_file.read_bytes()
         q_hash = sha256_bytes(q_bytes)[:16]
         queries[name] = Query(lang, q_bytes.decode("utf-8"))
-        walker_version = 3 if name == "kotlin" else 2
+        walker_version = 4 if name == "kotlin" else 2
         fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}:walker{walker_version}"
     return langs, queries, fingerprints
 
@@ -389,6 +390,7 @@ def parse_blob(
     blob_oid: str | None = None,
 ) -> ParseResult:
     """Parse a unique supported blob once per (blob_oid, language, extractor_fingerprint)."""
+    check_deadline()
     fp = extractor_fingerprint or get_extractor_fingerprint(language)
     actual_oid = blob_oid or sha256_bytes(blob_bytes)
     ext_id = make_extraction_id(blob_oid=actual_oid, language=language, extractor_fingerprint=fp)
@@ -449,7 +451,12 @@ def parse_blob(
 
     ts_lang = LANGUAGES[language]
     parser = Parser(ts_lang)
-    tree = parser.parse(blob_bytes)
+    def read_source(offset: int, _point: Any) -> bytes:
+        check_deadline()
+        return blob_bytes[offset:offset + 32768]
+
+    tree = parser.parse(read_source)
+    check_deadline()
     if tree is None or tree.root_node is None:
         return ParseResult(
             extraction_id=ext_id,
@@ -706,6 +713,7 @@ def parse_blob(
                     )
 
         for ch in node.children:
+            check_deadline()
             walk_python(ch, parent_sym, scope)
 
     def walk_js_ts(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
@@ -773,6 +781,7 @@ def parse_blob(
                 )
 
         for ch in node.children:
+            check_deadline()
             walk_js_ts(ch, parent_sym, scope)
 
     def _handle_js_ts_declaration(
@@ -922,6 +931,14 @@ def parse_blob(
                 walk_kotlin_java(ch, next_sym, next_scope)
             return
 
+        if language == "kotlin" and ntype == "property_declaration" and parent_sym is not None and parent_sym.kind == "class":
+            variable = next((c for c in node.named_children if c.type == "variable_declaration"), None)
+            if variable is not None and variable.named_children:
+                type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
+                if type_node is not None:
+                    add_occurrence(parent_sym.id, "property_type", node.start_byte, node.end_byte,
+                                   details={"name": variable.named_children[0].text.decode("utf-8"),
+                                            "type": type_node.text.decode("utf-8").rstrip("?")})
         if ntype in ("import", "import_declaration"):
             add_occurrence(
                 parent_sym.id if parent_sym else None,
@@ -992,7 +1009,7 @@ def parse_blob(
                                 if variable is None or not variable.named_children:
                                     continue
                                 var_name = variable.named_children[0].text.decode("utf-8")
-                                if var_name != recv_str:
+                                if var_name != re.split(r"[?.!]", recv_str)[0]:
                                     continue
                                 type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
                                 # An untyped local still shadows a typed parameter or field.
@@ -1008,6 +1025,7 @@ def parse_blob(
                 )
 
         for ch in node.children:
+            check_deadline()
             walk_kotlin_java(ch, parent_sym, scope)
 
     def _find_c_declarator_name(decl: Node | None) -> Node | None:
@@ -1188,6 +1206,7 @@ def parse_blob(
                     )
 
         for ch in node.children:
+            check_deadline()
             walk_go_rust_c_cpp(ch, parent_sym, scope)
 
     if language == "python":
@@ -1206,6 +1225,7 @@ def parse_blob(
         by_simple_name.setdefault(s.name, []).append(s)
 
     for occ in occurrences:
+        check_deadline()
         if occ.kind in ("call", "jsx_component") and occ.enclosing_symbol_id is not None:
             # Receiver calls require type/import resolution, even when names exist in this file.
             if occ.details.get("receiver"):
@@ -1467,365 +1487,398 @@ def index_active_snapshot_files(
     blobs_parsed = 0
     cache_hits = 0
 
-    # Read blob contents outside write transaction
+    # Keep one reader open and checkpoint each file before starting the next.
     blob_payloads: dict[str, tuple[int, bytes] | None] = {}
-    unique_oids = list(dict.fromkeys(str(r["blob_oid"]) for r in pending_rows))
-    if unique_oids:
-        with mirror.open_batch_session() as batch:
-            for oid in unique_oids:
-                obj = batch.read_object(oid)
-                if obj is None:
-                    blob_payloads[oid] = None
-                else:
-                    blob_payloads[oid] = (obj[1], obj[2])
-
-    with store.write_transaction(bump_generation=True) as conn:
+    with mirror.open_batch_session() as batch:
         for row in pending_rows:
-            path_bytes = bytes(row["path"])
-            blob_oid = str(row["blob_oid"])
-            disp_path, path_b64 = path_bytes_to_display(path_bytes)
-            payload = blob_payloads.get(blob_oid)
+            check_deadline()
+            oid = str(row["blob_oid"])
+            if oid not in blob_payloads:
+                obj = batch.read_object(oid)
+                blob_payloads[oid] = None if obj is None else (obj[1], obj[2])
+            with store.write_transaction(bump_generation=True) as conn:
+                path_bytes = bytes(row["path"])
+                blob_oid = str(row["blob_oid"])
+                disp_path, path_b64 = path_bytes_to_display(path_bytes)
+                payload = blob_payloads.get(blob_oid)
 
-            if payload is None:
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                Store.upsert_gap(
-                    conn,
-                    repository_id=repo_id,
-                    code="MISSING_GIT_OBJECT",
-                    scope=f"blob:{blob_oid}",
-                    message=f"Git blob {blob_oid[:12]} for {disp_path} is missing from object store.",
-                    retryable=True,
-                )
-                continue
-
-            size, raw_bytes = payload
-            if is_lfs_pointer(raw_bytes):
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                Store.upsert_gap(
-                    conn,
-                    repository_id=repo_id,
-                    code="LFS_CONTENT_NOT_FETCHED",
-                    scope=f"blob:{blob_oid}",
-                    message=f"File {disp_path} is a Git LFS pointer; external asset content was not fetched.",
-                    retryable=False,
-                )
-                continue
-
-            if size > MAX_PARSE_BYTES:
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                Store.upsert_gap(
-                    conn,
-                    repository_id=repo_id,
-                    code="BLOB_TOO_LARGE",
-                    scope=f"blob:{blob_oid}",
-                    message=f"File {disp_path} ({size} bytes) exceeds the 2 MiB limit.",
-                    retryable=False,
-                )
-                continue
-
-            if b"\x00" in raw_bytes:
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                Store.upsert_gap(
-                    conn,
-                    repository_id=repo_id,
-                    code="BINARY_CONTENT",
-                    scope=f"blob:{blob_oid}",
-                    message=f"File {disp_path} is binary.",
-                    retryable=False,
-                )
-                continue
-
-            try:
-                raw_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                Store.upsert_gap(
-                    conn,
-                    repository_id=repo_id,
-                    code="TEXT_DECODE_FAILED",
-                    scope=f"blob:{blob_oid}",
-                    message=f"File {disp_path} is not valid UTF-8.",
-                    retryable=False,
-                )
-                continue
-
-            lang = detect_language_for_path(path_bytes)
-            if lang is not None:
-                parse_res, is_hit = index_blob_into_store(
-                    conn,
-                    repository_id=repo_id,
-                    blob_oid=blob_oid,
-                    blob_bytes=raw_bytes,
-                    language=lang,
-                )
-                if is_hit:
-                    cache_hits += 1
-                else:
-                    blobs_parsed += 1
-                conn.execute(
-                    "UPDATE snapshot_files SET extraction_id = ?, content_state = 'indexed' WHERE path = ?",
-                    (parse_res.extraction_id, path_bytes),
-                )
-            else:
-                conn.execute(
-                    "UPDATE snapshot_files SET content_state = 'text_only' WHERE path = ?",
-                    (path_bytes,),
-                )
-                if not is_indexable_text_path(path_bytes):
+                if payload is None:
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
                     Store.upsert_gap(
                         conn,
                         repository_id=repo_id,
-                        code="UNSUPPORTED_SYNTAX",
+                        code="MISSING_GIT_OBJECT",
                         scope=f"blob:{blob_oid}",
-                        message=f"File {disp_path} uses an unsupported language; indexed as UTF-8 text.",
+                        message=f"Git blob {blob_oid[:12]} for {disp_path} is missing from object store.",
+                        retryable=True,
+                    )
+                    continue
+
+                size, raw_bytes = payload
+                if is_lfs_pointer(raw_bytes):
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
+                    Store.upsert_gap(
+                        conn,
+                        repository_id=repo_id,
+                        code="LFS_CONTENT_NOT_FETCHED",
+                        scope=f"blob:{blob_oid}",
+                        message=f"File {disp_path} is a Git LFS pointer; external asset content was not fetched.",
                         retryable=False,
                     )
+                    continue
 
-        # Rebuild active code search documents so they match the current `snapshot_files`
-        conn.execute("DELETE FROM search_documents WHERE record_kind = 'code'")
-        indexed_files = conn.execute(
-            "SELECT path, blob_oid, extraction_id, content_state FROM snapshot_files WHERE content_state IN ('indexed', 'text_only') ORDER BY path ASC"
-        ).fetchall()
+                if size > MAX_PARSE_BYTES:
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
+                    Store.upsert_gap(
+                        conn,
+                        repository_id=repo_id,
+                        code="BLOB_TOO_LARGE",
+                        scope=f"blob:{blob_oid}",
+                        message=f"File {disp_path} ({size} bytes) exceeds the 2 MiB limit.",
+                        retryable=False,
+                    )
+                    continue
 
-        # Group paths by extraction_id so shared blobs index all active paths on their symbols
-        ext_to_paths: dict[str, list[tuple[str, str | None, str]]] = {}
-        for r in indexed_files:
-            p_bytes = bytes(r["path"])
-            disp_p, b64_p = path_bytes_to_display(p_bytes)
-            b_oid = str(r["blob_oid"])
-            e_id = r["extraction_id"]
-            if e_id is not None:
-                ext_to_paths.setdefault(str(e_id), []).append((disp_p, b64_p, b_oid))
+                if b"\x00" in raw_bytes:
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
+                    Store.upsert_gap(
+                        conn,
+                        repository_id=repo_id,
+                        code="BINARY_CONTENT",
+                        scope=f"blob:{blob_oid}",
+                        message=f"File {disp_path} is binary.",
+                        retryable=False,
+                    )
+                    continue
 
-        for ext_id, path_infos in ext_to_paths.items():
-            ext_row = conn.execute(
-                "SELECT language, blob_oid FROM extractions WHERE id = ?",
-                (ext_id,),
-            ).fetchone()
-            lang_str = str(ext_row["language"]) if ext_row else "unknown"
-            b_oid = str(ext_row["blob_oid"]) if ext_row else ""
-            sym_rows = conn.execute(
-                """
-                SELECT id, kind, name, qualified_name, signature, byte_start, byte_end, line_start, line_end
-                FROM symbols
-                WHERE extraction_id = ?
-                ORDER BY byte_start ASC, id ASC
-                """,
-                (ext_id,),
-            ).fetchall()
-            doc_rows = conn.execute(
-                "SELECT enclosing_symbol_id, text FROM syntax_occurrences WHERE extraction_id = ? AND kind = 'docstring'",
-                (ext_id,),
-            ).fetchall()
-            sym_docs: dict[str, str] = {
-                str(dr["enclosing_symbol_id"]): str(dr["text"])
-                for dr in doc_rows
-                if dr["enclosing_symbol_id"]
-            }
+                try:
+                    raw_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
+                    Store.upsert_gap(
+                        conn,
+                        repository_id=repo_id,
+                        code="TEXT_DECODE_FAILED",
+                        scope=f"blob:{blob_oid}",
+                        message=f"File {disp_path} is not valid UTF-8.",
+                        retryable=False,
+                    )
+                    continue
 
-            primary_disp, primary_b64, _ = path_infos[0]
-            all_path_terms = " ".join(p[0] for p in path_infos)
-            raw_blob_b = (blob_payloads.get(b_oid) or (0, b""))[1]
-            if not raw_blob_b:
-                with mirror.open_batch_session() as batch:
-                    b_obj = batch.read_object(b_oid)
-                    if b_obj is not None:
-                        raw_blob_b = b_obj[2]
+                lang = detect_language_for_path(path_bytes)
+                if lang is not None:
+                    parse_res, is_hit = index_blob_into_store(
+                        conn,
+                        repository_id=repo_id,
+                        blob_oid=blob_oid,
+                        blob_bytes=raw_bytes,
+                        language=lang,
+                    )
+                    if is_hit:
+                        cache_hits += 1
+                    else:
+                        blobs_parsed += 1
+                    conn.execute(
+                        "UPDATE snapshot_files SET extraction_id = ?, content_state = 'indexed' WHERE path = ?",
+                        (parse_res.extraction_id, path_bytes),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE snapshot_files SET content_state = 'text_only' WHERE path = ?",
+                        (path_bytes,),
+                    )
+                    if not is_indexable_text_path(path_bytes):
+                        Store.upsert_gap(
+                            conn,
+                            repository_id=repo_id,
+                            code="UNSUPPORTED_SYNTAX",
+                            scope=f"blob:{blob_oid}",
+                            message=f"File {disp_path} uses an unsupported language; indexed as UTF-8 text.",
+                            retryable=False,
+                        )
 
-            for srow in sym_rows:
-                sid = str(srow["id"])
-                qname = str(srow["qualified_name"])
-                sname = str(srow["name"])
-                sig = str(srow["signature"])
-                doc_text = sym_docs.get(sid, "")
-                b_s = int(srow["byte_start"])
-                b_e = int(srow["byte_end"])
-                l_s = int(srow["line_start"])
-                l_e = int(srow["line_end"])
+    with mirror.open_batch_session() as cached_batch:
+        while True:
+            check_deadline()
+            with store.write_transaction(bump_generation=True) as conn:
+                current_files = conn.execute("SELECT path, blob_oid, extraction_id, content_state FROM snapshot_files ORDER BY path").fetchall()
+                manifest = {bytes(r["path"]).hex(): [r["blob_oid"], r["extraction_id"], r["content_state"]] for r in current_files}
+                checkpoint = conn.execute("SELECT cursor_json FROM checkpoints WHERE stream_key = 'syntax:documents'").fetchone()
+                previous = json.loads(checkpoint[0]) if checkpoint else {}
+                dirty_paths = {p for p in manifest.keys() | previous.keys() if manifest.get(p) != previous.get(p)}
+                if not dirty_paths and checkpoint:
+                    Store.resolve_gaps_in_scope(conn, scope="syntax:documents", code="STRUCTURE_PENDING")
+                    return blobs_parsed, cache_hits
+                remaining_paths = dirty_paths - set(sorted(dirty_paths)[:64])
+                dirty_paths -= remaining_paths
+                dirty_extractions = {m[p][1] for m in (manifest, previous) for p in dirty_paths if p in m and m[p][1]}
+                if checkpoint is None:
+                    conn.execute("DELETE FROM search_documents WHERE record_kind = 'code'")
+                else:
+                    for ext_id in dirty_extractions:
+                        conn.execute("DELETE FROM search_documents WHERE record_kind = 'code' AND record_id IN (SELECT id FROM symbols WHERE extraction_id = ?)", (ext_id,))
+                    for path_hex in dirty_paths:
+                        disp, b64 = path_bytes_to_display(bytes.fromhex(path_hex))
+                        conn.execute("DELETE FROM search_documents WHERE record_kind = 'code' AND json_extract(metadata_json, '$.path') = ? AND json_extract(metadata_json, '$.path_bytes_b64') IS ?", (disp, b64))
+                indexed_files = [r for r in current_files if r["content_state"] in ("indexed", "text_only")
+                                 and (r["extraction_id"] in dirty_extractions or bytes(r["path"]).hex() in dirty_paths)]
 
-                if raw_blob_b:
-                    from codecontext.identity import make_ev_id
+                # Group paths by extraction_id so shared blobs index all active paths on their symbols
+                ext_to_paths: dict[str, list[tuple[str, str | None, str]]] = {}
+                for r in indexed_files:
+                    p_bytes = bytes(r["path"])
+                    disp_p, b64_p = path_bytes_to_display(p_bytes)
+                    b_oid = str(r["blob_oid"])
+                    e_id = r["extraction_id"]
+                    if e_id is not None:
+                        ext_to_paths.setdefault(str(e_id), []).append((disp_p, b64_p, b_oid))
 
-                    sym_slice = raw_blob_b[b_s:b_e]
-                    sym_hash = sha256_bytes(sym_slice)
-                    for p_disp, p_b64, _ in path_infos:
-                        c_anc = {
-                            "git_oid": b_oid,
-                            "kind": "code",
-                            "original_review_commit": None,
-                            "path": {"path": p_disp, "path_bytes_b64": p_b64},
-                            "revision": active_rev,
-                            "source_version_id": None,
-                            "span": {
+                for ext_id, path_infos in ext_to_paths.items():
+                    check_deadline()
+                    ext_row = conn.execute(
+                        "SELECT language, blob_oid FROM extractions WHERE id = ?",
+                        (ext_id,),
+                    ).fetchone()
+                    lang_str = str(ext_row["language"]) if ext_row else "unknown"
+                    b_oid = str(ext_row["blob_oid"]) if ext_row else ""
+                    sym_rows = conn.execute(
+                        """
+                        SELECT id, kind, name, qualified_name, signature, byte_start, byte_end, line_start, line_end
+                        FROM symbols
+                        WHERE extraction_id = ?
+                        ORDER BY byte_start ASC, id ASC
+                        """,
+                        (ext_id,),
+                    ).fetchall()
+                    doc_rows = conn.execute(
+                        "SELECT enclosing_symbol_id, text FROM syntax_occurrences WHERE extraction_id = ? AND kind = 'docstring'",
+                        (ext_id,),
+                    ).fetchall()
+                    sym_docs: dict[str, str] = {
+                        str(dr["enclosing_symbol_id"]): str(dr["text"])
+                        for dr in doc_rows
+                        if dr["enclosing_symbol_id"]
+                    }
+
+                    primary_disp, primary_b64, _ = path_infos[0]
+                    all_path_terms = " ".join(p[0] for p in path_infos)
+                    raw_blob_b = (blob_payloads.get(b_oid) or (0, b""))[1]
+                    if not raw_blob_b:
+                        b_obj = cached_batch.read_object(b_oid)
+                        if b_obj is not None:
+                            raw_blob_b = b_obj[2]
+
+                    for srow in sym_rows:
+                        check_deadline()
+                        sid = str(srow["id"])
+                        qname = str(srow["qualified_name"])
+                        sname = str(srow["name"])
+                        sig = str(srow["signature"])
+                        doc_text = sym_docs.get(sid, "")
+                        b_s = int(srow["byte_start"])
+                        b_e = int(srow["byte_end"])
+                        l_s = int(srow["line_start"])
+                        l_e = int(srow["line_end"])
+
+                        if raw_blob_b:
+                            from codecontext.identity import make_ev_id
+
+                            sym_slice = raw_blob_b[b_s:b_e]
+                            sym_hash = sha256_bytes(sym_slice)
+                            for p_disp, p_b64, _ in path_infos:
+                                c_anc = {
+                                    "git_oid": b_oid,
+                                    "kind": "code",
+                                    "original_review_commit": None,
+                                    "path": {"path": p_disp, "path_bytes_b64": p_b64},
+                                    "revision": active_rev,
+                                    "source_version_id": None,
+                                    "span": {
+                                        "byte_end": b_e,
+                                        "byte_start": b_s,
+                                        "line_end": l_e,
+                                        "line_start": l_s,
+                                    },
+                                    "underlying_record_id": sid,
+                                }
+                                c_ev_id = make_ev_id(
+                                    repository_id=repo_id,
+                                    kind="code",
+                                    source_version_id=None,
+                                    git_oid=b_oid,
+                                    anchor=c_anc,
+                                    content_sha256=sym_hash,
+                                )
+                                conn.execute(
+                                    """
+                                    INSERT INTO evidence (id, kind, source_version_id, git_oid, anchor_json, content_sha256, state)
+                                    VALUES (?, 'code', NULL, ?, ?, ?, 'available')
+                                    ON CONFLICT(id) DO NOTHING
+                                    """,
+                                    (c_ev_id, b_oid, canonical_json(c_anc), sym_hash),
+                                )
+
+                        title_norm = normalize_search_text(f"{qname} {primary_disp}")
+                        ident_norm = normalize_search_text(f"{sname} {qname} {all_path_terms}")
+                        body_norm = normalize_search_text(f"{sig} {doc_text}")
+                        meta_json = canonical_json(
+                            {
+                                "blob_oid": b_oid,
                                 "byte_end": b_e,
                                 "byte_start": b_s,
+                                "display_title": f"{qname} ({primary_disp})",
+                                "language": lang_str,
                                 "line_end": l_e,
                                 "line_start": l_s,
-                            },
-                            "underlying_record_id": sid,
-                        }
-                        c_ev_id = make_ev_id(
-                            repository_id=repo_id,
-                            kind="code",
-                            source_version_id=None,
-                            git_oid=b_oid,
-                            anchor=c_anc,
-                            content_sha256=sym_hash,
+                                "path": primary_disp,
+                                "path_bytes_b64": primary_b64,
+                                "paths": [p[0] for p in path_infos[:10]],
+                                "revision": active_rev,
+                                "signature": sig[:320],
+                            }
                         )
                         conn.execute(
                             """
-                            INSERT INTO evidence (id, kind, source_version_id, git_oid, anchor_json, content_sha256, state)
-                            VALUES (?, 'code', NULL, ?, ?, ?, 'available')
-                            ON CONFLICT(id) DO NOTHING
+                            INSERT INTO search_documents (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)
+                            VALUES ('code', ?, 0, ?, ?, ?, ?)
                             """,
-                            (c_ev_id, b_oid, canonical_json(c_anc), sym_hash),
+                            (sid, title_norm, ident_norm, body_norm, meta_json),
                         )
 
-                title_norm = normalize_search_text(f"{qname} {primary_disp}")
-                ident_norm = normalize_search_text(f"{sname} {qname} {all_path_terms}")
-                body_norm = normalize_search_text(f"{sig} {doc_text}")
-                meta_json = canonical_json(
-                    {
-                        "blob_oid": b_oid,
-                        "byte_end": b_e,
-                        "byte_start": b_s,
-                        "display_title": f"{qname} ({primary_disp})",
-                        "language": lang_str,
-                        "line_end": l_e,
-                        "line_start": l_s,
-                        "path": primary_disp,
-                        "path_bytes_b64": primary_b64,
-                        "paths": [p[0] for p in path_infos[:10]],
-                        "revision": active_rev,
-                        "signature": sig[:320],
-                    }
-                )
-                conn.execute(
-                    """
-                    INSERT INTO search_documents (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)
-                    VALUES ('code', ?, 0, ?, ?, ?, ?)
-                    """,
-                    (sid, title_norm, ident_norm, body_norm, meta_json),
-                )
+                # Also index file/chunk-level documents for text_only files or files without symbols
+                with mirror.open_batch_session() as batch:
+                    for r in indexed_files:
+                        check_deadline()
+                        p_bytes = bytes(r["path"])
+                        disp_p, b64_p = path_bytes_to_display(p_bytes)
+                        b_oid = str(r["blob_oid"])
+                        e_id = r["extraction_id"]
+                        if e_id is not None:
+                            has_syms = int(
+                                conn.execute(
+                                    "SELECT COUNT(*) FROM symbols WHERE extraction_id = ?", (e_id,)
+                                ).fetchone()[0]
+                            )
+                            if has_syms > 0:
+                                continue
+                        obj = batch.read_object(b_oid)
+                        if obj is None:
+                            continue
+                        raw_b = obj[2]
+                        try:
+                            chunks = chunk_utf8_bytes(raw_b)
+                        except UnicodeDecodeError:
+                            continue
+                        for ch in chunks:
+                            l_s, l_e = byte_span_to_lines(raw_b, ch.byte_start, ch.byte_end)
+                            anchor_dict = {
+                                "git_oid": b_oid,
+                                "kind": "code",
+                                "original_review_commit": None,
+                                "path": {"path": disp_p, "path_bytes_b64": b64_p},
+                                "revision": active_rev,
+                                "source_version_id": None,
+                                "span": {
+                                    "byte_end": ch.byte_end,
+                                    "byte_start": ch.byte_start,
+                                    "line_end": l_e,
+                                    "line_start": l_s,
+                                },
+                                "underlying_record_id": None,
+                            }
+                            chunk_bytes = raw_b[ch.byte_start : ch.byte_end]
+                            c_hash = sha256_bytes(chunk_bytes)
+                            from codecontext.identity import make_ev_id
 
-        # Also index file/chunk-level documents for text_only files or files without symbols
-        with mirror.open_batch_session() as batch:
-            for r in indexed_files:
-                p_bytes = bytes(r["path"])
-                disp_p, b64_p = path_bytes_to_display(p_bytes)
-                b_oid = str(r["blob_oid"])
-                e_id = r["extraction_id"]
-                if e_id is not None:
-                    has_syms = int(
-                        conn.execute(
-                            "SELECT COUNT(*) FROM symbols WHERE extraction_id = ?", (e_id,)
-                        ).fetchone()[0]
-                    )
-                    if has_syms > 0:
-                        continue
-                obj = batch.read_object(b_oid)
-                if obj is None:
-                    continue
-                raw_b = obj[2]
-                try:
-                    chunks = chunk_utf8_bytes(raw_b)
-                except UnicodeDecodeError:
-                    continue
-                for ch in chunks:
-                    l_s, l_e = byte_span_to_lines(raw_b, ch.byte_start, ch.byte_end)
-                    anchor_dict = {
-                        "git_oid": b_oid,
-                        "kind": "code",
-                        "original_review_commit": None,
-                        "path": {"path": disp_p, "path_bytes_b64": b64_p},
-                        "revision": active_rev,
-                        "source_version_id": None,
-                        "span": {
-                            "byte_end": ch.byte_end,
-                            "byte_start": ch.byte_start,
-                            "line_end": l_e,
-                            "line_start": l_s,
-                        },
-                        "underlying_record_id": None,
-                    }
-                    chunk_bytes = raw_b[ch.byte_start : ch.byte_end]
-                    c_hash = sha256_bytes(chunk_bytes)
-                    from codecontext.identity import make_ev_id
+                            ev_id = make_ev_id(
+                                repository_id=repo_id,
+                                kind="code",
+                                source_version_id=None,
+                                git_oid=b_oid,
+                                anchor=anchor_dict,
+                                content_sha256=c_hash,
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO evidence (id, kind, source_version_id, git_oid, anchor_json, content_sha256, state)
+                                VALUES (?, 'code', NULL, ?, ?, ?, 'available')
+                                ON CONFLICT(id) DO NOTHING
+                                """,
+                                (ev_id, b_oid, canonical_json(anchor_dict), c_hash),
+                            )
+                            meta_json = canonical_json(
+                                {
+                                    "blob_oid": b_oid,
+                                    "byte_end": ch.byte_end,
+                                    "byte_start": ch.byte_start,
+                                    "display_title": disp_p,
+                                    "evidence_id": ev_id,
+                                    "line_end": l_e,
+                                    "line_start": l_s,
+                                    "path": disp_p,
+                                    "path_bytes_b64": b64_p,
+                                    "revision": active_rev,
+                                    "snippet": ch.text[:320],
+                                }
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO search_documents (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)
+                                VALUES ('code', ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(record_kind, record_id, chunk_ordinal) DO NOTHING
+                                """,
+                                (
+                                    ev_id,
+                                    ch.ordinal,
+                                    normalize_search_text(disp_p),
+                                    normalize_search_text(disp_p),
+                                    normalize_search_text(ch.text),
+                                    meta_json,
+                                ),
+                            )
 
-                    ev_id = make_ev_id(
-                        repository_id=repo_id,
-                        kind="code",
-                        source_version_id=None,
-                        git_oid=b_oid,
-                        anchor=anchor_dict,
-                        content_sha256=c_hash,
-                    )
+                rem_pending = int(
                     conn.execute(
-                        """
-                        INSERT INTO evidence (id, kind, source_version_id, git_oid, anchor_json, content_sha256, state)
-                        VALUES (?, 'code', NULL, ?, ?, ?, 'available')
-                        ON CONFLICT(id) DO NOTHING
-                        """,
-                        (ev_id, b_oid, canonical_json(anchor_dict), c_hash),
-                    )
-                    meta_json = canonical_json(
-                        {
-                            "blob_oid": b_oid,
-                            "byte_end": ch.byte_end,
-                            "byte_start": ch.byte_start,
-                            "display_title": disp_p,
-                            "evidence_id": ev_id,
-                            "line_end": l_e,
-                            "line_start": l_s,
-                            "path": disp_p,
-                            "path_bytes_b64": b64_p,
-                            "revision": active_rev,
-                            "snippet": ch.text[:320],
-                        }
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO search_documents (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)
-                        VALUES ('code', ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(record_kind, record_id, chunk_ordinal) DO NOTHING
-                        """,
-                        (
-                            ev_id,
-                            ch.ordinal,
-                            normalize_search_text(disp_p),
-                            normalize_search_text(disp_p),
-                            normalize_search_text(ch.text),
-                            meta_json,
-                        ),
-                    )
+                        "SELECT COUNT(*) FROM snapshot_files WHERE content_state = 'pending'"
+                    ).fetchone()[0]
+                )
+                if rem_pending == 0:
+                    Store.resolve_gaps_in_scope(conn, scope="git:snapshot", code="STRUCTURE_PENDING")
 
-        rem_pending = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM snapshot_files WHERE content_state = 'pending'"
-            ).fetchone()[0]
-        )
-        if rem_pending == 0:
-            Store.resolve_gaps_in_scope(conn, scope="git:snapshot", code="STRUCTURE_PENDING")
+                # Resolve cross-file call candidates using import/module/type-aware disambiguation
+                if remaining_paths:
+                    Store.upsert_gap(conn, repository_id=repo_id, code="STRUCTURE_PENDING", scope="syntax:documents",
+                                     message="Code search and call relationships are awaiting refresh.", retryable=True)
+                else:
+                    _resolve_cross_file_calls_and_imports(conn)
+                    Store.resolve_gaps_in_scope(conn, scope="syntax:documents", code="STRUCTURE_PENDING")
+                for path_hex in dirty_paths:
+                    if path_hex in manifest:
+                        previous[path_hex] = manifest[path_hex]
+                    else:
+                        previous.pop(path_hex, None)
+                conn.execute("""
+                    INSERT INTO checkpoints (stream_key, cursor_json) VALUES ('syntax:documents', ?)
+                    ON CONFLICT(stream_key) DO UPDATE SET cursor_json = excluded.cursor_json
+                """, (canonical_json(previous),))
 
-        # Resolve cross-file call candidates using import/module/type-aware disambiguation
-        _resolve_cross_file_calls_and_imports(conn)
-
-    return (blobs_parsed, cache_hits)
+                if not remaining_paths:
+                    return blobs_parsed, cache_hits
 
 
 PY_FROM_IMPORT_RE = re.compile(
@@ -1975,7 +2028,8 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
     4. Same-directory/package preference
     5. Global fallback ONLY when the symbol name is globally unique (1 match) across the snapshot.
     """
-    conn.execute("DELETE FROM relations WHERE method = 'lexical_snapshot'")
+    previous_relations = {r[0] for r in conn.execute("SELECT id FROM relations WHERE method = 'lexical_snapshot'")}
+    active_relations: set[str] = set()
 
     active_rows = conn.execute(
         """
@@ -2028,6 +2082,16 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         for ext_id, txts in ext_raw_imports.items()
     }
 
+    property_types: dict[tuple[str, str], set[str]] = {}
+    for info in sym_meta.values():
+        if info["kind"] == "class":
+            for name, type_name in re.findall(r"\b(?:val|var)\s+(\w+)\s*:\s*([\w.]+)", info["signature"]):
+                property_types.setdefault((info["id"], name), set()).add(type_name)
+    for row in conn.execute("SELECT enclosing_symbol_id, details_json FROM syntax_occurrences WHERE kind = 'property_type'"):
+        if row["enclosing_symbol_id"] in sym_meta:
+            detail = json.loads(row["details_json"])
+            property_types.setdefault((row["enclosing_symbol_id"], detail["name"]), set()).add(detail["type"])
+
     call_rows = conn.execute(
         """
         SELECT DISTINCT so.extraction_id, so.enclosing_symbol_id, so.details_json
@@ -2038,6 +2102,7 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
     ).fetchall()
 
     for cr in call_rows:
+        check_deadline()
         enc_id = str(cr["enclosing_symbol_id"])
         ext_id = str(cr["extraction_id"])
         enc_info = sym_meta.get(enc_id)
@@ -2066,14 +2131,32 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
             recv_types.update(_extract_receiver_types_from_signature(parent_info["signature"]))
         recv_types.update(_extract_receiver_types_from_signature(enc_info["signature"]))
         if isinstance(receiver, str) and "receiver_type" in det:
-            recv_types[receiver] = det["receiver_type"]
+            recv_types[re.split(r"[?.!]", receiver)[0]] = det["receiver_type"]
 
         resolved_targets: list[dict[str, Any]] = []
 
         if isinstance(receiver, str) and receiver:
             clean_recv = receiver.replace("this.", "").replace("self.", "").strip()
+            chain = re.sub(r"[?!]", "", clean_recv).split(".")
+            root_types = ({recv_types[chain[0]]} if chain[0] in recv_types
+                          else property_types.get((parent_id, chain[0]), set()))
+            if len(chain) > 1 and all(part.isidentifier() for part in chain):
+                types = root_types
+                for property_name in chain[1:]:
+                    types = {
+                        target_type
+                        for type_name in types
+                        for owner in by_name.get(type_name.rsplit(".", 1)[-1], [])
+                        if owner["kind"] == "class"
+                        for target_type in property_types.get((owner["id"], property_name), set())
+                    }
+                owner_ids = {
+                    owner["id"] for type_name in types
+                    for owner in by_name.get(type_name.rsplit(".", 1)[-1], []) if owner["kind"] == "class"
+                }
+                resolved_targets = [c for c in candidates if c["parent_symbol_id"] in owner_ids]
             # 1A. Receiver is an imported module alias (`a.save()` where `import a` or `from pkg import a`)
-            if clean_recv in mod_aliases:
+            if not resolved_targets and clean_recv in mod_aliases:
                 mod_spec = mod_aliases[clean_recv]
                 resolved_targets = [
                     c for c in candidates if _module_spec_matches_path(mod_spec, c["path"])
@@ -2088,13 +2171,12 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                     or _module_spec_matches_path(mod_spec, c["path"])
                 ]
             # 1B. Receiver is a typed parameter/field (`api.getUser()` where `api: Api`)
-            if not resolved_targets and clean_recv in recv_types:
-                t_name = recv_types[clean_recv]
+            if not resolved_targets and len(chain) == 1 and root_types:
                 resolved_targets = [
                     c
                     for c in candidates
-                    if c["qualified_name"] == f"{t_name}.{callee}"
-                    or c["qualified_name"].endswith(f".{t_name}.{callee}")
+                    if any(c["qualified_name"] == f"{t_name}.{callee}"
+                           or c["qualified_name"].endswith(f".{t_name}.{callee}") for t_name in root_types)
                 ]
             # 1C. Receiver is `self`/`this` -> same class methods only
             if not resolved_targets and receiver in ("self", "this") and parent_id and str(parent_id) in sym_meta:
@@ -2148,6 +2230,9 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                 relation_kind="calls_candidate",
                 method="lexical_snapshot",
             )
+            active_relations.add(rel_id)
+            if rel_id in previous_relations:
+                continue
             conn.execute(
                 """
                 INSERT INTO relations (
@@ -2157,3 +2242,5 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                 """,
                 (rel_id, enc_id, tgt["id"]),
             )
+
+    conn.executemany("DELETE FROM relations WHERE id = ?", [(rid,) for rid in previous_relations - active_relations])

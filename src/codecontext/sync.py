@@ -1,9 +1,13 @@
+import sqlite3
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from codecontext.deadline import SyncDeadlineExceeded, check_deadline, expired, sync_deadline
+from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.github import (
     GitHubClient,
@@ -27,6 +31,51 @@ def execute_sync(
     mirror: GitMirror,
     request: SyncRequest,
     *,
+    github_transport: httpx.BaseTransport | None = None,
+    github_token: str | None = None,
+) -> SyncReport:
+    started = now_us()
+    with store.connect_read() as conn:
+        commits_before = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+        extractions_before = conn.execute("SELECT COUNT(*) FROM extractions").fetchone()[0]
+        sources_before = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        versions_before = conn.execute("SELECT COUNT(*) FROM source_versions").fetchone()[0]
+    progress: dict[str, Any] = {"structure_complete": False}
+    with sync_deadline(request.max_seconds):
+        try:
+            return _execute_sync(store, mirror, request, progress=progress, github_transport=github_transport, github_token=github_token)
+        except (SyncDeadlineExceeded, CodeContextError, sqlite3.OperationalError, subprocess.TimeoutExpired, httpx.TransportError) as exc:
+            if not isinstance(exc, SyncDeadlineExceeded) and not expired():
+                raise
+    # The interrupted transaction rolls back; earlier file/commit checkpoints remain usable.
+    with store.write_transaction() as conn:
+        conn.execute("UPDATE jobs SET state = 'pending' WHERE state = 'running' AND kind = 'git_commit_diff'")
+        gap_code = "GIT_HISTORY_PENDING" if progress["structure_complete"] else "STRUCTURE_PENDING"
+        Store.upsert_gap(conn, repository_id=store.config.repository_id, code=gap_code,
+                         scope="sync:deadline", message="Sync reached its time budget. Run sync to finish the requested work.", retryable=True)
+        coverage, gaps, _ = Store.build_coverage_and_gaps(conn, max_detailed_gaps=20)
+        meta = conn.execute("SELECT * FROM store_meta WHERE singleton = 1").fetchone()
+        jobs = Store.get_queue_counts(conn)
+        commits_added = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] - commits_before
+        blobs_parsed = conn.execute("SELECT COUNT(*) FROM extractions").fetchone()[0] - extractions_before
+        sources_added = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] - sources_before
+        versions_added = conn.execute("SELECT COUNT(*) FROM source_versions").fetchone()[0] - versions_before
+    finished = now_us()
+    return SyncReport(repository_id=store.config.repository_id, revision=meta["active_revision"],
+                      generation=meta["generation"] + 1, access_epoch=meta["access_epoch"],
+                      coverage=coverage, gaps=gaps, state="partial", started_at=us_to_iso_z(started),
+                      finished_at=us_to_iso_z(finished), elapsed_ms=(finished-started)//1000,
+                      requests_attempted=getattr(progress.get("http_client"), "requests_attempted", 0),
+                      commits_added=commits_added, blobs_parsed=blobs_parsed,
+                      sources_added=sources_added, versions_added=versions_added, cache_hits=0, jobs=jobs, stop_reason="time_budget")
+
+
+def _execute_sync(
+    store: Store,
+    mirror: GitMirror,
+    request: SyncRequest,
+    *,
+    progress: dict[str, Any],
     github_transport: httpx.BaseTransport | None = None,
     github_token: str | None = None,
 ) -> SyncReport:
@@ -81,6 +130,10 @@ def execute_sync(
         focus_path=focus_path_bytes,
     )
 
+    progress["structure_complete"] = True
+    with store.write_transaction() as conn:
+        Store.resolve_gaps_in_scope(conn, scope="sync:deadline")
+    check_deadline()
     requests_attempted = 0
     sources_added = 0
     versions_added = 0
@@ -140,7 +193,7 @@ def execute_sync(
     # 5. If online and GitHub or GitLab repository is configured, collect remote evidence
     gitlab_info = (
         detect_gitlab_repository_from_git(Path(store.config.repo_path))
-        if store.config.repo_path and not store.config.github_repository
+        if not request.offline and store.config.repo_path and not store.config.github_repository
         else None
     )
 
@@ -149,6 +202,7 @@ def execute_sync(
         rem_reqs = request.max_requests - requests_attempted
         if rem_reqs > 0 and time.monotonic() < deadline_mono:
             with GitLabClient(base_url=gl_base, token=github_token, transport=github_transport) as gl_client:
+                progress["http_client"] = gl_client
                 used, s_add, v_add, gl_done = collect_gitlab_merge_requests_and_issues(
                     store,
                     gl_client,
@@ -172,11 +226,13 @@ def execute_sync(
                     message="Sync ran with offline=True; remote GitHub evidence collection remains pending.",
                     retryable=True,
                 )
-            stop_reason = "offline"
+            if stop_reason == "scope_complete":
+                stop_reason = "offline"
         elif stop_reason == "scope_complete":
             rem_reqs = request.max_requests - requests_attempted
             if rem_reqs > 0 and time.monotonic() < deadline_mono:
                 with GitHubClient(token=github_token, transport=github_transport) as gh_client:
+                    progress["http_client"] = gh_client
                     if focus_path_bytes is not None and not request.reconcile:
                         used, s_add, v_add, gh_done = collect_focused_github_evidence(
                             store,
@@ -317,6 +373,7 @@ def execute_sync(
         stop_reason != "scope_complete"
         or q_counts.pending > 0
         or cov.git.state != "complete"
+        or cov.structure.state != "complete"
         or (store.config.github_repository is not None and cov.github.state != "complete")
     )
     report_state: Any = "partial" if is_partial else "complete"
