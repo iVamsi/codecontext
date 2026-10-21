@@ -142,10 +142,14 @@ async def test_t11_early_end_to_end_milestone_and_surface_equivalence(tmp_path: 
         # Check advertised tools and annotations
         tools_res = await client.list_tools()
         tools_by_name = {t.name: t for t in tools_res.tools}
-        assert set(tools_by_name.keys()) == {"search", "get", "context"}
+        assert set(tools_by_name.keys()) == {
+            "search", "get", "context", "list_repositories", "search_graph",
+            "trace_path", "query_graph", "get_architecture", "detect_changes", "get_code_snippet",
+        }
         for t in tools_res.tools:
             schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
-            assert "request" in schema.get("properties", {})
+            if t.name != "list_repositories":
+                assert "request" in schema.get("properties", {})
             assert t.annotations is not None
             assert t.annotations.read_only_hint is True
             assert t.annotations.destructive_hint is False

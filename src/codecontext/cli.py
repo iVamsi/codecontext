@@ -255,8 +255,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--include-graph-tools",
         dest="include_graph_tools",
-        action="store_true",
-        help="Also expose search_graph, trace_path, and query_graph (Cypher) MCP tools.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expose structural graph tools (enabled by default).",
     )
 
     # search-graph

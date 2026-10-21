@@ -1,7 +1,10 @@
+import hashlib
+import json
 import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -902,7 +905,86 @@ class GitMirror:
     def open_batch_session(self) -> CatFileBatchSession:
         return CatFileBatchSession(self.git_dir, self.empty_hooks_dir)
 
-    def prepare_snapshot(self, revision: str = "HEAD") -> str:
+    def _prepare_workspace_revision(self, source_repo: Path, head_oid: str) -> tuple[str, list[bytes]]:
+        """Capture tracked working files in the owned mirror without writing the source index."""
+        from codecontext.workspace import (
+            _parse_ls_files_stage_z,
+            _read_root_confined_regular_file,
+        )
+
+        staged = _parse_ls_files_stage_z(run_safe_git(
+            ["ls-files", "--stage", "-z"], cwd=source_repo,
+            empty_hooks_dir=self.empty_hooks_dir,
+        ).stdout)
+        if any(stage != 0 for _, _, stage, _ in staged):
+            raise CodeContextError(
+                code="INVALID_REQUEST", message="Resolve unmerged files before syncing the workspace.",
+                retryable=False,
+            )
+        original = {entry.path: entry for entry in self.list_tree_entries(head_oid)}
+        tracked = {path for _, _, _, path in staged}
+        updates: list[bytes] = []
+        oversized: list[bytes] = []
+        zero_oid = "0" * len(head_oid)
+        for path in original.keys() - tracked:
+            updates.append(b"0 " + zero_oid.encode() + b"\t" + path + b"\0")
+        for mode, staged_oid, _, path in staged:
+            previous = original.get(path)
+            if mode == 0o160000:
+                if previous is None or previous.oid != staged_oid or previous.mode != mode:
+                    updates.append(f"{mode:o} {staged_oid}\t".encode() + path + b"\0")
+                continue
+            if mode == 0o120000 and previous is not None and previous.mode == mode:
+                continue
+            state, content, working_mode = _read_root_confined_regular_file(source_repo, path)
+            if state in ("deleted", "symlink", "oversized"):
+                if state == "oversized":
+                    oversized.append(path)
+                if path in original:
+                    updates.append(b"0 " + zero_oid.encode() + b"\t" + path + b"\0")
+                continue
+            if state != "ok" or content is None:
+                raise CodeContextError(
+                    code="IO_ERROR", message="Could not safely read a tracked workspace file.",
+                    retryable=True,
+                )
+            algorithm = "sha1" if len(head_oid) == 40 else "sha256"
+            oid = hashlib.new(algorithm, f"blob {len(content)}\0".encode() + content).hexdigest().encode()
+            if previous is None or previous.oid.encode() != oid or previous.mode != working_mode:
+                run_safe_git(
+                    ["hash-object", "-w", "--stdin"], git_dir=self.git_dir,
+                    empty_hooks_dir=self.empty_hooks_dir, stdin_bytes=content,
+                )
+                updates.append(f"{working_mode:o} ".encode() + oid + b"\t" + path + b"\0")
+        if not updates:
+            return head_oid, oversized
+
+        with tempfile.TemporaryDirectory(prefix="codecontext-index-") as temp_dir:
+            env = {"GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
+            for args, payload in [
+                (["read-tree", head_oid], None),
+                (["update-index", "-z", "--index-info"], b"".join(updates)),
+            ]:
+                run_safe_git(args, git_dir=self.git_dir, empty_hooks_dir=self.empty_hooks_dir,
+                             extra_env=env, stdin_bytes=payload)
+            tree_oid = run_safe_git(
+                ["write-tree"], git_dir=self.git_dir, empty_hooks_dir=self.empty_hooks_dir,
+                extra_env=env,
+            ).stdout.decode().strip()
+        raw_commit = (
+            f"tree {tree_oid}\nparent {head_oid}\n"
+            "author CodeContext Workspace <workspace@codecontext.invalid> 0 +0000\n"
+            "committer CodeContext Workspace <workspace@codecontext.invalid> 0 +0000\n\n"
+            "Uncommitted workspace snapshot (created in the CodeContext store only).\n"
+        ).encode()
+        snapshot_oid = run_safe_git(
+            ["hash-object", "-w", "-t", "commit", "--stdin"], git_dir=self.git_dir,
+            empty_hooks_dir=self.empty_hooks_dir, stdin_bytes=raw_commit,
+        ).stdout.decode().strip()
+        self.pin_retained_oid(snapshot_oid)
+        return snapshot_oid, oversized
+
+    def prepare_snapshot(self, revision: str = "HEAD", *, include_workspace: bool = False) -> str:
         """Import objects for `revision`, parse commit graph and file map, and atomically
         publish `snapshot_files`, `snapshot_commits`, `refs`, and `active_revision`.
         """
@@ -910,6 +992,10 @@ class GitMirror:
         resolved_oid, source_refs, is_shallow = self.import_local_refs_and_revision(
             source_repo, revision
         )
+        source_oid = resolved_oid
+        oversized: list[bytes] = []
+        if include_workspace:
+            resolved_oid, oversized = self._prepare_workspace_revision(source_repo, resolved_oid)
 
         # Read tree entries for active revision and reachable commits across all declared refs outside write transaction
         tree_entries = self.list_tree_entries(resolved_oid)
@@ -926,6 +1012,21 @@ class GitMirror:
 
         ts = now_us()
         with self.store.write_transaction(bump_generation=True) as conn:
+            Store.resolve_gaps_in_scope(conn, scope="workspace:snapshot")
+            if oversized:
+                Store.upsert_gap(
+                    conn, repository_id=self.store.config.repository_id,
+                    code="BLOB_TOO_LARGE", scope="workspace:snapshot",
+                    message=f"{len(oversized)} workspace file(s) exceed the bounded read limit and are omitted from the working snapshot.",
+                    retryable=False, observed_us=ts,
+                )
+            if resolved_oid != source_oid:
+                Store.upsert_gap(
+                    conn, repository_id=self.store.config.repository_id,
+                    code="WORKSPACE_SNAPSHOT", scope="workspace:snapshot",
+                    message=f"Snapshot includes uncommitted tracked files based on {source_oid}; the synthetic revision exists only in this store.",
+                    retryable=False, observed_us=ts,
+                )
             # Record observed refs
             conn.execute("UPDATE refs SET active = 0 WHERE source = 'local'")
             for ref_name, ref_oid in source_refs.items():
@@ -987,11 +1088,14 @@ class GitMirror:
                 )
 
             # Find existing extractions for blobs in the new snapshot so unchanged blobs reuse extraction_id
+            from codecontext.syntax import EXTRACTOR_FINGERPRINTS
+
             existing_ext_rows = conn.execute(
-                "SELECT blob_oid, id, state FROM extractions"
+                "SELECT blob_oid, id, state, language, extractor_fingerprint FROM extractions"
             ).fetchall()
             blob_to_ext: dict[str, tuple[str, str]] = {
                 str(r["blob_oid"]): (str(r["id"]), str(r["state"])) for r in existing_ext_rows
+                if r["extractor_fingerprint"] == EXTRACTOR_FINGERPRINTS.get(r["language"])
             }
 
             # Atomically replace snapshot_commits and snapshot_files
@@ -1085,12 +1189,13 @@ class GitMirror:
             conn.execute(
                 """
                 INSERT INTO checkpoints (stream_key, cursor_json, last_success_at_us, last_reconciled_at_us)
-                VALUES ('git:snapshot', '{}', ?, ?)
+                VALUES ('git:snapshot', ?, ?, ?)
                 ON CONFLICT(stream_key) DO UPDATE SET
+                    cursor_json = excluded.cursor_json,
                     last_success_at_us = excluded.last_success_at_us,
                     last_reconciled_at_us = excluded.last_reconciled_at_us
                 """,
-                (ts, ts),
+                (json.dumps({"workspace_base_revision": source_oid if resolved_oid != source_oid else None}), ts, ts),
             )
 
         return resolved_oid
@@ -1112,6 +1217,12 @@ class GitMirror:
         validate_revision_arg(requested_revision)
         if requested_revision == active_rev:
             return str(active_rev)
+        if requested_revision == "HEAD":
+            checkpoint = conn.execute(
+                "SELECT cursor_json FROM checkpoints WHERE stream_key = 'git:snapshot'"
+            ).fetchone()
+            if checkpoint and json.loads(checkpoint[0]).get("workspace_base_revision"):
+                return str(active_rev)
 
         # Check recorded refs in SQLite
         candidates = [

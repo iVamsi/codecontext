@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from mcp import Client
@@ -12,7 +14,7 @@ from codecontext.graph import (
     SearchGraphRequest,
     TracePathRequest,
 )
-from codecontext.mcp_server import create_mcp_server
+from codecontext.mcp_server import _DynamicMemoryHolder, create_mcp_server
 from codecontext.syntax import parse_blob
 from tests.fixtures.builders import (
     GitCommitSpec,
@@ -20,6 +22,183 @@ from tests.fixtures.builders import (
     init_fixture_repo,
     run_git_fixture,
 )
+
+
+def test_kotlin_receiver_does_not_link_unrelated_same_file_method(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Kotlin receivers", files={
+        "Main.kt": b"class A {\n fun save() {}\n}\nclass B {\n fun save() {}\n}\n"
+        b"fun run(b: B) { b.save() }\nfun unknown(x: Any) { x.save() }\n",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        trace = mem.trace_path(TracePathRequest(function_name="run", direction="outbound"))
+        assert {e.to_name for e in trace.edges} == {"B.save"}
+        assert not mem.trace_path(TracePathRequest(function_name="unknown", direction="outbound")).edges
+
+
+def test_kotlin_local_receiver_shadows_constructor_type(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Local receiver", files={
+        "Main.kt": b"class A {\n fun save() {}\n}\nclass B {\n fun save() {}\n}\n"
+        b"class Worker(val b: A) {\n fun run() {\n val b: B = B()\n b.save()\n }\n}\n",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        trace = mem.trace_path(TracePathRequest(function_name="Worker.run", direction="outbound", depth=1))
+        assert {e.to_name for e in trace.edges if e.to_name.endswith(".save")} == {"B.save"}
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_offline_sync_indexes_uncommitted_kotlin_rename(tmp_path: Path, object_format: str) -> None:
+    repo = init_fixture_repo(tmp_path / "repo", object_format=object_format)
+    committed = commit_fixture_spec(repo, GitCommitSpec(message="Original", files={
+        "Main.kt": b"fun oldName() {}\nfun caller() { oldName() }\n",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        (repo / "Main.kt").write_text("fun newName() {}\nfun caller() { newName() }\n")
+        source_index = (repo / ".git/index").read_bytes()
+        mem.sync(SyncRequest(offline=True))
+        snapshot = mem.status().revision
+        assert snapshot != committed
+        assert (repo / ".git/index").read_bytes() == source_index
+        assert not mem.search_graph(SearchGraphRequest(name_pattern="^oldName$")).nodes
+        assert len(mem.search_graph(SearchGraphRequest(name_pattern="^newName$")).nodes) == 1
+        assert "newName()" in mem.get_code_snippet(GetCodeSnippetRequest(qualified_name="caller")).code
+        assert run_git_fixture(repo, ["rev-parse", "HEAD"]).decode().strip() == committed
+        assert mem.search({"query": "newName", "revision": "HEAD", "kind": "code"}).hits
+        mem.sync(SyncRequest(offline=True))
+        assert mem.status().revision == snapshot
+        mem.sync(SyncRequest(revision=committed, offline=True))
+        assert len(mem.search_graph(SearchGraphRequest(name_pattern="^oldName$")).nodes) == 1
+
+
+async def test_mcp_routes_to_initialized_nested_submodule(tmp_path: Path) -> None:
+    library = init_fixture_repo(tmp_path / "library")
+    commit_fixture_spec(library, GitCommitSpec(message="Library", files={
+        "Library.kt": b"fun libraryOnly() {}\n",
+    }))
+    app = init_fixture_repo(tmp_path / "app")
+    commit_fixture_spec(app, GitCommitSpec(message="App", files={"App.kt": b"fun appOnly() {}\n"}))
+    run_git_fixture(app, ["-c", "protocol.file.allow=always", "submodule", "add", str(library), "nested/submodulelib"])
+    run_git_fixture(app, ["commit", "-am", "Add library"])
+    server, holder = create_mcp_server(workspace_path=app)
+    try:
+        async with Client(server) as client:
+            listed = await client.call_tool("list_repositories", {})
+            assert not listed.is_error
+            repos = json.loads(listed.content[0].text)
+            assert {r["path"] for r in repos["repositories"]} == {
+                str(app.resolve()), str((app / "nested/submodulelib").resolve()),
+            }
+            result = await client.call_tool("search_graph", {
+                "request": {"name_pattern": "libraryOnly"}, "repository": "nested/submodulelib",
+            })
+            assert not result.is_error
+            assert result.structured_content["nodes"][0]["file_path"] == "Library.kt"
+            root_result = await client.call_tool("search_graph", {"request": {"name_pattern": "appOnly"}})
+            assert root_result.structured_content["total_matched"] == 1
+            denied = await client.call_tool("search_graph", {
+                "request": {}, "repository": str(library),
+            })
+            assert denied.is_error
+            assert not (library / ".codecontext").exists()
+    finally:
+        holder.close()
+
+
+async def test_mcp_routes_multiple_client_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+    roots = [init_fixture_repo(tmp_path / name) for name in ("one", "two")]
+    for i, root in enumerate(roots):
+        commit_fixture_spec(root, GitCommitSpec(message="Root", files={
+            "main.py": f"def root_{i}(): pass\n".encode(),
+        }))
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+
+    async def list_roots():
+        return SimpleNamespace(roots=[SimpleNamespace(uri=p.as_uri()) for p in roots])
+
+    ctx = SimpleNamespace(session=SimpleNamespace(list_roots=list_roots))
+    try:
+        two = await holder.get_memory(ctx, str(roots[1]))
+        one = await holder.get_memory(None)
+        assert one is not two
+        assert one.search_graph({"name_pattern": "root_0"}).total_matched == 1
+        assert two.search_graph({"name_pattern": "root_1"}).total_matched == 1
+        assert await holder.get_memory(ctx, str(roots[0])) is one
+        assert await holder.get_memory(None) is one
+    finally:
+        holder.close()
+
+
+def test_search_graph_filters_and_pages_without_loading_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext import graph
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Graph", files={
+        "main.py": b"class A:\n    def one(self): pass\n    def two(self): self.one()\ndef test_skip(): pass\n",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+
+        def forbidden(*args):
+            pytest.fail("search_graph loaded the full graph")
+
+        monkeypatch.setattr(graph, "_load_active_graph", forbidden)
+        contains = mem.search_graph({"relationship": "CONTAINS", "direction": "inbound", "min_degree": 1})
+        assert {n.qualified_name for n in contains.nodes} == {"A.one", "A.two"}
+        calls = mem.search_graph({"label": "Function", "direction": "inbound", "min_degree": 1})
+        assert [n.qualified_name for n in calls.nodes] == ["A.one"]
+        page = mem.search_graph({"label": "method", "limit": 1, "offset": 1})
+        assert page.total_matched == 2 and not page.has_more
+        assert page.nodes[0].qualified_name == "A.two"
+        empty = mem.search_graph({"label": "method", "offset": 99})
+        assert empty.total_matched == 2 and not empty.nodes and not empty.has_more
+        assert not mem.search_graph({"file_pattern": "nomatch"}).nodes
+        assert mem.search_graph({"exclude_entry_points": True}).total_matched == 3
+
+
+def test_sync_invalidates_obsolete_extractor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext import syntax
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Kotlin", files={"Main.kt": b"fun example() {}\n"}))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        old_id = mem.search_graph({}).nodes[0].id
+        monkeypatch.setitem(syntax.EXTRACTOR_FINGERPRINTS, "kotlin", "test-next-extractor")
+        mem.sync(SyncRequest(offline=True))
+        assert mem.search_graph({}).nodes[0].id != old_id
+
+
+def test_workspace_snapshot_additions_deletions_and_unsafe_files(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    committed = commit_fixture_spec(repo, GitCommitSpec(message="Original", files={
+        "deleted.py": b"def removed(): pass\n",
+        "link.py": b"def formerly_regular(): pass\n",
+        "large.py": b"def formerly_small(): pass\n",
+    }))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        (repo / "deleted.py").unlink()
+        (repo / "link.py").unlink()
+        external = tmp_path / "outside.py"
+        external.write_text("def outside_secret(): pass\n")
+        (repo / "link.py").symlink_to(external)
+        (repo / "large.py").write_bytes(b"#" * (2 * 1024 * 1024 + 1))
+        (repo / "new.py").write_text("def added(): pass\n")
+        (repo / "untracked.py").write_text("def untracked(): pass\n")
+        run_git_fixture(repo, ["add", "new.py"])
+        staged = (repo / ".git/index").read_bytes()
+        mem.sync(SyncRequest(offline=True))
+        assert [n.name for n in mem.search_graph({}).nodes] == ["added"]
+        assert (repo / ".git/index").read_bytes() == staged
+        assert run_git_fixture(repo, ["rev-parse", "HEAD"]).decode().strip() == committed
+        with mem._store.connect_read() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM coverage_gaps WHERE code = 'BLOB_TOO_LARGE' AND active = 1").fetchone()[0]
 
 
 def test_go_rust_c_cpp_and_gradle_ast_extraction() -> None:
@@ -189,6 +368,11 @@ def test_import_and_type_disambiguated_call_resolution_and_strict_cypher(tmp_pat
             )
         assert exc_info.value.code == "INVALID_REQUEST"
 
+        for length in ("*", "*1..", "*0..2", "*3..2", "*1..7"):
+            with pytest.raises(CodeContextError) as exc_info:
+                mem.query_graph({"query": f"MATCH (a)-[r:CALLS{length}]->(b) RETURN b.name"})
+            assert exc_info.value.code == "INVALID_REQUEST"
+
         # 3. Verify ReDoS (nested quantifiers / backreferences) is rejected in search_graph and query_graph
         for redos_pat in ["(a+)+$", "([a-zA-Z]+)*", r"(a+)\1+", "(a|aa)+$", "((a|aa))+$", "(((a|aa)))+$"]:
             with pytest.raises(CodeContextError) as exc_info:
@@ -333,7 +517,7 @@ async def test_search_graph_trace_path_architecture_detect_changes_and_snippet(
         assert [c.name for c in snip.callers] == ["handle_request"]
         assert [c.name for c in snip.callees] == ["save_record"]
 
-    # 8. Verify MCP server with `include_graph_tools=True` exposes all 9 tools
+    # 8. Verify MCP server with `include_graph_tools=True` exposes all 10 tools
     mcp_srv, holder = create_mcp_server(store_dir, include_graph_tools=True)
     try:
         async with Client(mcp_srv) as client:
@@ -348,6 +532,7 @@ async def test_search_graph_trace_path_architecture_detect_changes_and_snippet(
                 "get_architecture",
                 "detect_changes",
                 "get_code_snippet",
+                "list_repositories",
             }
     finally:
         holder.close()

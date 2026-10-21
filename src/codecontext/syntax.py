@@ -151,7 +151,7 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         q_bytes = q_file.read_bytes()
         q_hash = sha256_bytes(q_bytes)[:16]
         queries[name] = Query(lang, q_bytes.decode("utf-8"))
-        fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}"
+        fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}:walker2"
     return langs, queries, fingerprints
 
 
@@ -979,6 +979,25 @@ def parse_blob(
                 det_dict: dict[str, Any] = {"callee": callee}
                 if recv_str:
                     det_dict["receiver"] = recv_str
+                    if language == "kotlin":
+                        ancestor = node.parent
+                        while ancestor is not None and ancestor.type != "function_declaration" and "receiver_type" not in det_dict:
+                            for declaration in reversed(ancestor.named_children):
+                                if declaration.type != "property_declaration":
+                                    continue
+                                if ancestor.type != "class_body" and declaration.start_byte >= node.start_byte:
+                                    continue
+                                variable = next((c for c in declaration.named_children if c.type == "variable_declaration"), None)
+                                if variable is None or not variable.named_children:
+                                    continue
+                                var_name = variable.named_children[0].text.decode("utf-8")
+                                if var_name != recv_str:
+                                    continue
+                                type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
+                                # An untyped local still shadows a typed parameter or field.
+                                det_dict["receiver_type"] = type_node.text.decode("utf-8").rstrip("?") if type_node else ""
+                                break
+                            ancestor = ancestor.parent
                 add_occurrence(
                     parent_sym.id if parent_sym else None,
                     "call",
@@ -1186,6 +1205,9 @@ def parse_blob(
 
     for occ in occurrences:
         if occ.kind in ("call", "jsx_component") and occ.enclosing_symbol_id is not None:
+            # Receiver calls require type/import resolution, even when names exist in this file.
+            if occ.details.get("receiver"):
+                continue
             callee = occ.details.get("callee") or occ.details.get("component")
             if isinstance(callee, str) and callee in by_simple_name:
                 for target_sym in by_simple_name[callee]:
@@ -1804,7 +1826,7 @@ JS_IMPORT_RE = re.compile(
 )
 KT_JAVA_IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.]+)\s*;?\s*$")
 PARAM_TYPE_RE = re.compile(
-    r"(?:([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s+([A-Za-z_]\w*))"
+    r"(?:([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)|([A-Z]\w*)\s+([A-Za-z_]\w*))"
 )
 
 
@@ -2026,11 +2048,14 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         caller_dir = caller_path.rsplit("/", 1)[0] if "/" in caller_path else ""
 
         # Gather receiver type map from enclosing function and its parent class (e.g. constructor injection)
-        recv_types = _extract_receiver_types_from_signature(enc_info["signature"])
+        recv_types: dict[str, str] = {}
         parent_id = enc_info.get("parent_symbol_id")
         if parent_id and str(parent_id) in sym_meta:
             parent_info = sym_meta[str(parent_id)]
             recv_types.update(_extract_receiver_types_from_signature(parent_info["signature"]))
+        recv_types.update(_extract_receiver_types_from_signature(enc_info["signature"]))
+        if isinstance(receiver, str) and "receiver_type" in det:
+            recv_types[receiver] = det["receiver_type"]
 
         resolved_targets: list[dict[str, Any]] = []
 

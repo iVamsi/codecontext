@@ -349,61 +349,84 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
     qn_re = compile_safe_regex(request.qn_pattern) if request.qn_pattern else None
     file_re = compile_safe_regex(request.file_pattern) if request.file_pattern else None
 
-    nodes, edges, expected_epoch = _load_active_graph(store)
-
-    in_deg: dict[str, int] = {nid: 0 for nid in nodes}
-    out_deg: dict[str, int] = {nid: 0 for nid in nodes}
-    for f_id, t_id, etype, _ in edges:
-        if request.relationship in ("ALL", etype):
-            out_deg[f_id] = out_deg.get(f_id, 0) + 1
-            in_deg[t_id] = in_deg.get(t_id, 0) + 1
-
-    matched: list[GraphNode] = []
-    for nid, node in nodes.items():
-        if not _matches_label(node, request.label):
-            continue
-        if name_re and not name_re.search(node.name):
-            continue
-        if qn_re and not qn_re.search(node.qualified_name):
-            continue
-        if file_re and not file_re.search(node.file_path):
-            continue
-        if request.exclude_entry_points and (
-            node.name in ENTRY_POINT_NAMES
-            or node.name.startswith("test_")
-            or "Test" in node.file_path
-        ):
-            continue
-
-        deg = (
-            in_deg[nid]
-            if request.direction == "inbound"
-            else (
-                out_deg[nid]
-                if request.direction == "outbound"
-                else (in_deg[nid] + out_deg[nid])
+    with store.read_snapshot() as snap:
+        conn = snap.conn
+        conn.create_function("display_path", 1, lambda p: path_bytes_to_display(bytes(p))[0], deterministic=True)
+        conn.create_function("symbol_label", 1, _kind_to_label, deterministic=True)
+        conditions: list[str] = []
+        params: list[Any] = []
+        for field, pattern in [("name", name_re), ("qualified_name", qn_re), ("file_path", file_re)]:
+            if pattern is not None:
+                fn = f"matches_{field}"
+                conn.create_function(fn, 1, lambda value, regex=pattern: bool(regex.search(value)), deterministic=True)
+                conditions.append(f"{fn}({field})")
+        if request.label:
+            if request.label.lower() == "function":
+                conditions.append("label IN ('Function', 'Method')")
+            else:
+                conditions.append("lower(label) = ?")
+                params.append(request.label.lower())
+        if request.exclude_entry_points:
+            placeholders = ",".join("?" for _ in ENTRY_POINT_NAMES)
+            conditions.append(f"name NOT IN ({placeholders}) AND substr(name, 1, 5) != 'test_' AND instr(file_path, 'Test') = 0")
+            params.extend(sorted(ENTRY_POINT_NAMES))
+        where = " AND ".join(conditions) or "1"
+        relation_filter = {
+            "CALLS": "AND r.relation_kind = 'calls_candidate'",
+            "CONTAINS": "AND r.relation_kind = 'contains'",
+            "ALL": "",
+        }[request.relationship]
+        degrees = []
+        for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
+            degrees.append(f"""(SELECT COUNT(*) FROM (
+                SELECT DISTINCT r.{other}, r.relation_kind
+                FROM relations r INDEXED BY relations_{own.removesuffix("_id")}
+                WHERE r.{own} = filtered.id AND r.from_kind = 'symbol'
+                  AND r.to_kind = 'symbol' AND r.state = 'active' {relation_filter}
+                  AND EXISTS (
+                    SELECT 1 FROM symbols endpoint
+                    JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
+                    WHERE endpoint.id = r.{other}
+                  )
+            )) AS {alias}""")
+        degree_expr = {"inbound": "inbound_degree", "outbound": "outbound_degree", "both": "inbound_degree + outbound_degree"}[request.direction]
+        degree_conditions = []
+        for op, bound in [(">=", request.min_degree), ("<=", request.max_degree)]:
+            if bound is not None:
+                degree_conditions.append(f"({degree_expr}) {op} ?")
+                params.append(bound)
+        degree_where = " AND ".join(degree_conditions) or "1"
+        sql = f"""
+            WITH paths AS (
+                SELECT extraction_id, MIN(path) AS path FROM snapshot_files
+                WHERE extraction_id IS NOT NULL GROUP BY extraction_id
+            ), nodes AS (
+                SELECT s.id, symbol_label(s.kind) AS label, s.name, s.qualified_name,
+                       display_path(paths.path) AS file_path, e.language,
+                       s.line_start, s.line_end, s.signature,
+                       MAX(1, s.line_end - s.line_start + 1) AS line_count
+                FROM paths JOIN symbols s ON s.extraction_id = paths.extraction_id
+                JOIN extractions e ON e.id = s.extraction_id
+            ), filtered AS (
+                SELECT * FROM nodes WHERE {where}
+            ), degrees AS (
+                SELECT filtered.*, {', '.join(degrees)} FROM filtered
+            ), matched AS (
+                SELECT * FROM degrees WHERE {degree_where}
             )
-        )
-        if request.min_degree is not None and deg < request.min_degree:
-            continue
-        if request.max_degree is not None and deg > request.max_degree:
-            continue
-
-        matched.append(
-            node.model_copy(
-                update={
-                    "inbound_degree": in_deg[nid],
-                    "outbound_degree": out_deg[nid],
-                }
-            )
-        )
-
-    matched.sort(key=lambda n: (n.file_path, n.line_start, n.id))
-    total = len(matched)
-    sliced = matched[request.offset : request.offset + request.limit]
-    has_more = (request.offset + len(sliced)) < total
+        """
+        total = int(conn.execute(sql + "SELECT COUNT(*) FROM matched", params).fetchone()[0])
+        rows = conn.execute(
+            sql + "SELECT * FROM matched ORDER BY file_path, line_start, id LIMIT ? OFFSET ?",
+            [*params, request.limit, request.offset],
+        ).fetchall()
+        nodes = [GraphNode(**dict(row)) for row in rows]
+        expected_epoch = snap.access_epoch
     store.verify_access_epoch_and_authorize(expected_epoch)
-    return SearchGraphResult(nodes=sliced, total_matched=total, has_more=has_more)
+    return SearchGraphResult(
+        nodes=nodes, total_matched=total,
+        has_more=request.offset + len(nodes) < total,
+    )
 
 
 def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResult:
@@ -498,7 +521,7 @@ CYPHER_NODE_RE = re.compile(
 
 CYPHER_EDGE_RE = re.compile(
     r"^\s*MATCH\s*\(\s*(?P<v1>[A-Za-z_]\w*)(?::(?P<l1>[A-Za-z_]\w*))?\s*(?:\{(?P<p1>[^}]*)\})?\s*\)\s*"
-    r"-\s*\[\s*(?P<relvar>[A-Za-z_]\w*)?(?::(?P<reltype>[A-Za-z_]\w*))?(?:\*(?P<minhop>\d+)?(?:\.\.(?P<maxhop>\d+))?)?\s*(?:\{(?P<relprops>[^}]*)\})?\s*\]\s*->\s*"
+    r"-\s*\[\s*(?P<relvar>[A-Za-z_]\w*)?(?::(?P<reltype>[A-Za-z_]\w*))?(?:\*(?P<minhop>\d+)(?:\.\.(?P<maxhop>\d+))?)?\s*(?:\{(?P<relprops>[^}]*)\})?\s*\]\s*->\s*"
     r"\(\s*(?P<v2>[A-Za-z_]\w*)(?::(?P<l2>[A-Za-z_]\w*))?\s*(?:\{(?P<p2>[^}]*)\})?\s*\)\s*"
     r"(?:WHERE\s+(?P<where>.+?)\s*)?"
     r"RETURN\s+(?P<ret>.+?)"
@@ -793,7 +816,12 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
             if m_edge.group("maxhop")
             else (min_hop if m_edge.group("minhop") else 1)
         )
-        max_hop = min(max_hop, 6)
+        if not 1 <= min_hop <= max_hop <= 6:
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message="Cypher path bounds must satisfy 1 <= minimum <= maximum <= 6.",
+                retryable=False,
+            )
         relprops = m_edge.group("relprops")
         v2 = m_edge.group("v2")
         l2 = m_edge.group("l2")

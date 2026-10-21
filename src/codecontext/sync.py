@@ -51,7 +51,7 @@ def execute_sync(
         commits_before = int(r_conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
 
     # 1. Prepare active snapshot
-    active_rev = mirror.prepare_snapshot(request.revision)
+    active_rev = mirror.prepare_snapshot(request.revision, include_workspace=request.revision == "HEAD")
 
     with store.connect_read() as r_conn:
         commits_after = int(r_conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
