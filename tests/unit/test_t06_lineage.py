@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from codecontext import Memory, SyncRequest
 from codecontext.git import GitMirror
 from codecontext.lineage import (
     index_commit_changes_and_hunks,
@@ -8,7 +9,7 @@ from codecontext.lineage import (
 )
 from codecontext.models import InitRequest
 from codecontext.store import Store
-from codecontext.syntax import index_active_snapshot_files
+from codecontext.syntax import index_active_snapshot_files, normalize_search_text
 from tests.fixtures.builders import (
     GitCommitSpec,
     build_f01_fixture,
@@ -76,6 +77,65 @@ def test_f01_focused_history_and_symbol_change_relations(tmp_path: Path) -> None
         assert {"commit", "hunk", "code"} <= ev_kinds
 
     store.close()
+
+
+def test_history_identifiers_are_unique_and_scoped_to_each_hunk(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    first = b"def firstbeacon():\n    return 1\n\n\ndef secondbeacon():\n    return 2\n"
+    second = b"def thirdbeacon():\n    def embeddedbeacon():\n        return 3\n    return embeddedbeacon()\n"
+    commit_fixture_spec(repo, GitCommitSpec(message="Base", files={"a.py": first, "b.py": second}))
+    changed = commit_fixture_spec(repo, GitCommitSpec(
+        message="Adjust values", files={
+            "a.py": first.replace(b"return 1", b"return 11").replace(b"return 2", b"return 22"),
+            "b.py": second.replace(b"return 3", b"return 33"),
+        },
+    ))
+    expected = {
+        ("a.py", 0): normalize_search_text("a.py firstbeacon"),
+        ("a.py", 1): normalize_search_text("a.py secondbeacon"),
+        ("b.py", 0): normalize_search_text("b.py thirdbeacon thirdbeacon.embeddedbeacon"),
+    }
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as memory:
+        memory.sync(SyncRequest(offline=True))
+
+        def verify_documents() -> list[tuple]:
+            with memory._store.connect_read() as conn:
+                rows = conn.execute(
+                    "SELECT json_extract(d.metadata_json, '$.path') AS path, d.chunk_ordinal, "
+                    "d.identifiers, d.body, h.patch_text, d.metadata_json, d.rowid "
+                    "FROM search_documents d JOIN changes c ON c.id = d.record_id "
+                    "JOIN hunks h ON h.change_id = c.id AND h.ordinal = d.chunk_ordinal "
+                    "WHERE d.record_kind = 'history' AND c.commit_oid = ? ORDER BY path, d.chunk_ordinal",
+                    (changed,),
+                ).fetchall()
+                assert {(r["path"], r["chunk_ordinal"]): r["identifiers"] for r in rows} == expected
+                for row in rows:
+                    assert row["body"] == normalize_search_text(f"Adjust values\n{row['patch_text']}")
+                for symbol, key in [("firstbeacon", ("a.py", 0)), ("secondbeacon", ("a.py", 1)),
+                                    ("thirdbeacon", ("b.py", 0))]:
+                    matches = conn.execute(
+                        "SELECT json_extract(d.metadata_json, '$.path'), d.chunk_ordinal "
+                        "FROM search_fts JOIN search_documents d ON d.rowid = search_fts.rowid "
+                        "JOIN changes c ON c.id = d.record_id WHERE search_fts MATCH ? "
+                        "AND d.record_kind = 'history' AND c.commit_oid = ?",
+                        (f"identifiers:{symbol}", changed),
+                    ).fetchall()
+                    assert [tuple(r) for r in matches] == [key]
+                associations = conn.execute(
+                    "SELECT DISTINCT r.method FROM relations r JOIN changes c ON c.id = r.from_id "
+                    "WHERE c.commit_oid = ? AND r.relation_kind = 'changes'", (changed,),
+                ).fetchall()
+                assert {row[0] for row in associations} == {"hunk_old_overlap", "hunk_new_overlap"}
+                evidence = conn.execute(
+                    "SELECT e.id, e.content_sha256, e.anchor_json FROM evidence e "
+                    "WHERE e.git_oid = ? ORDER BY e.id", (changed,),
+                ).fetchall()
+                return [tuple(row) for row in rows] + [tuple(row) for row in evidence]
+
+        before = verify_documents()
+        index_commit_changes_and_hunks(memory._store, memory._mirror, changed)
+        memory.sync(SyncRequest(offline=True))
+        assert verify_documents() == before
 
 
 def test_u06_and_i04_original_anchor_to_target_mappings(tmp_path: Path) -> None:

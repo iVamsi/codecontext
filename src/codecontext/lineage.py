@@ -670,7 +670,6 @@ def index_commit_changes_and_hunks(
             )
 
         changed_path_terms: list[str] = []
-        changed_symbol_names: list[str] = []
 
         for rch, hunks, old_bytes, new_bytes in all_raw_changes:
             old_b64 = encode_path_b64(rch.old_path) if rch.old_path is not None else None
@@ -754,6 +753,7 @@ def index_commit_changes_and_hunks(
                         pass
 
             for hk in hunks:
+                changed_symbol_names: set[str] = set()
                 p_hash = sha256_bytes(hk.patch_bytes)
                 hunk_id = make_hunk_id(
                     change_id=chg_id,
@@ -830,7 +830,7 @@ def index_commit_changes_and_hunks(
                     for sym, is_prim in associate_hunk_side_with_symbols(
                         old_bytes, hk.old_start, hk.old_count, old_syms
                     ):
-                        changed_symbol_names.append(sym.qualified_name)
+                        changed_symbol_names.add(sym.qualified_name)
                         rel_id = make_relation_id(
                             from_kind="change",
                             from_id=chg_id,
@@ -861,7 +861,7 @@ def index_commit_changes_and_hunks(
                     for sym, is_prim in associate_hunk_side_with_symbols(
                         new_bytes, hk.new_start, hk.new_count, new_syms
                     ):
-                        changed_symbol_names.append(sym.qualified_name)
+                        changed_symbol_names.add(sym.qualified_name)
                         # Also register exact code evidence for the modified/introduced symbol at this commit
                         sym_slice = new_bytes[sym.byte_start : sym.byte_end]
                         sym_hash = sha256_bytes(sym_slice)
@@ -967,7 +967,7 @@ def index_commit_changes_and_hunks(
                             chg_id,
                             hk.ordinal,
                             normalize_search_text(f"{title_line} {disp_p}"),
-                            normalize_search_text(" ".join([disp_p, *changed_symbol_names])),
+                            normalize_search_text(" ".join([disp_p, *sorted(changed_symbol_names)])),
                             normalize_search_text(f"{parsed_commit.message_text} {hk.patch_text}"),
                             meta_json,
                         ),
