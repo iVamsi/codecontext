@@ -317,3 +317,19 @@ def test_shallow_source_import(tmp_path: Path, merge: bool) -> None:
         assert mem.search_graph({"name_pattern": "^main$"}).nodes
         assert report.coverage.git.state != "complete"
         assert any(g.code == "SHALLOW_HISTORY" for g in report.gaps)
+
+        repeated = mem.sync(SyncRequest(offline=True))
+        assert any(g.code == "SHALLOW_HISTORY" for g in repeated.gaps)
+        with mem._store.write_transaction() as conn:
+            boundary = conn.execute("SELECT oid, diff_state FROM commits").fetchone()
+            assert boundary["diff_state"] == "partial"
+            # Simulate an older store that incorrectly marked the boundary diff complete.
+            conn.execute("UPDATE commits SET diff_state = 'complete'")
+        run_git_fixture(shallow, ["fetch", "--unshallow", "origin"])
+        recovered = mem.sync(SyncRequest(offline=True))
+        assert not any(g.code == "SHALLOW_HISTORY" for g in recovered.gaps)
+        assert recovered.coverage.git.state == "complete"
+        with mem._store.connect_read() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == (4 if merge else 2)
+            assert conn.execute("SELECT COUNT(*) FROM commits WHERE diff_state != 'complete'").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM changes WHERE commit_oid = ?", (boundary["oid"],)).fetchone()[0] > 0

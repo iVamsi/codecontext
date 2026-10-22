@@ -531,6 +531,7 @@ def index_commit_changes_and_hunks(
 
     all_raw_changes: list[tuple[RawChange, list[ParsedHunk], bytes | None, bytes | None]] = []
     predecessor_paths: set[bytes] = set()
+    missing_parent = False
 
     with mirror.open_batch_session() as batch:
         commit_obj = batch.read_object(commit_oid)
@@ -542,6 +543,7 @@ def index_commit_changes_and_hunks(
 
         for p_idx, p_oid in parents:
             if p_oid is not None and batch.read_object(p_oid) is None:
+                missing_parent = True
                 # Parent commit object is missing (e.g. shallow boundary)
                 with store.write_transaction(bump_generation=True) as conn:
                     Store.upsert_gap(
@@ -973,9 +975,11 @@ def index_commit_changes_and_hunks(
 
         if filter_paths is None:
             conn.execute(
-                "UPDATE commits SET diff_state = 'complete' WHERE oid = ?",
-                (commit_oid,),
+                "UPDATE commits SET diff_state = ? WHERE oid = ?",
+                ("partial" if missing_parent else "complete", commit_oid),
             )
+            if not missing_parent:
+                Store.resolve_gaps_in_scope(conn, scope=f"git:commit:{commit_oid}", code="MISSING_PARENT")
 
     return (changes_count, predecessor_paths)
 

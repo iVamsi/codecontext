@@ -853,6 +853,7 @@ class GitMirror:
                 "--no-write-fetch-head",
                 "--no-auto-maintenance",
                 "--update-shallow",
+                *(["--unshallow"] if not is_shallow and self.is_source_shallow(self.git_dir) else []),
                 "--end-of-options",
                 str(source_repo),
                 *refspecs,
@@ -1143,6 +1144,13 @@ class GitMirror:
                     message="Source repository is shallow; history before the shallow boundary is unavailable.",
                     retryable=True,
                     observed_us=ts,
+                )
+            else:
+                Store.resolve_gaps_in_scope(conn, scope="git:refs", code="SHALLOW_HISTORY")
+                # Older stores marked shallow-boundary diffs complete despite missing parents.
+                conn.execute(
+                    "UPDATE commits SET diff_state = 'partial' WHERE 'git:commit:' || oid IN "
+                    "(SELECT scope FROM coverage_gaps WHERE code = 'MISSING_PARENT' AND active = 1)"
                 )
 
             # Find existing extractions for blobs in the new snapshot so unchanged blobs reuse extraction_id
