@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 dependencies = [
+    # Floor: certifi before 2026.10.19 bundled compromised emSign roots.
+    "certifi>=2026.10.19",
     "httpx>=0.28,<1",
     "mcp==2.3.0",
     "pydantic>=2.10,<3",
