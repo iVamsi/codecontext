@@ -25,6 +25,8 @@ from codecontext.models import PathTarget, SymbolTarget, SyncReport, SyncRequest
 from codecontext.store import Store, now_us
 from codecontext.syntax import index_active_snapshot_files
 
+COMMIT_DIFF_BATCH_SIZE = 32
+
 
 def execute_sync(
     store: Store,
@@ -33,6 +35,7 @@ def execute_sync(
     *,
     github_transport: httpx.BaseTransport | None = None,
     github_token: str | None = None,
+    gitlab_token: str | None = None,
 ) -> SyncReport:
     started = now_us()
     with store.connect_read() as conn:
@@ -43,7 +46,15 @@ def execute_sync(
     progress: dict[str, Any] = {"structure_complete": False}
     with sync_deadline(request.max_seconds):
         try:
-            return _execute_sync(store, mirror, request, progress=progress, github_transport=github_transport, github_token=github_token)
+            return _execute_sync(
+                store,
+                mirror,
+                request,
+                progress=progress,
+                github_transport=github_transport,
+                github_token=github_token,
+                gitlab_token=gitlab_token,
+            )
         except (SyncDeadlineExceeded, CodeContextError, sqlite3.OperationalError, subprocess.TimeoutExpired, httpx.TransportError) as exc:
             if not isinstance(exc, SyncDeadlineExceeded) and not expired():
                 raise
@@ -66,8 +77,44 @@ def execute_sync(
                       coverage=coverage, gaps=gaps, state="partial", started_at=us_to_iso_z(started),
                       finished_at=us_to_iso_z(finished), elapsed_ms=(finished-started)//1000,
                       requests_attempted=getattr(progress.get("http_client"), "requests_attempted", 0),
-                      commits_added=commits_added, blobs_parsed=blobs_parsed,
-                      sources_added=sources_added, versions_added=versions_added, cache_hits=0, jobs=jobs, stop_reason="time_budget")
+                      commits_added=max(0, commits_added), blobs_parsed=max(0, blobs_parsed),
+                      sources_added=max(0, sources_added), versions_added=max(0, versions_added),
+                      cache_hits=0, jobs=jobs, stop_reason="time_budget")
+
+
+def _drain_commit_diff_jobs(store: Store, mirror: GitMirror, deadline_mono: float) -> bool:
+    """Process pending `git_commit_diff` jobs in batches that share one `cat-file --batch`
+    session and one write transaction. A batch is committed atomically (job completion and
+    its changes together), so an interrupted batch rolls back to `pending` with no partial rows.
+    Returns False when the time budget is exhausted before the queue empties.
+    """
+    while True:
+        if time.monotonic() >= deadline_mono:
+            return False
+        with store.connect_read() as r_conn:
+            jobs = r_conn.execute(
+                """
+                SELECT id, owner_id FROM jobs
+                WHERE state = 'pending' AND kind = 'git_commit_diff'
+                ORDER BY priority ASC, created_at_us ASC, id ASC
+                LIMIT ?
+                """,
+                (COMMIT_DIFF_BATCH_SIZE,),
+            ).fetchall()
+        if not jobs:
+            return True
+        with mirror.open_batch_session() as batch, store.write_transaction(bump_generation=True) as conn:
+            for job in jobs:
+                check_deadline()
+                if time.monotonic() >= deadline_mono:
+                    break
+                index_commit_changes_and_hunks(
+                    store, mirror, str(job["owner_id"]), batch=batch, conn=conn
+                )
+                conn.execute(
+                    "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
+                    (now_us(), str(job["id"])),
+                )
 
 
 def _execute_sync(
@@ -78,6 +125,7 @@ def _execute_sync(
     progress: dict[str, Any],
     github_transport: httpx.BaseTransport | None = None,
     github_token: str | None = None,
+    gitlab_token: str | None = None,
 ) -> SyncReport:
     """Execute bounded, resumable synchronization for `request` without calling any model.
     Priority order per 02-ingestion-and-lineage §1:
@@ -99,8 +147,11 @@ def _execute_sync(
         repo_id = str(meta["repository_id"])
         commits_before = int(r_conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
 
-    # 1. Prepare active snapshot
-    active_rev = mirror.prepare_snapshot(request.revision, include_workspace=request.revision == "HEAD")
+    active_rev = mirror.prepare_snapshot(
+        request.revision,
+        include_workspace=request.revision == "HEAD",
+        include_untracked=request.include_untracked,
+    )
 
     with store.connect_read() as r_conn:
         commits_after = int(r_conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
@@ -123,7 +174,7 @@ def _execute_sync(
             if s_path:
                 focus_path_bytes = bytes(s_path["path"])
 
-    # 2. Extract active snapshot syntax (focus first)
+    # The focus file goes first so a short budget still covers the code the caller asked about.
     blobs_parsed, cache_hits = index_active_snapshot_files(
         store,
         mirror,
@@ -139,7 +190,13 @@ def _execute_sync(
     versions_added = 0
     stop_reason: str = "scope_complete"
 
-    # 3. Process focus history (or all reachable commits if no focus) within time budget
+    if request.ingest_docs:
+        from codecontext.docs_ingest import ingest_repository_docs
+
+        d_src, d_ver = ingest_repository_docs(store, mirror, active_revision=active_rev)
+        sources_added += d_src
+        versions_added += d_ver
+
     focus_commits: list[str] = []
     if focus_path_bytes is not None:
         focus_commits = index_focused_path_history(
@@ -150,7 +207,6 @@ def _execute_sync(
             max_changes=100,
         )
     else:
-        # Enqueue pending commits in jobs queue
         with store.write_transaction(bump_generation=True) as conn:
             pending_c = conn.execute(
                 "SELECT oid FROM commits WHERE diff_state != 'complete' ORDER BY first_seen_at_us ASC, oid ASC"
@@ -158,50 +214,24 @@ def _execute_sync(
             for r in pending_c:
                 Store.enqueue_job(conn, kind="git_commit_diff", owner_id=str(r["oid"]), priority=50)
 
-    # 4. Process pending git_commit_diff jobs first when no focus was supplied so commits have changes before GitHub collection
-    while stop_reason == "scope_complete":
-        if time.monotonic() >= deadline_mono:
-            stop_reason = "time_budget"
-            break
-        with store.connect_read() as r_conn:
-            next_job = r_conn.execute(
-                """
-                SELECT id, kind, owner_id
-                FROM jobs
-                WHERE state = 'pending' AND kind = 'git_commit_diff'
-                ORDER BY priority ASC, created_at_us ASC, id ASC
-                LIMIT 1
-                """
-            ).fetchone()
-        if not next_job:
-            break
+    if focus_path_bytes is None and not _drain_commit_diff_jobs(store, mirror, deadline_mono):
+        stop_reason = "time_budget"
 
-        job_id = str(next_job["id"])
-        c_oid = str(next_job["owner_id"])
-        with store.write_transaction(bump_generation=False) as conn:
-            conn.execute(
-                "UPDATE jobs SET state = 'running', updated_at_us = ? WHERE id = ?",
-                (now_us(), job_id),
+    gitlab_info: tuple[str, str] | None = None
+    if not request.offline and not store.config.github_repository:
+        if store.config.gitlab_repository:
+            gitlab_info = (
+                store.config.gitlab_base_url or "https://gitlab.com",
+                store.config.gitlab_repository,
             )
-        index_commit_changes_and_hunks(store, mirror, c_oid)
-        with store.write_transaction(bump_generation=True) as conn:
-            conn.execute(
-                "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
-                (now_us(), job_id),
-            )
+        elif store.config.repo_path:
+            gitlab_info = detect_gitlab_repository_from_git(Path(store.config.repo_path))
 
-    # 5. If online and GitHub or GitLab repository is configured, collect remote evidence
-    gitlab_info = (
-        detect_gitlab_repository_from_git(Path(store.config.repo_path))
-        if not request.offline and store.config.repo_path and not store.config.github_repository
-        else None
-    )
-
-    if gitlab_info is not None and not request.offline and stop_reason == "scope_complete":
+    if gitlab_info is not None and stop_reason == "scope_complete":
         gl_base, gl_proj = gitlab_info
         rem_reqs = request.max_requests - requests_attempted
         if rem_reqs > 0 and time.monotonic() < deadline_mono:
-            with GitLabClient(base_url=gl_base, token=github_token, transport=github_transport) as gl_client:
+            with GitLabClient(base_url=gl_base, token=gitlab_token, transport=github_transport) as gl_client:
                 progress["http_client"] = gl_client
                 used, s_add, v_add, gl_done = collect_gitlab_merge_requests_and_issues(
                     store,
@@ -214,6 +244,18 @@ def _execute_sync(
                 versions_added += v_add
                 if not gl_done:
                     stop_reason = "request_budget"
+    elif store.config.gitlab_repository and request.offline:
+        with store.write_transaction(bump_generation=True) as conn:
+            Store.upsert_gap(
+                conn,
+                repository_id=repo_id,
+                code="GITHUB_BACKFILL_PENDING",
+                scope=f"gitlab:{store.config.gitlab_repository}",
+                message="Sync ran with offline=True; remote GitLab evidence collection remains pending.",
+                retryable=True,
+            )
+        if stop_reason == "scope_complete":
+            stop_reason = "offline"
 
     if store.config.github_repository:
         if request.offline:
@@ -233,6 +275,15 @@ def _execute_sync(
             if rem_reqs > 0 and time.monotonic() < deadline_mono:
                 with GitHubClient(token=github_token, transport=github_transport) as gh_client:
                     progress["http_client"] = gh_client
+
+                    def _apply(done: bool) -> None:
+                        nonlocal stop_reason
+                        if not done:
+                            if requests_attempted >= request.max_requests:
+                                stop_reason = "request_budget"
+                            elif time.monotonic() >= deadline_mono:
+                                stop_reason = "time_budget"
+
                     if focus_path_bytes is not None and not request.reconcile:
                         used, s_add, v_add, gh_done = collect_focused_github_evidence(
                             store,
@@ -244,103 +295,61 @@ def _execute_sync(
                         requests_attempted += used
                         sources_added += s_add
                         versions_added += v_add
-                        if not gh_done:
-                            if requests_attempted >= request.max_requests:
-                                stop_reason = "request_budget"
-                            elif time.monotonic() >= deadline_mono:
-                                stop_reason = "time_budget"
+                        _apply(gh_done)
+                    elif request.reconcile:
+                        used2, s_add2, v_add2, gh_done2 = collect_full_and_incremental_github(
+                            store,
+                            gh_client,
+                            reconcile=True,
+                            remaining_requests=rem_reqs,
+                            deadline_monotonic=deadline_mono,
+                            use_graphql=request.use_graphql,
+                        )
+                        requests_attempted += used2
+                        sources_added += s_add2
+                        versions_added += v_add2
+                        _apply(gh_done2)
                     else:
-                        if request.reconcile:
+                        # Run focused commit PRs first if any, then full /issues + incremental streams
+                        target_commits_for_gh = focus_commits
+                        if not target_commits_for_gh:
+                            with store.connect_read() as r_conn:
+                                c_rows = r_conn.execute(
+                                    "SELECT commit_oid FROM snapshot_commits LIMIT 25"
+                                ).fetchall()
+                                target_commits_for_gh = [str(r["commit_oid"]) for r in c_rows]
+
+                        used1, s_add1, v_add1, gh_done1 = collect_focused_github_evidence(
+                            store,
+                            gh_client,
+                            commit_oids=target_commits_for_gh,
+                            remaining_requests=rem_reqs,
+                            deadline_monotonic=deadline_mono,
+                        )
+                        requests_attempted += used1
+                        sources_added += s_add1
+                        versions_added += v_add1
+
+                        rem_reqs2 = request.max_requests - requests_attempted
+                        if gh_done1 and rem_reqs2 > 0 and time.monotonic() < deadline_mono:
                             used2, s_add2, v_add2, gh_done2 = collect_full_and_incremental_github(
                                 store,
                                 gh_client,
-                                reconcile=True,
-                                remaining_requests=rem_reqs,
+                                reconcile=False,
+                                remaining_requests=rem_reqs2,
                                 deadline_monotonic=deadline_mono,
+                                use_graphql=request.use_graphql,
                             )
                             requests_attempted += used2
                             sources_added += s_add2
                             versions_added += v_add2
-                            if not gh_done2:
-                                if requests_attempted >= request.max_requests:
-                                    stop_reason = "request_budget"
-                                elif time.monotonic() >= deadline_mono:
-                                    stop_reason = "time_budget"
+                            _apply(gh_done2)
                         else:
-                            # Run focused commit PRs first if any, then full /issues + incremental streams
-                            target_commits_for_gh = focus_commits
-                            if not target_commits_for_gh:
-                                with store.connect_read() as r_conn:
-                                    c_rows = r_conn.execute(
-                                        "SELECT commit_oid FROM snapshot_commits LIMIT 25"
-                                    ).fetchall()
-                                    target_commits_for_gh = [str(r["commit_oid"]) for r in c_rows]
+                            _apply(gh_done1)
 
-                            used1, s_add1, v_add1, gh_done1 = collect_focused_github_evidence(
-                                store,
-                                gh_client,
-                                commit_oids=target_commits_for_gh,
-                                remaining_requests=rem_reqs,
-                                deadline_monotonic=deadline_mono,
-                            )
-                            requests_attempted += used1
-                            sources_added += s_add1
-                            versions_added += v_add1
-
-                            rem_reqs2 = request.max_requests - requests_attempted
-                            if gh_done1 and rem_reqs2 > 0 and time.monotonic() < deadline_mono:
-                                used2, s_add2, v_add2, gh_done2 = collect_full_and_incremental_github(
-                                    store,
-                                    gh_client,
-                                    reconcile=False,
-                                    remaining_requests=rem_reqs2,
-                                    deadline_monotonic=deadline_mono,
-                                )
-                                requests_attempted += used2
-                                sources_added += s_add2
-                                versions_added += v_add2
-                                if not gh_done2:
-                                    if requests_attempted >= request.max_requests:
-                                        stop_reason = "request_budget"
-                                    elif time.monotonic() >= deadline_mono:
-                                        stop_reason = "time_budget"
-                            elif not gh_done1:
-                                if requests_attempted >= request.max_requests:
-                                    stop_reason = "request_budget"
-                                elif time.monotonic() >= deadline_mono:
-                                    stop_reason = "time_budget"
-
-    # 6. Process any remaining pending git_commit_diff jobs while time budget allows
-    while stop_reason == "scope_complete":
-        if time.monotonic() >= deadline_mono:
-            stop_reason = "time_budget"
-            break
-        with store.connect_read() as r_conn:
-            next_job = r_conn.execute(
-                """
-                SELECT id, kind, owner_id
-                FROM jobs
-                WHERE state = 'pending' AND kind = 'git_commit_diff'
-                ORDER BY priority ASC, created_at_us ASC, id ASC
-                LIMIT 1
-                """
-            ).fetchone()
-        if not next_job:
-            break
-
-        job_id = str(next_job["id"])
-        c_oid = str(next_job["owner_id"])
-        with store.write_transaction(bump_generation=False) as conn:
-            conn.execute(
-                "UPDATE jobs SET state = 'running', updated_at_us = ? WHERE id = ?",
-                (now_us(), job_id),
-            )
-        index_commit_changes_and_hunks(store, mirror, c_oid)
-        with store.write_transaction(bump_generation=True) as conn:
-            conn.execute(
-                "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
-                (now_us(), job_id),
-            )
+    # History left over after remote collection uses whatever budget remains.
+    if stop_reason == "scope_complete" and not _drain_commit_diff_jobs(store, mirror, deadline_mono):
+        stop_reason = "time_budget"
 
     # Check if all git commit diffs are complete and resolve GIT_HISTORY_PENDING if so
     with store.write_transaction(bump_generation=True) as conn:

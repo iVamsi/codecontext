@@ -1,5 +1,7 @@
 import json
+import math
 import sqlite3
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -274,6 +276,7 @@ def execute_search(
     count_kind: str = "estimated",
     exclude_enriched: bool = False,
     pre_authorize_hook: Callable[[], None] | None = None,
+    embedding_adapter: Any | None = None,
 ) -> SearchResult:
     """Execute deterministic lexical + exact search over the active prepared snapshot."""
     cutoff_us = datetime_to_us(request.knowledge_cutoff) if request.knowledge_cutoff else None
@@ -429,20 +432,47 @@ def execute_search(
         had_unknown_time_gap = False
 
         if terms and requested_kinds:
-            match_expr = build_fts_match_expression(terms)
+            quoted_terms = ['"' + t.replace('"', '""') + '"' for t in terms]
+            tiered_exprs = []
+            if len(quoted_terms) > 1:
+                tiered_exprs.append(" AND ".join(quoted_terms))
+            tiered_exprs.append(" OR ".join(quoted_terms))
+
             for lkind in requested_kinds:
-                fts_rows = conn.execute(
-                    """
-                    SELECT sd.record_id, sd.record_kind, sd.metadata_json,
-                           bm25(search_fts) AS bm25_score
-                    FROM search_fts
-                    JOIN search_documents sd ON sd.rowid = search_fts.rowid
-                    WHERE search_fts MATCH ? AND sd.record_kind = ?
-                    ORDER BY bm25_score ASC, sd.record_id ASC, sd.chunk_ordinal ASC
-                    LIMIT 250
-                    """,
-                    (match_expr, lkind),
-                ).fetchall()
+                fts_rows = []
+                for match_expr in tiered_exprs:
+                    try:
+                        rows = conn.execute(
+                            """
+                            SELECT sd.record_id, sd.record_kind, sd.metadata_json,
+                                   bm25(search_fts, 10.0, 5.0, 1.0) AS bm25_score
+                            FROM search_fts
+                            JOIN search_documents sd ON sd.rowid = search_fts.rowid
+                            WHERE search_fts MATCH ? AND sd.record_kind = ?
+                            ORDER BY bm25_score ASC, sd.record_id ASC, sd.chunk_ordinal ASC
+                            LIMIT 250
+                            """,
+                            (match_expr, lkind),
+                        ).fetchall()
+                        if rows:
+                            fts_rows.extend(rows)
+                            if len(fts_rows) >= 50:
+                                break
+                    except sqlite3.OperationalError:
+                        fallback_expr = build_fts_match_expression(terms)
+                        fts_rows = conn.execute(
+                            """
+                            SELECT sd.record_id, sd.record_kind, sd.metadata_json,
+                                   bm25(search_fts, 10.0, 5.0, 1.0) AS bm25_score
+                            FROM search_fts
+                            JOIN search_documents sd ON sd.rowid = search_fts.rowid
+                            WHERE search_fts MATCH ? AND sd.record_kind = ?
+                            ORDER BY bm25_score ASC, sd.record_id ASC, sd.chunk_ordinal ASC
+                            LIMIT 250
+                            """,
+                            (fallback_expr, lkind),
+                        ).fetchall()
+                        break
 
                 rank_in_kind = 0
                 seen_in_kind: set[str] = set()
@@ -498,6 +528,89 @@ def execute_search(
                     retryable=False,
                 )
             )
+
+        if request.semantic and embedding_adapter is not None and store.schema_version < 2:
+            request_gaps.append(
+                Gap(
+                    id=None,
+                    code="ENRICHMENT_PENDING",
+                    scope="search:semantic",
+                    message="Store schema predates embeddings; run a writable sync to upgrade it. Results are lexical only.",
+                    retryable=True,
+                )
+            )
+        elif request.semantic and embedding_adapter is not None:
+            try:
+                q_vec = embedding_adapter.embed([request.query])[0]
+            except Exception as exc:
+                q_vec = None
+                request_gaps.append(
+                    Gap(
+                        id=None,
+                        code="MODEL_FAILED",
+                        scope="search:semantic",
+                        message=f"Query embedding failed ({type(exc).__name__}); results are lexical only.",
+                        retryable=True,
+                    )
+                )
+            if q_vec and requested_kinds:
+                dim = len(q_vec)
+                kind_placeholders = ",".join("?" for _ in requested_kinds)
+                # ponytail: full scan of matching embeddings in Python; add an ANN index if stores outgrow it.
+                emb_rows = conn.execute(
+                    f"""
+                    SELECT de.record_id, de.record_kind, de.vector_f32, sd.metadata_json
+                    FROM document_embeddings de
+                    JOIN search_documents sd
+                      ON sd.record_kind = de.record_kind
+                     AND sd.record_id = de.record_id
+                     AND sd.chunk_ordinal = de.chunk_ordinal
+                    WHERE de.model_fingerprint = ? AND de.dimensions = ?
+                      AND de.record_kind IN ({kind_placeholders})
+                    """,
+                    (embedding_adapter.model_fingerprint, dim, *requested_kinds),
+                ).fetchall()
+                q_norm = math.sqrt(sum(x * x for x in q_vec))
+                scored_embs = []
+                for erow in emb_rows:
+                    vec_bytes = bytes(erow["vector_f32"])
+                    if len(vec_bytes) != dim * 4:
+                        continue
+                    v = struct.unpack(f"{dim}f", vec_bytes)
+                    dot = sum(a * b for a, b in zip(q_vec, v, strict=True))
+                    v_norm = math.sqrt(sum(b * b for b in v))
+                    sim = dot / (q_norm * v_norm) if (q_norm * v_norm) > 0 else 0.0
+                    scored_embs.append(
+                        (sim, str(erow["record_kind"]), str(erow["record_id"]), erow["metadata_json"])
+                    )
+                scored_embs.sort(key=lambda x: (-x[0], x[2]))
+                sem_rank = 0
+                seen_semantic: set[str] = set()
+                for _sim, s_kind, s_rec_id, s_meta_json in scored_embs:
+                    if sem_rank >= 100:
+                        break
+                    if s_rec_id in seen_semantic:
+                        continue
+                    seen_semantic.add(s_rec_id)
+                    cand = _validate_and_project_lexical_candidate(
+                        conn,
+                        lkind=s_kind,
+                        rec_id=s_rec_id,
+                        meta=json.loads(str(s_meta_json)),
+                        cutoff_us=cutoff_us,
+                        ancestor_commits=ancestor_commits,
+                    )
+                    if cand is None:
+                        continue
+                    sem_rank += 1
+                    rrf_contrib = 1.0 / (60.0 + sem_rank)
+                    if cand.id in fused_candidates:
+                        fused_candidates[cand.id].score += rrf_contrib
+                        fused_candidates[cand.id].match = "hybrid"
+                    else:
+                        cand.score = rrf_contrib
+                        cand.match = "semantic"
+                        fused_candidates[cand.id] = cand
 
         # 3. Merge pinned exact matches first, then fused score descending, then stable ID
         ordered_candidates: list[_CandidateHit] = list(pinned_hits.values())

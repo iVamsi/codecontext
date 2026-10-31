@@ -1,13 +1,15 @@
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
 from pydantic import ValidationError
 
+from codecontext.adapters import pack_f32_vector
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.identity import (
@@ -27,6 +29,7 @@ from codecontext.identity import (
     us_to_iso_z,
 )
 from codecontext.models import (
+    EmbeddingAdapter,
     EnrichReport,
     EnrichRequest,
     EpisodeExtractionOutput,
@@ -637,6 +640,71 @@ def _validate_and_resolve_segment_output(
     return (output, validated_claims)
 
 
+MAX_ENRICH_CONCURRENCY = 16
+
+EpisodeWorker = Generator[ModelRequest, "ModelResponse | Exception", None]
+
+
+def _call_model(model: ModelAdapter, request: ModelRequest) -> ModelResponse | Exception:
+    try:
+        return model.complete(request)
+    except Exception as exc:
+        return exc
+
+
+def _drive_episode_workers(
+    episode_ids: Iterable[str],
+    make_worker: Callable[[str], EpisodeWorker],
+    *,
+    model: ModelAdapter,
+    concurrency: int,
+    should_continue: Callable[[], bool],
+) -> None:
+    """Run episode workers, sending each model request to the adapter.
+
+    A worker does its budget reservation and database work on this thread, then
+    yields a request. Up to `concurrency` requests are in flight at once. Once
+    `should_continue` turns false, no new episode starts, but calls already sent
+    still finish so their usage is recorded.
+    """
+    pending = iter(episode_ids)
+    if concurrency == 1:
+        for ep_id in pending:
+            if not should_continue():
+                return
+            worker = make_worker(ep_id)
+            outcome: ModelResponse | Exception | None = None
+            while True:
+                try:
+                    request = worker.send(outcome)
+                except StopIteration:
+                    break
+                outcome = _call_model(model, request)
+        return
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        in_flight: dict[Future[ModelResponse | Exception], EpisodeWorker] = {}
+
+        def advance(worker: EpisodeWorker, outcome: ModelResponse | Exception | None) -> None:
+            try:
+                request = worker.send(outcome)
+            except StopIteration:
+                return
+            in_flight[pool.submit(_call_model, model, request)] = worker
+
+        while True:
+            while len(in_flight) < concurrency and should_continue():
+                ep_id = next(pending, None)
+                if ep_id is None:
+                    break
+                advance(make_worker(ep_id), None)
+            if not in_flight:
+                return
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                advance(in_flight.pop(fut), fut.result())
+
+
 def execute_enrich(
     store: Store,
     mirror: GitMirror,
@@ -644,8 +712,20 @@ def execute_enrich(
     *,
     model: ModelAdapter,
     token_counter: Callable[[str], int] = default_token_estimator,
+    embedding_adapter: EmbeddingAdapter | None = None,
+    concurrency: int = 1,
 ) -> EnrichReport:
-    """Execute budgeted model enrichment across target or pending episodes (and summaries in T19)."""
+    """Execute budgeted model enrichment across target or pending episodes (and summaries in T19).
+
+    `concurrency` bounds how many episode model calls run at once. Only the adapter
+    calls leave the calling thread; every SQLite read and write stays on it.
+    """
+    if not 1 <= concurrency <= MAX_ENRICH_CONCURRENCY:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"concurrency must be between 1 and {MAX_ENRICH_CONCURRENCY}.",
+            retryable=False,
+        )
     if not isinstance(model, ModelAdapter):
         raise CodeContextError(
             code="INVALID_REQUEST",
@@ -739,11 +819,14 @@ def execute_enrich(
     omitted_failures = 0
     stop_reason: str = "scope_complete"
 
-    for ep_id in target_episode_ids:
+    def _enrich_episode(ep_id: str) -> Generator[ModelRequest, ModelResponse | Exception, None]:
+        nonlocal cache_hit_items, calls_used, claims_added, completed_items, cost_used
+        nonlocal est_in_used, failed_items, has_any_reported, omitted_failures, overrun_detected
+        nonlocal rep_in_total, rep_out_total, res_out_used, stop_reason, unc_in_used, unc_out_used
         with store.connect_read() as r_conn:
             ep_row = r_conn.execute("SELECT * FROM episodes WHERE id = ?", (ep_id,)).fetchone()
             if not ep_row:
-                continue
+                return
             ep_fp, seg_plans, dep_inputs = assemble_episode_segments(
                 r_conn,
                 mirror,
@@ -926,7 +1009,10 @@ def execute_enrich(
                 )
 
                 try:
-                    m_resp = model.complete(m_req)
+                    outcome = yield m_req
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    m_resp = outcome
                     if not isinstance(m_resp, ModelResponse):
                         m_resp = ModelResponse.model_validate(m_resp)
                 except Exception as exc:
@@ -1360,8 +1446,13 @@ def execute_enrich(
                 Store.resolve_gaps_in_scope(conn, scope=f"episode:{ep_id}", code="MODEL_INVALID_OUTPUT")
                 Store.resolve_gaps_in_scope(conn, scope=f"episode:{ep_id}", code="MODEL_FAILED")
 
-        if stop_reason != "scope_complete":
-            break
+    _drive_episode_workers(
+        target_episode_ids,
+        _enrich_episode,
+        model=model,
+        concurrency=concurrency,
+        should_continue=lambda: stop_reason == "scope_complete",
+    )
 
     # 2. Build group and repository summaries when no explicit target_ids were supplied and budget remains (T19)
     if request.target_ids is None and stop_reason == "scope_complete" and active_rev is not None:
@@ -1428,6 +1519,9 @@ def execute_enrich(
         else "partial"
     )
 
+    if request.generate_embeddings and embedding_adapter is not None:
+        _generate_document_embeddings(store, embedding_adapter)
+
     return EnrichReport(
         repository_id=repo_id,
         revision=active_rev,
@@ -1462,6 +1556,71 @@ def execute_enrich(
         omitted_failure_count=omitted_failures,
         stop_reason=stop_reason,  # type: ignore[arg-type]
     )
+
+
+def _generate_document_embeddings(
+    store: Store,
+    adapter: EmbeddingAdapter,
+) -> int:
+    fp = adapter.model_fingerprint
+    with store.read_snapshot() as snap:
+        rows = snap.conn.execute(
+            """
+            SELECT sd.record_kind, sd.record_id, sd.chunk_ordinal, sd.title, sd.identifiers, sd.body
+            FROM search_documents sd
+            LEFT JOIN document_embeddings de
+              ON de.record_kind = sd.record_kind
+             AND de.record_id = sd.record_id
+             AND de.chunk_ordinal = sd.chunk_ordinal
+             AND de.model_fingerprint = ?
+            WHERE de.record_id IS NULL
+            ORDER BY sd.record_id ASC, sd.chunk_ordinal ASC
+            """,
+            (fp,),
+        ).fetchall()
+
+    if not rows:
+        return 0
+
+    chunks_to_embed = [
+        (
+            str(r["record_kind"]),
+            str(r["record_id"]),
+            int(r["chunk_ordinal"]),
+            f"{r['title']} {r['identifiers']}\n{r['body']}",
+        )
+        for r in rows
+    ]
+
+    total_embedded = 0
+    batch_size = 32
+    for i in range(0, len(chunks_to_embed), batch_size):
+        batch = chunks_to_embed[i : i + batch_size]
+        texts = [b[3] for b in batch]
+        vectors = adapter.embed(texts)
+        if len(vectors) != len(batch):
+            raise CodeContextError(
+                code="MODEL_INVALID_OUTPUT",
+                message="Embedding adapter returned a different number of vectors than texts sent.",
+                retryable=False,
+            )
+        with store.write_transaction(bump_generation=True) as conn:
+            now = now_us()
+            for (rk, rid, cord, _), vec in zip(batch, vectors, strict=True):
+                blob = pack_f32_vector(vec)
+                conn.execute(
+                    """
+                    INSERT INTO document_embeddings (
+                        record_kind, record_id, chunk_ordinal, model_fingerprint, dimensions, vector_f32, updated_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(record_kind, record_id, chunk_ordinal, model_fingerprint)
+                    DO UPDATE SET vector_f32 = excluded.vector_f32, updated_at_us = excluded.updated_at_us
+                    """,
+                    (rk, rid, cord, fp, len(vec), blob, now),
+                )
+                total_embedded += 1
+
+    return total_embedded
 
 
 def _resolve_target_id_to_episode_ids(

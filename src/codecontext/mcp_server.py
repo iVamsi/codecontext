@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
 import os
 import subprocess
+import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -31,12 +34,17 @@ from codecontext.memory import Memory
 from codecontext.models import (
     ContextPack,
     ContextRequest,
+    EmbeddingAdapter,
+    EnrichReport,
+    EnrichRequest,
     GetRequest,
     InitRequest,
+    ModelAdapter,
     RecordPage,
     SearchRequest,
     SearchResult,
     Status,
+    SyncReport,
     SyncRequest,
 )
 from codecontext.store import detect_github_repository_from_git
@@ -63,6 +71,8 @@ READ_ONLY_ANNOTATIONS = ToolAnnotations(
 )
 
 
+_logger = logging.getLogger(__name__)
+
 def _find_git_toplevel(path: Path) -> Path | None:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
@@ -86,6 +96,44 @@ def _find_git_toplevel(path: Path) -> Path | None:
     except OSError:
         pass
     return None
+
+
+
+def _with_writable_memory[T](mem: Memory, action: Callable[[Memory], T]) -> T:
+    """Run a write on a short-lived writable Memory opened on the current worker thread.
+
+    Server memories stay read-only, and each thread keeps its own SQLite connection.
+    """
+    with Memory.open(mem._store.store_path, read_only=False) as rw_mem:
+        rw_mem.configure_embedding_adapter(mem._embedding_adapter)
+        return action(rw_mem)
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _submodule_discovery_key(root: Path) -> tuple[int, ...]:
+    """Mtimes of the files that decide which submodules exist and are initialized.
+
+    Discovery reads gitlinks from the index and checks each submodule checkout, which
+    Git records in `.gitmodules`, `config`, and the `modules/` directory.
+    """
+    git_dir = root / ".git"
+    if git_dir.is_file():
+        try:
+            pointer = git_dir.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pointer = ""
+        if pointer.startswith("gitdir:"):
+            git_dir = (root / pointer[len("gitdir:") :].strip()).resolve()
+    return tuple(
+        _mtime_ns(p)
+        for p in (root / ".gitmodules", git_dir / "index", git_dir / "config", git_dir / "modules")
+    )
 
 
 def _auto_bootstrap_store_if_needed(
@@ -141,11 +189,23 @@ def _auto_bootstrap_store_if_needed(
 class _DynamicMemoryHolder:
     """Route reads to configured/client roots and their initialized Git submodules."""
 
-    def __init__(self, pinned_memory: Memory | None) -> None:
+    def __init__(
+        self,
+        pinned_memory: Memory | None,
+        *,
+        auto_sync: bool = False,
+        embedding_adapter: EmbeddingAdapter | None = None,
+    ) -> None:
         self._pinned = pinned_memory
+        self._auto_sync = auto_sync
+        self._embedding_adapter = embedding_adapter
         self._initial_cwd_top = _find_git_toplevel(Path.cwd().resolve())
         self._default_root = self._initial_cwd_top
         self._memories: dict[Path, Memory] = {}
+        self._submodule_cache: dict[Path, tuple[tuple[int, ...], list[Path]]] = {}
+        self._last_sync_time: dict[Path, float] = {}
+        # The event loop keeps only weak references to tasks.
+        self._sync_tasks: set[asyncio.Task[object]] = set()
         self._lock = asyncio.Lock()
 
     async def repositories(self, ctx: Context | None) -> list[Path]:
@@ -177,6 +237,14 @@ class _DynamicMemoryHolder:
         def with_submodules() -> list[Path]:
             found = list(dict.fromkeys(roots))
             for root in found:
+                key = _submodule_discovery_key(root)
+                cached = self._submodule_cache.get(root)
+                if cached is not None and cached[0] == key:
+                    for sub in cached[1]:
+                        if sub not in found:
+                            found.append(sub)
+                    continue
+                subs: list[Path] = []
                 entries = _parse_ls_files_stage_z(run_safe_git(
                     ["ls-files", "--stage", "-z"], cwd=root, empty_hooks_dir=Path(os.devnull),
                 ).stdout)
@@ -188,6 +256,8 @@ class _DynamicMemoryHolder:
                         continue
                     if _find_git_toplevel(child) == child and (not hasattr(os, "getuid") or child.stat().st_uid == os.getuid()):
                         found.append(child)
+                        subs.append(child)
+                self._submodule_cache[root] = (key, subs)
             return found
 
         found = await asyncio.to_thread(with_submodules)
@@ -195,11 +265,22 @@ class _DynamicMemoryHolder:
             self._default_root = found[0]
         return found
 
+    def _pinned_memory(self) -> Memory:
+        assert self._pinned is not None
+        if self._auto_sync:
+            bound = self._pinned._workspace_path or self._pinned._store.config.repo_path
+            if bound is not None:
+                self._maybe_trigger_auto_sync(Path(bound).resolve(), self._pinned)
+        return self._pinned
+
     async def get_memory(self, ctx: Context | None = None, repository: str | None = None) -> Memory:
         if repository is None and self._pinned is not None:
-            return self._pinned
+            return self._pinned_memory()
         if ctx is None and repository is None and self._default_root in self._memories:
-            return self._memories[self._default_root]
+            mem = self._memories[self._default_root]
+            if self._auto_sync:
+                self._maybe_trigger_auto_sync(self._default_root, mem)
+            return mem
         roots = await self.repositories(ctx)
         if not roots:
             raise CodeContextError(code="STORE_NOT_INITIALIZED", message="No available Git repository. Configure --workspace or an MCP client root.")
@@ -211,11 +292,12 @@ class _DynamicMemoryHolder:
             if candidate_ws not in roots:
                 raise CodeContextError(code="REPOSITORY_MISMATCH", message="Repository is not a configured root or initialized submodule. Use list_repositories.")
         if self._pinned is not None and candidate_ws == roots[0]:
-            return self._pinned
+            return self._pinned_memory()
 
         def bootstrap() -> Memory:
             st_path, ws_path = _auto_bootstrap_store_if_needed(None, candidate_ws)
             mem = Memory.open(st_path, read_only=True)
+            mem.configure_embedding_adapter(self._embedding_adapter)
             if ws_path is not None:
                 mem.configure_workspace(ws_path)
             return mem
@@ -223,7 +305,38 @@ class _DynamicMemoryHolder:
         async with self._lock:
             if candidate_ws not in self._memories:
                 self._memories[candidate_ws] = await asyncio.to_thread(bootstrap)
-            return self._memories[candidate_ws]
+            mem = self._memories[candidate_ws]
+            if self._auto_sync:
+                self._maybe_trigger_auto_sync(candidate_ws, mem)
+            return mem
+
+    def _maybe_trigger_auto_sync(self, root: Path, mem: Memory) -> asyncio.Task[object] | None:
+        """Start a background offline sync at most once per 15 seconds per root."""
+        now = time.monotonic()
+        last = self._last_sync_time.get(root)
+        if last is not None and now - last <= 15.0:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        self._last_sync_time[root] = now
+        request = SyncRequest(revision="HEAD", offline=True, max_seconds=3)
+        task = loop.create_task(
+            asyncio.to_thread(_with_writable_memory, mem, lambda rw: rw.sync(request))
+        )
+        self._sync_tasks.add(task)
+        task.add_done_callback(self._on_auto_sync_done)
+        return task
+
+    def _on_auto_sync_done(self, task: asyncio.Task[object]) -> None:
+        self._sync_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            detail = exc.code if isinstance(exc, CodeContextError) else type(exc).__name__
+            _logger.warning("Background auto-sync failed: %s", detail)
 
     def close(self) -> None:
         for mem in self._memories.values():
@@ -239,11 +352,25 @@ def create_mcp_server(
     *,
     workspace_path: Path | str | None = None,
     include_graph_tools: bool = True,
+    auto_sync: bool = False,
+    allow_sync: bool = False,
+    allow_enrich: bool = False,
+    model_adapter: ModelAdapter | None = None,
+    enrich_concurrency: int = 1,
+    embedding_adapter: EmbeddingAdapter | None = None,
 ) -> tuple[MCPServer, _DynamicMemoryHolder]:
     """Create a read-only MCPServer bound to `store_path` and optional `workspace_path`.
     If both are omitted, resolves the active project dynamically per session/root and
     auto-bootstraps `<repo>/.codecontext`.
+
+    `allow_enrich` requires `model_adapter`. `embedding_adapter` turns on hybrid search.
     """
+    if allow_enrich and model_adapter is None:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="--allow-enrich needs a model: pass --provider and --model, or --adapter.",
+            retryable=False,
+        )
     st_in = Path(store_path) if store_path is not None else None
     ws_in = Path(workspace_path) if workspace_path is not None else None
 
@@ -251,10 +378,13 @@ def create_mcp_server(
     if st_in is not None or ws_in is not None:
         resolved_store, resolved_ws = _auto_bootstrap_store_if_needed(st_in, ws_in)
         pinned_memory = Memory.open(resolved_store, read_only=True)
+        pinned_memory.configure_embedding_adapter(embedding_adapter)
         if resolved_ws is not None:
             pinned_memory.configure_workspace(resolved_ws)
 
-    holder = _DynamicMemoryHolder(pinned_memory)
+    holder = _DynamicMemoryHolder(
+        pinned_memory, auto_sync=auto_sync, embedding_adapter=embedding_adapter
+    )
     semaphore = asyncio.Semaphore(4)
     server = MCPServer(
         name="codecontext",
@@ -497,6 +627,62 @@ def create_mcp_server(
                     )
                     raise ToolError(sanitized.to_json(pretty=False)) from exc
 
+    if allow_sync:
+        @server.tool(
+            name="sync",
+            description="Synchronize repository code and git history into the prepared snapshot.",
+        )
+        async def sync(
+            request: SyncRequest,
+            ctx: Context,
+            repository: str | None = None,
+        ) -> SyncReport:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx, repository)
+                    return await asyncio.to_thread(
+                        _with_writable_memory, mem, lambda rw: rw.sync(request)
+                    )
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during sync.",
+                        retryable=False,
+                        details={"exception_type": type(exc).__name__},
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
+    if allow_enrich:
+        @server.tool(
+            name="enrich",
+            description="Run budgeted model extraction or vector embedding generation.",
+        )
+        async def enrich(
+            request: EnrichRequest,
+            ctx: Context,
+            repository: str | None = None,
+        ) -> EnrichReport:
+            async with semaphore:
+                try:
+                    mem = await holder.get_memory(ctx, repository)
+                    return await asyncio.to_thread(
+                        _with_writable_memory,
+                        mem,
+                        lambda rw: rw.enrich(request, model=model_adapter, concurrency=enrich_concurrency),
+                    )
+                except CodeContextError as exc:
+                    raise ToolError(exc.to_json(pretty=False)) from exc
+                except Exception as exc:
+                    sanitized = CodeContextError(
+                        code="IO_ERROR",
+                        message="Internal error during enrich.",
+                        retryable=False,
+                        details={"exception_type": type(exc).__name__},
+                    )
+                    raise ToolError(sanitized.to_json(pretty=False)) from exc
+
     return server, holder
 
 
@@ -505,11 +691,23 @@ def run_stdio_server(
     *,
     workspace_path: Path | str | None = None,
     include_graph_tools: bool = True,
+    auto_sync: bool = False,
+    allow_sync: bool = False,
+    allow_enrich: bool = False,
+    model_adapter: ModelAdapter | None = None,
+    enrich_concurrency: int = 1,
+    embedding_adapter: EmbeddingAdapter | None = None,
 ) -> None:
     server, mem_or_holder = create_mcp_server(
         store_path,
         workspace_path=workspace_path,
         include_graph_tools=include_graph_tools,
+        auto_sync=auto_sync,
+        allow_sync=allow_sync,
+        allow_enrich=allow_enrich,
+        model_adapter=model_adapter,
+        enrich_concurrency=enrich_concurrency,
+        embedding_adapter=embedding_adapter,
     )
     try:
         server.run(transport="stdio")

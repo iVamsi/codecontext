@@ -32,6 +32,7 @@ from codecontext.identity import default_token_estimator
 from codecontext.models import (
     ContextPack,
     ContextRequest,
+    EmbeddingAdapter,
     EnrichReport,
     EnrichRequest,
     ExportReport,
@@ -42,16 +43,19 @@ from codecontext.models import (
     PurgeReport,
     PurgeRequest,
     RecordPage,
+    SCIPImportReport,
     SearchRequest,
     SearchResult,
     Status,
     SyncReport,
     SyncRequest,
+    TeamMergeReport,
 )
 from codecontext.retrieval import execute_context, execute_get, execute_search
+from codecontext.scip_import import execute_import_scip
 from codecontext.store import Store
 from codecontext.sync import execute_sync
-from codecontext.team import execute_join, execute_publish
+from codecontext.team import execute_join, execute_publish, execute_team_merge
 from codecontext.workspace import validate_workspace_binding
 
 
@@ -95,6 +99,7 @@ class Memory:
         self._count_kind: str = "estimated"
         self._github_transport: httpx.BaseTransport | None = None
         self._github_token: str | None = None
+        self._embedding_adapter: EmbeddingAdapter | None = None
 
     @classmethod
     def initialize(cls, store_path: Path | str, request: InitRequest | dict[str, Any]) -> "Memory":
@@ -106,7 +111,7 @@ class Memory:
     @classmethod
     def open(cls, store_path: Path | str, *, read_only: bool = False) -> "Memory":
         s_path = Path(store_path)
-        # Validate manifest hashes if opening an exported archive with manifest.json
+        # An exported archive carries manifest.json; reject it if any file hash no longer matches.
         manifest_file = s_path.expanduser().resolve() / "manifest.json"
         if manifest_file.exists():
             _validate_archive_manifest(s_path.expanduser().resolve(), manifest_file)
@@ -169,7 +174,9 @@ class Memory:
         request: EnrichRequest | dict[str, Any],
         *,
         model: ModelAdapter,
+        concurrency: int = 1,
     ) -> EnrichReport:
+        """Run budgeted enrichment. `concurrency` bounds parallel model calls (1..16)."""
         self._ensure_open()
         validated_req = _validate_request_model(EnrichRequest, request)
         return execute_enrich(
@@ -178,6 +185,8 @@ class Memory:
             validated_req,
             model=model,
             token_counter=self._token_counter,
+            embedding_adapter=self._embedding_adapter,
+            concurrency=concurrency,
         )
 
     def search(self, request: SearchRequest | dict[str, Any]) -> SearchResult:
@@ -190,6 +199,7 @@ class Memory:
             token_counter=self._token_counter,
             estimator_id=self._estimator_id,
             count_kind=self._count_kind,
+            embedding_adapter=self._embedding_adapter,
         )
 
     def get(self, request: GetRequest | dict[str, Any]) -> RecordPage:
@@ -239,6 +249,24 @@ class Memory:
         execute_join(Path(store_path), Path(share_dir), Path(repo_path))
         with cls.open(store_path) as mem:
             return mem.status()
+
+    @classmethod
+    def merge_share(cls, store_path: Path | str, share_dir: Path | str, repo_path: Path | str) -> TeamMergeReport:
+        return execute_team_merge(Path(store_path), Path(share_dir), Path(repo_path))
+
+    def import_scip(self, scip_path: Path | str) -> SCIPImportReport:
+        self._ensure_open()
+        return execute_import_scip(self._store, Path(scip_path))
+
+    def configure_embedding_adapter(self, adapter: EmbeddingAdapter | None) -> None:
+        """Enable hybrid vector search and embedding generation, or disable them with None."""
+        if adapter is not None and not isinstance(adapter, EmbeddingAdapter):
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message="Embedding adapter must provide model_fingerprint, dimensions, and embed().",
+                retryable=False,
+            )
+        self._embedding_adapter = adapter
 
     def purge(self, request: PurgeRequest | dict[str, Any]) -> PurgeReport:
         self._ensure_open()

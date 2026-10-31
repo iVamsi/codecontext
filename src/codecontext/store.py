@@ -1,9 +1,12 @@
 import base64
 import fcntl
+import functools
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.parse
 import uuid
@@ -27,6 +30,7 @@ from codecontext.identity import (
     sha256_bytes,
     us_to_iso_z,
     validate_github_repo_name,
+    validate_gitlab_project_path,
 )
 from codecontext.models import (
     GAP_CODE_REGISTRY,
@@ -43,13 +47,29 @@ from codecontext.models import (
     Status,
 )
 
-SCHEMA_VERSION = 1
-MIGRATION_FILE = Path(__file__).parent / "migrations" / "001_initial.sql"
+SCHEMA_VERSION = 2
+MIN_READ_ONLY_SCHEMA_VERSION = 1
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+MIGRATION_FILE = MIGRATIONS_DIR / "001_initial.sql"
 
 
 def get_migration_sql_and_hash() -> tuple[str, str]:
     raw = MIGRATION_FILE.read_bytes()
     return raw.decode("utf-8"), sha256_bytes(raw)
+
+
+@functools.lru_cache(maxsize=1)
+def get_all_migrations() -> tuple[tuple[int, str, str], ...]:
+    items: list[tuple[int, str, str]] = []
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        prefix = path.name.split("_", 1)[0]
+        if not prefix.isdigit():
+            continue
+        ver = int(prefix)
+        raw = path.read_bytes()
+        items.append((ver, raw.decode("utf-8"), sha256_bytes(raw)))
+    items.sort(key=lambda t: t[0])
+    return tuple(items)
 
 
 def now_us() -> int:
@@ -64,9 +84,11 @@ class StoreConfig:
     repo_path: str | None
     github_repository: str | None
     allowed_issue_repositories: list[str]
+    gitlab_repository: str | None = None
+    gitlab_base_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "allowed_issue_repositories": self.allowed_issue_repositories,
             "format_version": self.format_version,
             "github_repository": self.github_repository,
@@ -74,6 +96,11 @@ class StoreConfig:
             "repo_path": self.repo_path,
             "repository_id": self.repository_id,
         }
+        if self.gitlab_repository is not None:
+            out["gitlab_repository"] = self.gitlab_repository
+        if self.gitlab_base_url is not None:
+            out["gitlab_base_url"] = self.gitlab_base_url
+        return out
 
 
 @dataclass(frozen=True)
@@ -86,13 +113,15 @@ class ReadSnapshot:
     access_state: str
     object_format: str
     github_name: str | None
+    gitlab_name: str | None = None
+    gitlab_base_url: str | None = None
+    workspace_base_revision: str | None = None
 
 
 def _parse_github_remote_url(raw_url: str) -> str | None:
     url = raw_url.strip()
     if not url:
         return None
-    # Match git@github.com:OWNER/REPO(.git) or https://github.com/OWNER/REPO(.git)
     for prefix in ("git@github.com:", "ssh://git@github.com/", "https://github.com/", "http://github.com/"):
         if url.startswith(prefix):
             rest = url[len(prefix) :].strip("/")
@@ -200,13 +229,30 @@ def inspect_local_git_repository(repo_path: Path) -> tuple[Path, Path, int, int,
 def normalize_github_repo(repo: str | None) -> str | None:
     if repo is None:
         return None
-    validated = validate_github_repo_name(repo.strip())
-    return validated
+    return validate_github_repo_name(repo.strip())
+
+
+def normalize_gitlab_repo(repo: str | None) -> str | None:
+    if repo is None:
+        return None
+    return validate_gitlab_project_path(repo.strip())
+
+
+def normalize_gitlab_base_url(url: str | None) -> str | None:
+    if url is None:
+        return None
+    cleaned = url.strip().rstrip("/")
+    if not cleaned.startswith("https://"):
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="GitLab base URL must use https://.",
+            retryable=False,
+        )
+    return cleaned
 
 
 def normalize_allowlist(repos: list[str]) -> list[str]:
     cleaned = [validate_github_repo_name(r.strip()) for r in repos]
-    # Preserve canonical case if unique case-insensitively, sorted by lowercase
     by_lower: dict[str, str] = {}
     for item in cleaned:
         low = item.lower()
@@ -301,6 +347,36 @@ def decode_and_validate_cursor(
     return offset, extra
 
 
+@contextmanager
+def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout_seconds
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise CodeContextError(
+                        code="STORE_BUSY",
+                        message="Another process holds the store lock.",
+                        retryable=True,
+                    ) from exc
+                time.sleep(0.02)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
 class Store:
     def __init__(
         self,
@@ -318,6 +394,12 @@ class Store:
         self.tmp_dir = store_path / "tmp"
         self._lock_path = store_path / "tmp" / "writer.lock"
         self._closed = False
+        self.schema_version = SCHEMA_VERSION
+        self._tls = threading.local()
+        self._close_callbacks: list[Any] = []
+
+    def register_close_callback(self, fn: Any) -> None:
+        self._close_callbacks.append(fn)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -328,6 +410,14 @@ class Store:
             )
 
     def close(self) -> None:
+        if self._closed:
+            return
+        for cb in self._close_callbacks:
+            try:
+                cb()
+            except Exception:
+                pass
+        self._close_callbacks.clear()
         self._closed = True
 
     @classmethod
@@ -338,8 +428,6 @@ class Store:
             request.repo_path
         )
 
-        # Runtime store must not be the checkout root itself or inside its .git common dir,
-        # except when stored inside a dedicated `.codecontext` directory at the repository root.
         is_dot_codecontext = (
             resolved_store.name == ".codecontext" and resolved_store.parent == resolved_repo
         )
@@ -356,6 +444,8 @@ class Store:
             )
 
         norm_gh = normalize_github_repo(request.github_repository)
+        norm_gl = normalize_gitlab_repo(request.gitlab_repository)
+        norm_gl_base = normalize_gitlab_base_url(request.gitlab_base_url)
         norm_allow = normalize_allowlist(request.allowed_issue_repositories)
 
         store_json = resolved_store / "store.json"
@@ -389,17 +479,24 @@ class Store:
                         )
                     db_common_real, db_dev, db_ino, db_gh, db_fmt = row
 
+                # Tolerate st_dev changes across OS remounts when realpath and st_ino match
                 same_common = (
                     db_common_real == str(common_real)
-                    and int(db_dev) == st_dev
                     and int(db_ino) == st_ino
                     and db_fmt == obj_fmt
                 )
+                if same_common and int(db_dev) != st_dev:
+                    with existing.write_transaction(bump_generation=False) as wconn:
+                        wconn.execute(
+                            "UPDATE store_meta SET common_dir_device = ? WHERE singleton = 1",
+                            (st_dev,),
+                        )
                 same_gh = (existing.config.github_repository or "").lower() == (norm_gh or "").lower()
+                same_gl = (existing.config.gitlab_repository or "").lower() == (norm_gl or "").lower()
                 same_allow = [x.lower() for x in existing.config.allowed_issue_repositories] == [
                     x.lower() for x in norm_allow
                 ]
-                if not (same_common and same_gh and same_allow):
+                if not (same_common and same_gh and same_gl and same_allow):
                     raise CodeContextError(
                         code="REPOSITORY_MISMATCH",
                         message="Store is already bound to a different repository or configuration.",
@@ -410,97 +507,130 @@ class Store:
                 existing.close()
                 raise
 
-        if resolved_store.exists() and any(resolved_store.iterdir()):
-            raise CodeContextError(
-                code="INVALID_REQUEST",
-                message="Target store directory is non-empty and not an initialized CodeContext store.",
-                retryable=False,
-            )
+        created_dir = not resolved_store.exists()
+        if resolved_store.exists():
+            entries = [p for p in resolved_store.iterdir() if p.name != "tmp"]
+            if entries:
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Target store directory is non-empty and not an initialized CodeContext store.",
+                    retryable=False,
+                )
 
         resolved_store.mkdir(parents=True, exist_ok=True)
         (resolved_store / "tmp").mkdir(parents=True, exist_ok=True)
-        git_dir = resolved_store / "repository.git"
-        empty_tpl = resolved_store / "tmp" / "_empty_git_tpl"
-        empty_tpl.mkdir(parents=True, exist_ok=True)
+        lock_file = resolved_store / "tmp" / "writer.lock"
 
-        init_args = ["git", "-c", "core.fsmonitor=false", "init", "--bare", f"--template={empty_tpl}"]
-        if obj_fmt == "sha256":
-            init_args.append("--object-format=sha256")
-        init_args.append(str(git_dir))
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_TERMINAL_PROMPT": "0",
-            "LC_ALL": "C",
-        }
-        subprocess.run(init_args, env=env, capture_output=True, check=True, timeout=15)
-        subprocess.run(
-            ["git", "--git-dir", str(git_dir), "config", "gc.auto", "0"],
-            env=env,
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
+        with _acquire_file_lock(lock_file, timeout_seconds=remaining_timeout(10.0)):
+            # Re-check after lock acquisition in case a concurrent caller finished initialization
+            if store_json.exists() and db_file.exists():
+                return cls.open(resolved_store, read_only=False)
 
-        repo_uuid = str(uuid.uuid4())
-        config = StoreConfig(
-            format_version=1,
-            repository_id=repo_uuid,
-            read_only_archive=False,
-            repo_path=str(resolved_repo),
-            github_repository=norm_gh,
-            allowed_issue_repositories=norm_allow,
-        )
+            try:
+                git_dir = resolved_store / "repository.git"
+                empty_tpl = resolved_store / "tmp" / "_empty_git_tpl"
+                empty_tpl.mkdir(parents=True, exist_ok=True)
 
-        migration_sql, migration_hash = get_migration_sql_and_hash()
-        created_us = now_us()
+                init_args = ["git", "-c", "core.fsmonitor=false", "init", "--bare", f"--template={empty_tpl}"]
+                if obj_fmt == "sha256":
+                    init_args.append("--object-format=sha256")
+                init_args.append(str(git_dir))
+                env = {
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "LC_ALL": "C",
+                }
+                subprocess.run(init_args, env=env, capture_output=True, check=True, timeout=15)
+                subprocess.run(
+                    ["git", "--git-dir", str(git_dir), "config", "gc.auto", "0"],
+                    env=env,
+                    capture_output=True,
+                    check=True,
+                    timeout=10,
+                )
 
-        conn = sqlite3.connect(str(db_file), timeout=5.0, isolation_level=None)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.executescript(migration_sql)
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO schema_migrations (version, applied_at_us, migration_sha256) VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, created_us, migration_hash),
-            )
-            conn.execute(
-                """
-                INSERT INTO store_meta (
-                    singleton, repository_id, schema_version, object_format,
-                    local_repository_path, common_dir_realpath, common_dir_device, common_dir_inode,
-                    github_repository_id, github_name, principal_id, active_revision,
-                    generation, access_epoch, access_state, created_at_us
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, 0, 0, 'allowed', ?)
-                """,
-                (
-                    repo_uuid,
-                    SCHEMA_VERSION,
-                    obj_fmt,
-                    str(resolved_repo),
-                    str(common_real),
-                    st_dev,
-                    st_ino,
-                    norm_gh,
-                    created_us,
-                ),
-            )
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
+                repo_uuid = str(uuid.uuid4())
+                config = StoreConfig(
+                    format_version=1,
+                    repository_id=repo_uuid,
+                    read_only_archive=False,
+                    repo_path=str(resolved_repo),
+                    github_repository=norm_gh,
+                    allowed_issue_repositories=norm_allow,
+                    gitlab_repository=norm_gl,
+                    gitlab_base_url=norm_gl_base,
+                )
 
-        store_json.write_text(
-            json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        if is_dot_codecontext:
-            gitignore_file = resolved_store / ".gitignore"
-            if not gitignore_file.exists():
-                gitignore_file.write_text("*\n", encoding="utf-8")
+                migrations = get_all_migrations()
+                created_us = now_us()
+
+                conn = sqlite3.connect(str(db_file), timeout=5.0, isolation_level=None)
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    for _, mig_sql, _ in migrations:
+                        conn.executescript(mig_sql)
+                    conn.execute("BEGIN IMMEDIATE")
+                    for ver, _, mig_hash in migrations:
+                        conn.execute(
+                            "INSERT INTO schema_migrations (version, applied_at_us, migration_sha256) VALUES (?, ?, ?)",
+                            (ver, created_us, mig_hash),
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO store_meta (
+                            singleton, repository_id, schema_version, object_format,
+                            local_repository_path, common_dir_realpath, common_dir_device, common_dir_inode,
+                            github_repository_id, github_name, gitlab_project_id, gitlab_name, gitlab_base_url,
+                            principal_id, active_revision, workspace_base_revision,
+                            generation, access_epoch, access_state, created_at_us
+                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL, NULL, NULL, 0, 0, 'allowed', ?)
+                        """,
+                        (
+                            repo_uuid,
+                            SCHEMA_VERSION,
+                            obj_fmt,
+                            str(resolved_repo),
+                            str(common_real),
+                            st_dev,
+                            st_ino,
+                            norm_gh,
+                            norm_gl,
+                            norm_gl_base,
+                            created_us,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                finally:
+                    conn.close()
+
+                tmp_json = resolved_store / "tmp" / f"store.json.{uuid.uuid4().hex}"
+                tmp_json.write_text(
+                    json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_json, store_json)
+                if is_dot_codecontext:
+                    gitignore_file = resolved_store / ".gitignore"
+                    if not gitignore_file.exists():
+                        gitignore_file.write_text("*\n", encoding="utf-8")
+            except Exception:
+                # Clean up partial artifacts so retries are not blocked
+                for fname in ("store.json", "memory.sqlite3", "memory.sqlite3-wal", "memory.sqlite3-shm", ".gitignore"):
+                    (resolved_store / fname).unlink(missing_ok=True)
+                shutil.rmtree(resolved_store / "repository.git", ignore_errors=True)
+                if created_dir:
+                    shutil.rmtree(resolved_store / "tmp", ignore_errors=True)
+                    try:
+                        resolved_store.rmdir()
+                    except OSError:
+                        pass
+                raise
+
         return cls(resolved_store, config, read_only=False)
 
     @classmethod
@@ -524,7 +654,7 @@ class Store:
                 retryable=False,
             ) from exc
 
-        expected_keys = {
+        required_keys = {
             "format_version",
             "repository_id",
             "read_only_archive",
@@ -532,7 +662,12 @@ class Store:
             "github_repository",
             "allowed_issue_repositories",
         }
-        if not isinstance(raw_cfg, dict) or set(raw_cfg.keys()) != expected_keys:
+        optional_keys = {"gitlab_repository", "gitlab_base_url"}
+        if (
+            not isinstance(raw_cfg, dict)
+            or not required_keys.issubset(raw_cfg.keys())
+            or not set(raw_cfg.keys()).issubset(required_keys | optional_keys)
+        ):
             raise CodeContextError(
                 code="STORE_VERSION_UNSUPPORTED",
                 message="Invalid store.json format or unexpected keys.",
@@ -552,13 +687,14 @@ class Store:
             repo_path=raw_cfg["repo_path"],
             github_repository=raw_cfg["github_repository"],
             allowed_issue_repositories=list(raw_cfg["allowed_issue_repositories"]),
+            gitlab_repository=raw_cfg.get("gitlab_repository"),
+            gitlab_base_url=raw_cfg.get("gitlab_base_url"),
         )
         effective_read_only = read_only or config.read_only_archive
-        if not effective_read_only:
-            verify_runtime_dependencies()
+        verify_runtime_dependencies()
 
         instance = cls(resolved_store, config, read_only=effective_read_only)
-        instance._validate_schema_and_identity()
+        instance._validate_and_migrate_schema()
         if not effective_read_only:
             instance.recover_abandoned_jobs()
         return instance
@@ -576,9 +712,10 @@ class Store:
             if for_write:
                 conn = sqlite3.connect(str(self.db_path), timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("PRAGMA cache_size=-32000")
                 conn.execute(f"PRAGMA busy_timeout={int(remaining_timeout(5.0) * 1000)}")
                 conn.set_progress_handler(lambda: int(expired()), 1000)
                 return conn
@@ -587,6 +724,8 @@ class Store:
                 uri = f"file:{quoted}?mode=ro"
                 conn = sqlite3.connect(uri, uri=True, timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("PRAGMA cache_size=-32000")
                 conn.set_progress_handler(lambda: int(expired()), 1000)
                 return conn
         except sqlite3.OperationalError as exc:
@@ -602,9 +741,10 @@ class Store:
                 retryable=False,
             ) from exc
 
-    def _validate_schema_and_identity(self) -> None:
-        _, expected_hash = get_migration_sql_and_hash()
-        verify_runtime_dependencies()
+    def _validate_and_migrate_schema(self) -> None:
+        all_migs = get_all_migrations()
+        mig_by_ver = {ver: (sql, sha) for ver, sql, sha in all_migs}
+
         conn = self._open_raw_connection(for_write=False)
         try:
             try:
@@ -612,9 +752,7 @@ class Store:
                     "SELECT version, migration_sha256 FROM schema_migrations ORDER BY version ASC"
                 ).fetchall()
                 meta = conn.execute(
-                    "SELECT repository_id, schema_version, object_format, read_only_check FROM ("
-                    "SELECT repository_id, schema_version, object_format, 1 AS read_only_check FROM store_meta WHERE singleton = 1"
-                    ")"
+                    "SELECT repository_id, schema_version, object_format FROM store_meta WHERE singleton = 1"
                 ).fetchone()
             except sqlite3.OperationalError as exc:
                 raise CodeContextError(
@@ -629,32 +767,84 @@ class Store:
                     message="Database migration or store_meta is missing.",
                     retryable=False,
                 )
-            if len(mig_rows) != 1 or int(mig_rows[0]["version"]) != SCHEMA_VERSION:
+
+            db_schema_ver = int(meta["schema_version"])
+            if db_schema_ver < MIN_READ_ONLY_SCHEMA_VERSION or db_schema_ver > SCHEMA_VERSION:
                 raise CodeContextError(
                     code="STORE_VERSION_UNSUPPORTED",
-                    message=f"Unsupported schema migration version: {mig_rows[0]['version']}",
+                    message=f"Unsupported store_meta schema_version: {db_schema_ver}",
                     retryable=False,
                 )
-            if mig_rows[0]["migration_sha256"] != expected_hash:
+
+            if len(mig_rows) != db_schema_ver:
                 raise CodeContextError(
                     code="STORE_VERSION_UNSUPPORTED",
-                    message="Schema migration checksum mismatch.",
+                    message="Inconsistent schema_migrations table length vs store_meta.schema_version.",
                     retryable=False,
                 )
-            if int(meta["schema_version"]) != SCHEMA_VERSION:
-                raise CodeContextError(
-                    code="STORE_VERSION_UNSUPPORTED",
-                    message=f"Unsupported store_meta schema_version: {meta['schema_version']}",
-                    retryable=False,
-                )
+
+            for expected_ver, row in enumerate(mig_rows, start=1):
+                row_ver = int(row["version"])
+                if row_ver != expected_ver or row_ver not in mig_by_ver:
+                    raise CodeContextError(
+                        code="STORE_VERSION_UNSUPPORTED",
+                        message=f"Unsupported schema migration version: {row_ver}",
+                        retryable=False,
+                    )
+                if row["migration_sha256"] != mig_by_ver[row_ver][1]:
+                    raise CodeContextError(
+                        code="STORE_VERSION_UNSUPPORTED",
+                        message=f"Schema migration checksum mismatch at version {row_ver}.",
+                        retryable=False,
+                    )
+
             if meta["repository_id"] != self.config.repository_id:
                 raise CodeContextError(
                     code="REPOSITORY_MISMATCH",
                     message="store.json repository_id does not match SQLite store_meta.",
                     retryable=False,
                 )
+            self.schema_version = db_schema_ver
         finally:
             conn.close()
+
+        if self.schema_version < SCHEMA_VERSION and not self.read_only:
+            self._apply_pending_migrations(mig_by_ver)
+
+    def _apply_pending_migrations(self, mig_by_ver: dict[int, tuple[str, str]]) -> None:
+        with self.acquire_writer_lock(timeout_seconds=remaining_timeout(10.0)):
+            conn = self._open_raw_connection(for_write=True)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                cur_row = conn.execute("SELECT schema_version FROM store_meta WHERE singleton = 1").fetchone()
+                cur_ver = int(cur_row["schema_version"]) if cur_row else self.schema_version
+                for next_ver in range(cur_ver + 1, SCHEMA_VERSION + 1):
+                    mig_sql, mig_hash = mig_by_ver[next_ver]
+                    applied_us = now_us()
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        for stmt in (s.strip() for s in mig_sql.split(";")):
+                            if not stmt or stmt.upper().startswith("PRAGMA "):
+                                continue
+                            conn.execute(stmt)
+                        conn.execute(
+                            "INSERT INTO schema_migrations (version, applied_at_us, migration_sha256) VALUES (?, ?, ?)",
+                            (next_ver, applied_us, mig_hash),
+                        )
+                        conn.execute(
+                            "UPDATE store_meta SET schema_version = ? WHERE singleton = 1",
+                            (next_ver,),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                        raise
+                self.schema_version = SCHEMA_VERSION
+            finally:
+                conn.close()
 
     @contextmanager
     def acquire_writer_lock(
@@ -670,32 +860,20 @@ class Store:
                 message="Store is opened in read-only mode.",
                 retryable=False,
             )
-        self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        deadline = time.monotonic() + timeout_seconds
-        acquired = False
-        try:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError as exc:
-                    if time.monotonic() >= deadline:
-                        raise CodeContextError(
-                            code="STORE_BUSY",
-                            message="Another writer holds the store operation lock.",
-                            retryable=True,
-                        ) from exc
-                    time.sleep(0.02)
-            yield
-        finally:
-            if acquired:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            os.close(fd)
+        if getattr(self._tls, "lock_depth", 0) > 0:
+            self._tls.lock_depth += 1
+            try:
+                yield
+            finally:
+                self._tls.lock_depth -= 1
+            return
+
+        with _acquire_file_lock(self._lock_path, timeout_seconds=timeout_seconds):
+            self._tls.lock_depth = 1
+            try:
+                yield
+            finally:
+                self._tls.lock_depth = 0
 
     @contextmanager
     def connect_read(self) -> Iterator[sqlite3.Connection]:
@@ -710,10 +888,19 @@ class Store:
         conn = self._open_raw_connection(for_write=False)
         try:
             conn.execute("BEGIN DEFERRED")
-            meta = conn.execute(
-                "SELECT repository_id, active_revision, generation, access_epoch, "
-                "access_state, object_format, github_name FROM store_meta WHERE singleton = 1"
-            ).fetchone()
+            if self.schema_version >= 2:
+                meta = conn.execute(
+                    "SELECT repository_id, active_revision, generation, access_epoch, "
+                    "access_state, object_format, github_name, gitlab_name, gitlab_base_url, "
+                    "workspace_base_revision FROM store_meta WHERE singleton = 1"
+                ).fetchone()
+            else:
+                meta = conn.execute(
+                    "SELECT repository_id, active_revision, generation, access_epoch, "
+                    "access_state, object_format, github_name, NULL AS gitlab_name, "
+                    "NULL AS gitlab_base_url, NULL AS workspace_base_revision "
+                    "FROM store_meta WHERE singleton = 1"
+                ).fetchone()
             if not meta:
                 raise CodeContextError(
                     code="STORE_NOT_INITIALIZED",
@@ -735,6 +922,9 @@ class Store:
                 access_state=str(meta["access_state"]),
                 object_format=str(meta["object_format"]),
                 github_name=meta["github_name"],
+                gitlab_name=meta["gitlab_name"],
+                gitlab_base_url=meta["gitlab_base_url"],
+                workspace_base_revision=meta["workspace_base_revision"],
             )
         finally:
             try:
@@ -777,6 +967,30 @@ class Store:
         bump_access_epoch: bool = False,
         lock_timeout: float = 5.0,
     ) -> Iterator[sqlite3.Connection]:
+        active_conn: sqlite3.Connection | None = getattr(self._tls, "write_conn", None)
+        if active_conn is not None:
+            depth = int(getattr(self._tls, "tx_depth", 1))
+            sp_name = f"cc_sp_{depth}"
+            self._tls.tx_depth = depth + 1
+            active_conn.execute(f"SAVEPOINT {sp_name}")
+            try:
+                yield active_conn
+                if bump_generation:
+                    self._tls.pending_bump_gen = True
+                if bump_access_epoch:
+                    self._tls.pending_bump_epoch = True
+                active_conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except Exception:
+                try:
+                    active_conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    active_conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._tls.tx_depth = depth
+            return
+
         with self.acquire_writer_lock(timeout_seconds=remaining_timeout(lock_timeout)):
             conn = self._open_raw_connection(for_write=True)
             try:
@@ -790,10 +1004,14 @@ class Store:
                             retryable=True,
                         ) from exc
                     raise
+                self._tls.write_conn = conn
+                self._tls.tx_depth = 1
+                self._tls.pending_bump_gen = bump_generation
+                self._tls.pending_bump_epoch = bump_access_epoch
                 yield conn
-                if bump_generation:
+                if self._tls.pending_bump_gen:
                     conn.execute("UPDATE store_meta SET generation = generation + 1 WHERE singleton = 1")
-                if bump_access_epoch:
+                if self._tls.pending_bump_epoch:
                     conn.execute("UPDATE store_meta SET access_epoch = access_epoch + 1 WHERE singleton = 1")
                 conn.execute("COMMIT")
             except Exception as exc:
@@ -812,10 +1030,16 @@ class Store:
                     ) from exc
                 raise
             finally:
+                self._tls.write_conn = None
+                self._tls.tx_depth = 0
                 conn.close()
 
     def recover_abandoned_jobs(self) -> int:
         """Reset abandoned running jobs to pending on writable startup."""
+        with self.connect_read() as rconn:
+            has_running = rconn.execute("SELECT 1 FROM jobs WHERE state = 'running' LIMIT 1").fetchone()
+        if not has_running:
+            return 0
         with self.write_transaction(bump_generation=False) as conn:
             cur = conn.execute(
                 "UPDATE jobs SET state = 'pending', updated_at_us = ? WHERE state = 'running'",
@@ -999,13 +1223,20 @@ class Store:
         """Compute Coverage and bounded detailed active Gap list.
         Returns (coverage, detailed_gaps, omitted_gap_count).
         """
-        meta = conn.execute(
-            "SELECT active_revision, github_name FROM store_meta WHERE singleton = 1"
-        ).fetchone()
+        cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(store_meta)").fetchall()}
+        if "gitlab_name" in cols:
+            meta = conn.execute(
+                "SELECT active_revision, github_name, gitlab_name FROM store_meta WHERE singleton = 1"
+            ).fetchone()
+            gitlab_name = meta["gitlab_name"] if meta else None
+        else:
+            meta = conn.execute(
+                "SELECT active_revision, github_name FROM store_meta WHERE singleton = 1"
+            ).fetchone()
+            gitlab_name = None
         active_rev = meta["active_revision"] if meta else None
         github_name = meta["github_name"] if meta else None
 
-        # Active gaps ordered by (scope, code, id)
         gap_rows = conn.execute(
             """
             SELECT id, code, scope, record_id, message, retryable
@@ -1028,7 +1259,7 @@ class Store:
             code_counts[c] = code_counts.get(c, 0) + 1
             if sc.startswith("git:") or c in ("GIT_HISTORY_PENDING", "SHALLOW_HISTORY", "MISSING_GIT_OBJECT", "MISSING_PARENT"):
                 git_gaps += 1
-            elif sc.startswith("github:") or c in ("GITHUB_BACKFILL_PENDING", "SOURCE_UNAVAILABLE", "SOURCE_UNVERIFIED", "API_RESULT_CAP", "RECONCILIATION_PENDING"):
+            elif sc.startswith(("github:", "gitlab:")) or c in ("GITHUB_BACKFILL_PENDING", "SOURCE_UNAVAILABLE", "SOURCE_UNVERIFIED", "API_RESULT_CAP", "RECONCILIATION_PENDING"):
                 github_gaps += 1
             elif sc.startswith("blob:") or c in ("STRUCTURE_PENDING", "UNSUPPORTED_SYNTAX", "PARSE_ERROR", "BLOB_TOO_LARGE", "BINARY_CONTENT", "TEXT_DECODE_FAILED"):
                 structure_gaps += 1
@@ -1052,7 +1283,6 @@ class Store:
         ]
         omitted_gaps = max(0, total_active_gaps - len(detailed_gaps))
 
-        # Refs
         ref_rows = conn.execute(
             "SELECT name FROM refs WHERE active = 1 ORDER BY name ASC"
         ).fetchall()
@@ -1060,7 +1290,6 @@ class Store:
         selected_refs = all_refs[:20]
         omitted_ref_count = max(0, len(all_refs) - len(selected_refs))
 
-        # Git coverage
         total_commits = int(conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
         completed_commits = int(
             conn.execute("SELECT COUNT(*) FROM commits WHERE diff_state = 'complete'").fetchone()[0]
@@ -1096,31 +1325,36 @@ class Store:
             gap_count=git_gaps,
         )
 
-        # GitHub coverage
-        total_sources = int(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0])
+        # Remote discussion coverage (GitHub or GitLab; excludes localprovider='git' docs)
+        remote_sources = int(
+            conn.execute("SELECT COUNT(*) FROM sources WHERE provider IN ('github', 'gitlab')").fetchone()[0]
+        )
         pending_gh_jobs = int(
             conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE kind LIKE 'github_%' AND state IN ('pending', 'running', 'retryable_error')"
+                "SELECT COUNT(*) FROM jobs WHERE (kind LIKE 'github_%' OR kind LIKE 'gitlab_%') "
+                "AND state IN ('pending', 'running', 'retryable_error')"
             ).fetchone()[0]
         )
         blocked_gh_jobs = int(
             conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE kind LIKE 'github_%' AND state = 'blocked'"
+                "SELECT COUNT(*) FROM jobs WHERE (kind LIKE 'github_%' OR kind LIKE 'gitlab_%') AND state = 'blocked'"
             ).fetchone()[0]
         )
         gh_ckpt = conn.execute(
-            "SELECT MAX(last_success_at_us) AS ls, MIN(last_reconciled_at_us) AS lr FROM checkpoints WHERE stream_key LIKE 'github:%'"
+            "SELECT MAX(last_success_at_us) AS ls, MIN(last_reconciled_at_us) AS lr "
+            "FROM checkpoints WHERE stream_key LIKE 'github:%' OR stream_key LIKE 'gitlab:%'"
         ).fetchone()
         gh_last_success = us_to_iso_z(int(gh_ckpt["ls"])) if gh_ckpt and gh_ckpt["ls"] is not None else None
         gh_reconciled = us_to_iso_z(int(gh_ckpt["lr"])) if gh_ckpt and gh_ckpt["lr"] is not None else None
 
-        if github_name is None:
+        has_remote_provider = bool(github_name or gitlab_name or remote_sources > 0 or gh_last_success is not None)
+        if not has_remote_provider:
             gh_state: Any = "unavailable"
             gh_known_total: int | None = 0
-        elif blocked_gh_jobs > 0 and total_sources == 0:
+        elif blocked_gh_jobs > 0 and remote_sources == 0:
             gh_state = "blocked"
             gh_known_total = None
-        elif total_sources == 0 and pending_gh_jobs == 0 and gh_last_success is None:
+        elif remote_sources == 0 and pending_gh_jobs == 0 and gh_last_success is None:
             gh_state = "not_started"
             gh_known_total = None
         elif pending_gh_jobs > 0 or blocked_gh_jobs > 0 or github_gaps > 0:
@@ -1128,11 +1362,11 @@ class Store:
             gh_known_total = None
         else:
             gh_state = "complete"
-            gh_known_total = total_sources
+            gh_known_total = remote_sources
 
         gh_part = CoveragePart(
             state=gh_state,
-            completed=total_sources,
+            completed=remote_sources,
             known_total=gh_known_total,
             unit="records",
             last_success_at=gh_last_success,
@@ -1140,7 +1374,6 @@ class Store:
             gap_count=github_gaps,
         )
 
-        # Structure coverage
         snap_total = int(conn.execute("SELECT COUNT(*) FROM snapshot_files").fetchone()[0])
         snap_done = int(
             conn.execute(
@@ -1180,7 +1413,6 @@ class Store:
             gap_count=structure_gaps,
         )
 
-        # Enrichment coverage
         total_eps = int(conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0])
         inspected_eps = int(
             conn.execute("SELECT COUNT(*) FROM episodes WHERE state = 'inspected'").fetchone()[0]
@@ -1233,38 +1465,68 @@ class Store:
         count_kind: str = "estimated",
     ) -> Status:
         """Compute Status with fixed 6,000-token ceiling, at most 10 detailed gaps, and gap_ expansion handles."""
+        try:
+            from codecontext.syntax import get_supported_syntax_languages
+
+            syntax_langs = get_supported_syntax_languages()
+        except Exception:
+            syntax_langs = [
+                "bash",
+                "c",
+                "c_sharp",
+                "cpp",
+                "go",
+                "gradle",
+                "graphql",
+                "java",
+                "javascript",
+                "kotlin",
+                "php",
+                "proto",
+                "python",
+                "ruby",
+                "rust",
+                "sql",
+                "swift",
+                "tsx",
+                "typescript",
+            ]
+
         with self.read_snapshot() as snap:
             conn = snap.conn
             q_counts = self.get_queue_counts(conn)
             snap_file_cnt = int(conn.execute("SELECT COUNT(*) FROM snapshot_files").fetchone()[0])
             commit_cnt = int(conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0])
             source_cnt = int(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0])
+            gh_source_cnt = int(
+                conn.execute("SELECT COUNT(*) FROM sources WHERE provider = 'github'").fetchone()[0]
+            )
+            gl_source_cnt = int(
+                conn.execute("SELECT COUNT(*) FROM sources WHERE provider = 'gitlab'").fetchone()[0]
+            )
             claim_cnt = int(
                 conn.execute("SELECT COUNT(*) FROM claims WHERE state = 'ready'").fetchone()[0]
             )
             sum_cnt = int(
                 conn.execute("SELECT COUNT(*) FROM summaries WHERE state = 'ready'").fetchone()[0]
             )
+            emb_cnt = 0
+            if self.schema_version >= 2:
+                try:
+                    emb_cnt = int(conn.execute("SELECT COUNT(*) FROM document_embeddings").fetchone()[0])
+                except sqlite3.OperationalError:
+                    emb_cnt = 0
 
             has_git_objs = (self.git_dir / "objects").exists()
             caps = Capabilities(
-                syntax_languages=[
-                    "c",
-                    "cpp",
-                    "go",
-                    "java",
-                    "javascript",
-                    "kotlin",
-                    "python",
-                    "rust",
-                    "tsx",
-                    "typescript",
-                ],
+                syntax_languages=syntax_langs,
                 text_fallback=True,
                 git_history=commit_cnt > 0,
-                github_history=source_cnt > 0,
+                github_history=gh_source_cnt > 0,
+                gitlab_history=gl_source_cnt > 0,
                 offline_git_objects=has_git_objs,
                 enriched_claims_available=claim_cnt > 0,
+                semantic_embeddings_available=emb_cnt > 0,
             )
 
             max_gaps = 10
@@ -1294,6 +1556,7 @@ class Store:
                         access_state="allowed" if snap.access_state == "allowed" else "blocked",
                         read_only=self.read_only,
                         github_repository=snap.github_name,
+                        gitlab_repository=snap.gitlab_name,
                         object_format="sha256" if snap.object_format == "sha256" else "sha1",
                         jobs=q_counts,
                         snapshot_file_count=snap_file_cnt,

@@ -1,4 +1,5 @@
 import base64
+import bisect
 import hashlib
 import json
 import math
@@ -19,6 +20,7 @@ ALL_ID_PREFIXES: frozenset[str] = PUBLIC_ID_PREFIXES | INTERNAL_ID_PREFIXES
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 HEX_OID_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+GITLAB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
 
 
 def _check_no_floats(value: Any) -> None:
@@ -46,6 +48,10 @@ def canonical_sha256(data: Any) -> str:
 
 def sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def make_id(prefix: str, payload: dict[str, Any]) -> str:
@@ -544,6 +550,59 @@ def default_token_estimator(text: str) -> int:
     return math.ceil(len(text.encode("utf-8")) / 3)
 
 
+class LineByteIndex:
+    """Precomputed newline offset index for O(log L) byte-span and line-range lookups."""
+
+    __slots__ = ("_blob_len", "_line_ends", "_line_starts")
+
+    def __init__(self, blob_bytes: bytes) -> None:
+        self._blob_len = len(blob_bytes)
+        starts: list[int] = []
+        ends: list[int] = []
+        if blob_bytes:
+            pos = 0
+            n = len(blob_bytes)
+            while pos < n:
+                nl = blob_bytes.find(b"\n", pos)
+                if nl == -1:
+                    starts.append(pos)
+                    ends.append(n)
+                    break
+                end = nl + 1
+                starts.append(pos)
+                ends.append(end)
+                pos = end
+        self._line_starts = starts
+        self._line_ends = ends
+
+    @property
+    def line_count(self) -> int:
+        return len(self._line_starts)
+
+    def line_interval(self, one_based_line: int) -> tuple[int, int]:
+        idx = one_based_line - 1
+        return (self._line_starts[idx], self._line_ends[idx])
+
+    def byte_span_to_lines(self, byte_start: int, byte_end: int) -> tuple[int | None, int | None]:
+        if byte_start < 0 or byte_end < byte_start or byte_end > self._blob_len:
+            raise ValueError(
+                f"Invalid byte span [{byte_start}, {byte_end}) for blob of {self._blob_len} bytes"
+            )
+        if byte_start == byte_end or not self._line_starts:
+            return (None, None)
+        # Spans are half-open: a line overlaps when it ends after byte_start and starts before byte_end.
+        first_idx = bisect.bisect_right(self._line_ends, byte_start)
+        last_idx = bisect.bisect_left(self._line_starts, byte_end) - 1
+        if first_idx >= len(self._line_starts) or last_idx < first_idx:
+            return (None, None)
+        return (first_idx + 1, last_idx + 1)
+
+    def line_range_to_byte_span(
+        self, line_start: int, line_count: int
+    ) -> tuple[int, int, int | None, int | None]:
+        return line_range_to_byte_span(b"", line_start, line_count, line_index=self)
+
+
 def build_line_byte_table(blob_bytes: bytes) -> list[tuple[int, int]]:
     """Return 1-indexed line intervals as zero-based half-open (byte_start, byte_end) pairs.
 
@@ -569,6 +628,8 @@ def line_range_to_byte_span(
     blob_bytes: bytes,
     line_start: int,
     line_count: int,
+    *,
+    line_index: LineByteIndex | None = None,
 ) -> tuple[int, int, int | None, int | None]:
     """Convert Git hunk 1-based line_start and line_count to (byte_start, byte_end, line_start, line_end).
 
@@ -579,43 +640,35 @@ def line_range_to_byte_span(
     """
     if line_count < 0 or line_start < 0:
         raise ValueError(f"Invalid hunk coordinates: start={line_start}, count={line_count}")
-    table = build_line_byte_table(blob_bytes)
+    idx = line_index if line_index is not None else LineByteIndex(blob_bytes)
+    total_lines = idx.line_count
     if line_count == 0:
         if line_start == 0:
             return (0, 0, None, None)
-        if line_start > len(table):
-            raise ValueError(f"Hunk boundary line {line_start} exceeds line count {len(table)}")
-        boundary = table[line_start - 1][1]
+        if line_start > total_lines:
+            raise ValueError(f"Hunk boundary line {line_start} exceeds line count {total_lines}")
+        boundary = idx.line_interval(line_start)[1]
         return (boundary, boundary, None, None)
 
     if line_start < 1:
         raise ValueError("Non-empty hunk range must have line_start >= 1")
     line_end = line_start + line_count - 1
-    if line_end > len(table):
-        raise ValueError(f"Hunk line_end {line_end} exceeds blob line count {len(table)}")
-    byte_start = table[line_start - 1][0]
-    byte_end = table[line_end - 1][1]
+    if line_end > total_lines:
+        raise ValueError(f"Hunk line_end {line_end} exceeds blob line count {total_lines}")
+    byte_start = idx.line_interval(line_start)[0]
+    byte_end = idx.line_interval(line_end)[1]
     return (byte_start, byte_end, line_start, line_end)
 
 
-def byte_span_to_lines(blob_bytes: bytes, byte_start: int, byte_end: int) -> tuple[int | None, int | None]:
-    if byte_start < 0 or byte_end < byte_start or byte_end > len(blob_bytes):
-        raise ValueError(f"Invalid byte span [{byte_start}, {byte_end}) for blob of {len(blob_bytes)} bytes")
-    if byte_start == byte_end:
-        return (None, None)
-    table = build_line_byte_table(blob_bytes)
-    if not table:
-        return (None, None)
-    first_line: int | None = None
-    last_line: int | None = None
-    for idx, (l_start, l_end) in enumerate(table, start=1):
-        if l_end > byte_start and first_line is None:
-            first_line = idx
-        if l_start < byte_end:
-            last_line = idx
-        else:
-            break
-    return (first_line, last_line)
+def byte_span_to_lines(
+    blob_bytes: bytes,
+    byte_start: int,
+    byte_end: int,
+    *,
+    line_index: LineByteIndex | None = None,
+) -> tuple[int | None, int | None]:
+    idx = line_index if line_index is not None else LineByteIndex(blob_bytes)
+    return idx.byte_span_to_lines(byte_start, byte_end)
 
 
 def validate_github_repo_name(name: str) -> str:
@@ -633,3 +686,20 @@ def validate_github_repo_name(name: str) -> str:
             retryable=False,
         )
     return f"{owner}/{repo}"
+
+
+def validate_gitlab_project_path(name: str) -> str:
+    if not isinstance(name, str) or len(name) > 300 or not GITLAB_REPO_RE.match(name):
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"Invalid GitLab project path: {name!r}. Expected GROUP[/SUBGROUP]/PROJECT.",
+            retryable=False,
+        )
+    parts = name.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"Invalid GitLab project path segment in: {name!r}.",
+            retryable=False,
+        )
+    return "/".join(parts)

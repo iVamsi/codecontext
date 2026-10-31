@@ -1,3 +1,5 @@
+import functools
+import importlib
 import shutil
 import sqlite3
 import subprocess
@@ -5,8 +7,13 @@ from typing import Any
 
 from codecontext.errors import CodeContextError
 
+_DEFAULT_SQLITE_VERIFIED = False
+
 
 def verify_sqlite_capabilities(conn: sqlite3.Connection | None = None) -> None:
+    global _DEFAULT_SQLITE_VERIFIED
+    if conn is None and _DEFAULT_SQLITE_VERIFIED:
+        return
     close_after = False
     if conn is None:
         conn = sqlite3.connect(":memory:")
@@ -33,11 +40,14 @@ def verify_sqlite_capabilities(conn: sqlite3.Connection | None = None) -> None:
                 retryable=False,
                 details={"capability": "sqlite_json"},
             ) from exc
+        if close_after:
+            _DEFAULT_SQLITE_VERIFIED = True
     finally:
         if close_after:
             conn.close()
 
 
+@functools.lru_cache(maxsize=8)
 def verify_git_capabilities(git_executable: str = "git") -> tuple[int, int, int]:
     git_path = shutil.which(git_executable)
     if not git_path:
@@ -64,7 +74,6 @@ def verify_git_capabilities(git_executable: str = "git") -> tuple[int, int, int]
         ) from exc
 
     raw = proc.stdout.strip()
-    # Expected format: "git version 2.43.0..."
     parts = raw.split()
     version_str = parts[2] if len(parts) >= 3 else ""
     num_parts = []
@@ -89,20 +98,51 @@ def verify_git_capabilities(git_executable: str = "git") -> tuple[int, int, int]
     return version_tuple
 
 
+@functools.lru_cache(maxsize=1)
 def verify_treesitter_capabilities() -> dict[str, Any]:
     try:
         import tree_sitter
+        import tree_sitter_c
+        import tree_sitter_cpp
+        import tree_sitter_go
+        import tree_sitter_java
         import tree_sitter_javascript
+        import tree_sitter_kotlin
         import tree_sitter_python
+        import tree_sitter_rust
         import tree_sitter_typescript
         from tree_sitter import Language, Parser, Query
 
-        languages = {
-            "python": Language(tree_sitter_python.language()),
+        languages: dict[str, Language] = {
+            "c": Language(tree_sitter_c.language()),
+            "cpp": Language(tree_sitter_cpp.language()),
+            "go": Language(tree_sitter_go.language()),
+            "java": Language(tree_sitter_java.language()),
             "javascript": Language(tree_sitter_javascript.language()),
-            "typescript": Language(tree_sitter_typescript.language_typescript()),
+            "kotlin": Language(tree_sitter_kotlin.language()),
+            "python": Language(tree_sitter_python.language()),
+            "rust": Language(tree_sitter_rust.language()),
             "tsx": Language(tree_sitter_typescript.language_tsx()),
+            "typescript": Language(tree_sitter_typescript.language_typescript()),
         }
+
+        optional_specs = [
+            ("bash", "tree_sitter_bash", "language"),
+            ("c_sharp", "tree_sitter_c_sharp", "language"),
+            ("php", "tree_sitter_php", "language_php"),
+            ("ruby", "tree_sitter_ruby", "language"),
+            ("scala", "tree_sitter_scala", "language"),
+            ("swift", "tree_sitter_swift", "language"),
+        ]
+        for lang_key, mod_name, fn_name in optional_specs:
+            try:
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name, None) or getattr(mod, "language", None)
+                if callable(fn):
+                    languages[lang_key] = Language(fn())
+            except Exception:
+                pass
+
         minimal_queries = {
             "python": "(function_definition name: (identifier) @name)",
             "javascript": "(function_declaration name: (identifier) @name)",
@@ -114,8 +154,13 @@ def verify_treesitter_capabilities() -> dict[str, Any]:
             tree = parser.parse(b"function f() {}\ndef g(): pass\n")
             if tree is None or tree.root_node is None:
                 raise RuntimeError(f"Tree-sitter parser returned no root for {name}")
-            Query(lang, minimal_queries[name])
-        return {"languages": sorted(languages.keys()), "tree_sitter": getattr(tree_sitter, "__version__", "0.26.0")}
+            if name in minimal_queries:
+                Query(lang, minimal_queries[name])
+        return {
+            "languages": ["javascript", "python", "tsx", "typescript"],
+            "all_languages": sorted(languages.keys()),
+            "tree_sitter": getattr(tree_sitter, "__version__", "0.26.0"),
+        }
     except Exception as exc:
         if isinstance(exc, CodeContextError):
             raise

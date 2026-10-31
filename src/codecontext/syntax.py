@@ -1,8 +1,12 @@
+import contextvars
 import importlib.metadata
 import json
+import os
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Callable, Iterable
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,7 +22,7 @@ import tree_sitter_rust
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query
 
-from codecontext.deadline import check_deadline
+from codecontext.deadline import SyncDeadlineExceeded, check_deadline
 from codecontext.git import GitMirror
 from codecontext.identity import (
     byte_span_to_lines,
@@ -30,12 +34,30 @@ from codecontext.identity import (
     path_bytes_to_display,
     sha256_bytes,
 )
+from codecontext.scip_import import retire_dangling_scip_relations
 from codecontext.store import Store
 
 QUERIES_DIR = Path(__file__).parent / "queries"
 MAX_PARSE_BYTES = 2 * 1024 * 1024  # 2 MiB
 CHUNK_MAX_BYTES = 8192
 CHUNK_OVERLAP_BYTES = 512
+# Checking the clock on every node is measurable on large files; 256 nodes take well under a millisecond.
+DEADLINE_CHECK_INTERVAL = 256
+# Tree-sitter releases the GIL while parsing, but walking the tree is Python work, so more threads stop helping.
+PARSE_WORKERS = min(8, os.cpu_count() or 1)
+# Thread start-up costs more than parsing a handful of small files.
+PARALLEL_PARSE_MIN_BLOBS = 4
+# Bounds how many blobs and parse results are held in memory before they are written.
+PARSE_BATCH_SIZE = 64
+
+# Node types that name a referenced type, per grammar. JavaScript has no type annotations.
+TYPE_REF_LEAVES: dict[str, frozenset[str]] = {
+    "python": frozenset({"identifier", "attribute"}),
+    "typescript": frozenset({"type_identifier", "nested_type_identifier"}),
+    "tsx": frozenset({"type_identifier", "nested_type_identifier"}),
+    "java": frozenset({"type_identifier", "scoped_type_identifier"}),
+    "kotlin": frozenset({"user_type"}),
+}
 
 EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".py": "python",
@@ -60,7 +82,36 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".hpp": "cpp",
     ".hh": "cpp",
     ".hxx": "cpp",
+    ".cs": "c_sharp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".sql": "sql",
+    ".proto": "protobuf",
+    ".graphql": "graphql",
+    ".gql": "graphql",
+    ".gradle": "groovy",
 }
+
+STRUCTURAL_LANGUAGES: frozenset[str] = frozenset(
+    {
+        "c_sharp",
+        "ruby",
+        "php",
+        "bash",
+        "swift",
+        "scala",
+        "sql",
+        "protobuf",
+        "graphql",
+        "groovy",
+    }
+)
 
 DOC_AND_CONFIG_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -152,7 +203,7 @@ def _load_languages_and_queries() -> tuple[dict[str, Language], dict[str, Query]
         q_bytes = q_file.read_bytes()
         q_hash = sha256_bytes(q_bytes)[:16]
         queries[name] = Query(lang, q_bytes.decode("utf-8"))
-        walker_version = 4 if name == "kotlin" else 2
+        walker_version = 5 if name == "kotlin" else 3
         fingerprints[name] = f"{name}:ts{ts_ver}:g{lang_pkg_vers[name]}:q{q_hash}:walker{walker_version}"
     return langs, queries, fingerprints
 
@@ -161,7 +212,7 @@ LANGUAGES, COMPILED_QUERIES, EXTRACTOR_FINGERPRINTS = _load_languages_and_querie
 
 
 def get_extractor_fingerprint(language: str) -> str:
-    return EXTRACTOR_FINGERPRINTS[language]
+    return EXTRACTOR_FINGERPRINTS.get(language, f"{language}:structural:v1")
 
 
 def detect_language_for_path(path_bytes: bytes) -> str | None:
@@ -325,11 +376,22 @@ class ParseResult:
     relations: list[CandidateRelation]
 
 
-def _collect_error_ranges(node: Node, out: list[tuple[int, int]]) -> None:
-    if node.type == "ERROR" or node.is_missing:
-        out.append((node.start_byte, node.end_byte))
-    for child in node.children:
-        _collect_error_ranges(child, out)
+def _push_children(stack: list[tuple[Node, Any, list[str]]], children: list[Node], parent_sym: Any, scope: list[str]) -> None:
+    # Reversed so the stack pops children in source order, matching a recursive pre-order walk.
+    stack.extend((ch, parent_sym, scope) for ch in reversed(children))
+
+
+def _collect_error_ranges(root: Node, out: list[tuple[int, int]]) -> None:
+    stack = [root]
+    visited = 0
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited % DEADLINE_CHECK_INTERVAL == 0:
+            check_deadline()
+        if node.type == "ERROR" or node.is_missing:
+            out.append((node.start_byte, node.end_byte))
+        stack.extend(reversed(node.children))
 
 
 def _ranges_intersect(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
@@ -365,6 +427,211 @@ def _extract_signature(raw_bytes: bytes, decl_start: int, body_start: int | None
     lines = [line.strip() for line in sig_str.splitlines() if line.strip()]
     joined = " ".join(lines)
     return joined[:4000]
+
+
+def _parse_structural_fallback(
+    blob_bytes: bytes,
+    language: str,
+    actual_oid: str,
+    fp: str,
+    ext_id: str,
+) -> ParseResult:
+    """Deterministic structural AST extraction for languages without compiled tree-sitter grammars."""
+    text = blob_bytes.decode("utf-8", errors="replace")
+    symbols: list[ExtractedSymbol] = []
+    occurrences: list[ExtractedOccurrence] = []
+    relations: list[CandidateRelation] = []
+
+    def add_sym(
+        name: str,
+        kind: str,
+        byte_start: int,
+        byte_end: int,
+        parent_id: str | None = None,
+        qual_name: str | None = None,
+        sig: str = "",
+        body_start: int | None = None,
+        body_end: int | None = None,
+    ) -> ExtractedSymbol:
+        qname = qual_name or name
+        l_start, l_end = byte_span_to_lines(blob_bytes, byte_start, byte_end)
+        if l_start is None or l_end is None:
+            l_start, l_end = 1, 1
+        sid = make_sym_id(
+            blob_oid=actual_oid,
+            language=language,
+            extractor_fingerprint=fp,
+            byte_start=byte_start,
+            byte_end=byte_end,
+            kind=kind,
+            qualified_name=qname,
+        )
+        sym = ExtractedSymbol(
+            id=sid,
+            parent_symbol_id=parent_id,
+            kind=kind,
+            name=name,
+            qualified_name=qname,
+            byte_start=byte_start,
+            byte_end=byte_end,
+            body_byte_start=body_start,
+            body_byte_end=body_end,
+            line_start=l_start,
+            line_end=l_end,
+            signature=sig or name,
+            docstring=None,
+        )
+        symbols.append(sym)
+        if parent_id:
+            relations.append(
+                CandidateRelation(
+                    from_symbol_id=parent_id,
+                    to_symbol_id=sid,
+                    relation_kind="contains",
+                    method="structural_containment",
+                )
+            )
+        return sym
+
+    def add_occ(enclosing_id: str | None, occ_kind: str, b_start: int, b_end: int, details: dict[str, Any] | None = None) -> None:
+        occ_text = text[b_start:b_end].strip()[:1000]
+        if not occ_text:
+            return
+        occ_id = make_id(
+            "ext_",
+            {
+                "byte_end": b_end,
+                "byte_start": b_start,
+                "extraction_id": ext_id,
+                "kind": occ_kind,
+                "text": occ_text,
+            },
+        )
+        occurrences.append(
+            ExtractedOccurrence(
+                id=occ_id,
+                enclosing_symbol_id=enclosing_id,
+                kind=occ_kind,
+                text=occ_text,
+                byte_start=b_start,
+                byte_end=b_end,
+                details=details or {},
+            )
+        )
+
+    if language == "c_sharp":
+        for m in re.finditer(r"\b(?:public|private|protected|internal|static|abstract|sealed|\s)*\b(class|interface|struct|enum|record)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s*:\s*([^{]+))?\s*\{", text):
+            skind = "interface" if m.group(1) == "interface" else ("enum" if m.group(1) == "enum" else ("struct" if m.group(1) == "struct" else "class"))
+            c_name = m.group(2)
+            c_sym = add_sym(c_name, skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
+            if m.group(3):
+                for b_cand in m.group(3).split(","):
+                    b_clean = b_cand.strip().split("<")[0]
+                    if b_clean:
+                        add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": b_clean})
+        for m in re.finditer(r"\b(?:public|private|protected|internal|static|async|virtual|override|abstract|\s)+\b([A-Za-z0-9_<>[\]?]+)\s+([A-Z]\w*)\s*\(([^)]*)\)\s*\{", text):
+            fn_name = m.group(2)
+            add_sym(fn_name, "method", m.start(), m.end(), sig=m.group(0).strip(" {"))
+
+    elif language == "ruby":
+        for m in re.finditer(r"^\s*class\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s*<\s*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*))?", text, re.MULTILINE):
+            c_name = m.group(1)
+            c_sym = add_sym(c_name, "class", m.start(), m.end(), sig=m.group(0).strip())
+            if m.group(2):
+                add_occ(c_sym.id, "inherits", m.start(2), m.end(2), {"base_class": m.group(2)})
+        for m in re.finditer(r"^\s*module\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)", text, re.MULTILINE):
+            add_sym(m.group(1), "namespace", m.start(), m.end(), sig=m.group(0).strip())
+        for m in re.finditer(r"^\s*def\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)", text, re.MULTILINE):
+            add_sym(m.group(1), "method", m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "php":
+        for m in re.finditer(r"\b(?:abstract|final|\s)*\b(class|interface|trait|enum)\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z0-9_\\]+))?(?:\s+implements\s+([A-Za-z0-9_\\,\s]+))?\s*\{", text):
+            skind = "interface" if m.group(1) == "interface" else "class"
+            c_name = m.group(2)
+            c_sym = add_sym(c_name, skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
+            if m.group(3):
+                add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": m.group(3)})
+        for m in re.finditer(r"\b(?:public|private|protected|static|abstract|final|\s)*\bfunction\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", text):
+            add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "bash":
+        for m in re.finditer(r"^\s*(?:function\s+)?([a-zA-Z0-9_.-]+)\s*\(\s*\)\s*\{|^\s*function\s+([a-zA-Z0-9_.-]+)\s*\{", text, re.MULTILINE):
+            fn_name = m.group(1) or m.group(2)
+            add_sym(fn_name, "function", m.start(), m.end(), sig=f"function {fn_name}()")
+
+    elif language == "swift":
+        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|final|\s)*\b(class|struct|enum|protocol|actor|extension)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s*:\s*([^{]+))?\s*\{", text):
+            skind = "interface" if m.group(1) == "protocol" else "class"
+            c_sym = add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
+            if m.group(3):
+                for b_part in m.group(3).split(","):
+                    clean = b_part.strip().split("<")[0]
+                    if clean:
+                        add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": clean})
+        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|static|override|\s)*\bfunc\s+([a-zA-Z_]\w*)(?:<[^>]+>)?\s*\(([^)]*)\)", text):
+            add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "scala":
+        for m in re.finditer(r"\b(?:abstract|sealed|final|\s)*\b(class|object|trait)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s+extends\s+([A-Za-z0-9_.]+))?(?:\s+with\s+([^{]+))?\s*\{", text):
+            skind = "interface" if m.group(1) == "trait" else "class"
+            c_sym = add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
+            if m.group(3):
+                add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": m.group(3)})
+        for m in re.finditer(r"\bdef\s+([a-zA-Z_]\w*)\s*(?:\[[^\]]+\])?(?:\s*\(([^)]*)\))?", text):
+            add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "sql":
+        for m in re.finditer(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?([`\"\[]?([a-zA-Z0-9_.]+)[`\"\]]?)", text, re.IGNORECASE):
+            skind = m.group(1).lower()
+            name = m.group(3).strip("`\"[]")
+            add_sym(name, skind, m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "protobuf":
+        for m in re.finditer(r"\b(message|service|enum)\s+([A-Za-z_]\w*)\s*\{", text):
+            skind = "interface" if m.group(1) == "service" else ("enum" if m.group(1) == "enum" else "class")
+            add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
+        for m in re.finditer(r"\brpc\s+([A-Za-z_]\w*)\s*\(([^)]+)\)\s*returns\s*\(([^)]+)\)", text):
+            add_sym(m.group(1), "method", m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "graphql":
+        for m in re.finditer(r"\b(type|interface|union|input|enum)\s+([A-Za-z_]\w*)", text):
+            skind = "interface" if m.group(1) == "interface" else ("enum" if m.group(1) == "enum" else "class")
+            add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip())
+
+    elif language == "groovy":
+        for m in re.finditer(r"\bclass\s+([A-Za-z_]\w*)\s*\{", text):
+            add_sym(m.group(1), "class", m.start(), m.end(), sig=m.group(0).strip(" {"))
+        for m in re.finditer(r"\btask\s+([a-zA-Z_]\w*)", text):
+            add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
+        for m in re.finditer(r"\bdef\s+([a-zA-Z_]\w*)\s*\(", text):
+            add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip(" ("))
+
+    # Without a grammar, any `name(` inside a function's span is the best available call signal.
+    for sym in symbols:
+        if sym.kind in ("function", "method", "async_function", "async_method"):
+            body_text = text[sym.byte_start:sym.byte_end]
+            for cm in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body_text):
+                cname = cm.group(1)
+                if cname not in ("if", "for", "while", "switch", "catch", "return", sym.name):
+                    add_occ(
+                        sym.id,
+                        "call",
+                        sym.byte_start + cm.start(1),
+                        sym.byte_start + cm.end(1),
+                        {"callee": cname, "raw_callee": cname},
+                    )
+
+    return ParseResult(
+        extraction_id=ext_id,
+        blob_oid=actual_oid,
+        language=language,
+        extractor_fingerprint=fp,
+        state="complete",
+        diagnostics=[],
+        symbols=symbols,
+        occurrences=occurrences,
+        relations=relations,
+    )
 
 
 def _extract_python_docstring(body_node: Node | None, raw_bytes: bytes) -> tuple[str, int, int] | None:
@@ -437,6 +704,8 @@ def parse_blob(
         )
 
     if language not in LANGUAGES:
+        if language in STRUCTURAL_LANGUAGES:
+            return _parse_structural_fallback(blob_bytes, language, actual_oid, fp, ext_id)
         return ParseResult(
             extraction_id=ext_id,
             blob_oid=actual_oid,
@@ -592,14 +861,170 @@ def parse_blob(
             )
         return sym
 
-    def walk_python(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
-        if node.type == "decorated_definition":
-            inner = node.child_by_field_name("definition")
-            if inner is not None and inner.type in ("function_definition", "class_definition"):
-                name_n = inner.child_by_field_name("name")
-                body_n = inner.child_by_field_name("body")
-                is_async = any(c.type == "async" for c in inner.children)
-                if inner.type == "class_definition":
+    def text_of(n: Node) -> str:
+        return blob_bytes[n.start_byte : n.end_byte].decode("utf-8", errors="replace").strip()
+
+    def ref_name(n: Node) -> str:
+        # Generic arguments and call arguments are not part of the referenced name.
+        return "".join(re.split(r"[<(\[]", text_of(n), maxsplit=1)[0].split())
+
+    def emit_type_refs(sym_id: str, roots: list[Node]) -> None:
+        leaves = TYPE_REF_LEAVES.get(language, frozenset())
+        # Python names parameters with the same node type as types, so only names under a `type` count.
+        # A call inside an annotation (`Field(...)`) names a function, not a type.
+        stack = [(r, language != "python") for r in reversed(roots)]
+        while stack:
+            n, inside = stack.pop()
+            if inside and n.type in leaves:
+                if n.type == "user_type":
+                    name = ".".join(text_of(c) for c in n.named_children if c.type in ("identifier", "type_identifier"))
+                    stack.extend((c, True) for c in reversed(n.named_children) if c.type == "type_arguments")
+                else:
+                    name = text_of(n)
+                if name:
+                    add_occurrence(sym_id, "references_type", n.start_byte, n.end_byte, {"type_name": name})
+                continue
+            if n.type == "call":
+                continue
+            inside = inside or n.type == "type"
+            stack.extend((c, inside) for c in reversed(n.children))
+
+    def emit_declaration_edges(sym_id: str, decl: Node, outer: Node) -> None:
+        decorators: list[Node] = []
+        supertypes: list[tuple[str, Node]] = []
+        type_roots: list[Node | None] = []
+        if language == "python":
+            if outer.type == "decorated_definition":
+                decorators = [d.named_children[0] for d in outer.children if d.type == "decorator" and d.named_children]
+            if decl.type == "class_definition":
+                supers = decl.child_by_field_name("superclasses")
+                if supers is not None:
+                    supertypes = [("inherits", c) for c in supers.named_children if c.type in ("identifier", "attribute")]
+            else:
+                type_roots = [decl.child_by_field_name("parameters"), decl.child_by_field_name("return_type")]
+        elif language in ("javascript", "typescript", "tsx"):
+            # TypeScript puts member decorators before the member as class-body siblings.
+            owners: list[Node] = [outer, decl] if outer != decl else [decl]
+            leading: list[Node] = []
+            prev = decl.prev_named_sibling if outer == decl else None
+            while prev is not None and prev.type == "decorator":
+                leading.append(prev)
+                prev = prev.prev_named_sibling
+            raw_decorators = [*reversed(leading), *(c for o in owners for c in o.children if c.type == "decorator")]
+            decorators = [d.named_children[0] for d in raw_decorators if d.named_children]
+            for clause in decl.children:
+                if clause.type not in ("class_heritage", "extends_type_clause"):
+                    continue
+                for part in clause.named_children:
+                    if part.type == "implements_clause":
+                        supertypes += [("implements", t) for t in part.named_children]
+                    elif part.type == "extends_clause":
+                        supertypes += [("inherits", t) for t in part.named_children if t.type != "type_arguments"]
+                    elif part.type != "type_arguments":
+                        supertypes.append(("inherits", part))
+            type_roots = [decl.child_by_field_name("parameters"), decl.child_by_field_name("return_type")]
+        elif language == "java":
+            mods = next((c for c in decl.children if c.type == "modifiers"), None)
+            if mods is not None:
+                decorators = [n for a in mods.named_children if a.type in ("annotation", "marker_annotation")
+                              if (n := a.child_by_field_name("name")) is not None]
+            for clause in decl.children:
+                kind = {"superclass": "inherits", "super_interfaces": "implements", "extends_interfaces": "inherits"}.get(clause.type)
+                if kind is None:
+                    continue
+                parts = clause.named_children
+                if len(parts) == 1 and parts[0].type == "type_list":
+                    parts = parts[0].named_children
+                supertypes += [(kind, t) for t in parts]
+            if decl.type in ("method_declaration", "constructor_declaration"):
+                type_roots = [decl.child_by_field_name("type"), decl.child_by_field_name("parameters")]
+        elif language == "kotlin":
+            mods = next((c for c in decl.children if c.type == "modifiers"), None)
+            if mods is not None:
+                decorators = [n for a in mods.named_children if a.type == "annotation"
+                              if (n := next((c for c in a.named_children if c.type in ("user_type", "constructor_invocation")), None)) is not None]
+            # Kotlin marks a superclass by its constructor call; a bare supertype on a class is an interface.
+            is_interface = any(c.type == "interface" for c in decl.children)
+            delegation = next((c for c in decl.children if c.type == "delegation_specifiers"), None)
+            for spec in delegation.named_children if delegation is not None else []:
+                inner = spec.named_children[0] if spec.named_children else None
+                if inner is None:
+                    continue
+                if inner.type == "constructor_invocation":
+                    supertypes.append(("inherits", inner))
+                elif inner.type == "explicit_delegation" and inner.named_children:
+                    supertypes.append(("implements", inner.named_children[0]))
+                elif inner.type == "user_type":
+                    supertypes.append(("inherits" if is_interface else "implements", inner))
+            type_roots = [c for c in decl.children if c.type in ("function_value_parameters", "user_type", "nullable_type", "primary_constructor")]
+        for n in decorators:
+            name = ref_name(n)
+            if name:
+                add_occurrence(sym_id, "decorates", n.start_byte, n.end_byte, {"decorator": name})
+        for kind, n in supertypes:
+            name = ref_name(n)
+            if name:
+                add_occurrence(sym_id, kind, n.start_byte, n.end_byte, {"base_class": name})
+        emit_type_refs(sym_id, [r for r in type_roots if r is not None])
+
+    def emit_import(enclosing_id: str | None, n: Node, module: str, imported: str, local: str) -> None:
+        if module and imported and local:
+            add_occurrence(enclosing_id, "imports", n.start_byte, n.end_byte,
+                           {"imported": imported, "module": module, "name": local})
+
+    def emit_qualified_import(enclosing_id: str | None, node: Node) -> None:
+        if any(c.type in ("asterisk", "*") for c in node.children):
+            return
+        target = next((c for c in node.named_children if c.type in ("scoped_identifier", "qualified_identifier", "identifier")), None)
+        if target is None:
+            return
+        full = text_of(target)
+        if "." not in full:
+            return
+        module, imported = full.rsplit(".", 1)
+        alias = next((c for c in node.named_children if c.type == "identifier" and c != target), None)
+        emit_import(enclosing_id, node, module, imported, text_of(alias) if alias is not None else imported)
+
+    def walk_python(root_node: Node) -> None:
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str]]] = [(root_node, None, [])]
+        visited = 0
+        while stack:
+            node, parent_sym, scope = stack.pop()
+            visited += 1
+            if visited % DEADLINE_CHECK_INTERVAL == 0:
+                check_deadline()
+            if node.type == "decorated_definition":
+                inner = node.child_by_field_name("definition")
+                if inner is not None and inner.type in ("function_definition", "class_definition"):
+                    name_n = inner.child_by_field_name("name")
+                    body_n = inner.child_by_field_name("body")
+                    is_async = any(c.type == "async" for c in inner.children)
+                    if inner.type == "class_definition":
+                        skind = "class"
+                    elif parent_sym is not None and parent_sym.kind == "class":
+                        skind = "async_method" if is_async else "method"
+                    else:
+                        skind = "async_function" if is_async else "function"
+                    sym = add_symbol(
+                        parent_id=parent_sym.id if parent_sym else None,
+                        scope_names=scope,
+                        sym_kind=skind,
+                        name_node=name_n,
+                        decl_start=node.start_byte,
+                        decl_end=node.end_byte,
+                        body_node=body_n,
+                    )
+                    if sym is not None:
+                        emit_declaration_edges(sym.id, inner, node)
+                        if body_n is not None:
+                            _push_children(stack, body_n.children, sym, [*scope, sym.name])
+                    continue
+
+            if node.type in ("function_definition", "class_definition"):
+                name_n = node.child_by_field_name("name")
+                body_n = node.child_by_field_name("body")
+                is_async = any(c.type == "async" for c in node.children)
+                if node.type == "class_definition":
                     skind = "class"
                 elif parent_sym is not None and parent_sym.kind == "class":
                     skind = "async_method" if is_async else "method"
@@ -614,176 +1039,189 @@ def parse_blob(
                     decl_end=node.end_byte,
                     body_node=body_n,
                 )
-                if sym is not None and body_n is not None:
-                    for ch in body_n.children:
-                        walk_python(ch, sym, [*scope, sym.name])
-                return
+                if sym is not None:
+                    emit_declaration_edges(sym.id, node, node)
+                    if body_n is not None:
+                        _push_children(stack, body_n.children, sym, [*scope, sym.name])
+                continue
 
-        if node.type in ("function_definition", "class_definition"):
-            name_n = node.child_by_field_name("name")
-            body_n = node.child_by_field_name("body")
-            is_async = any(c.type == "async" for c in node.children)
-            if node.type == "class_definition":
-                skind = "class"
-            elif parent_sym is not None and parent_sym.kind == "class":
-                skind = "async_method" if is_async else "method"
-            else:
-                skind = "async_function" if is_async else "function"
-            sym = add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=scope,
-                sym_kind=skind,
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=body_n,
-            )
-            if sym is not None and body_n is not None:
-                for ch in body_n.children:
-                    walk_python(ch, sym, [*scope, sym.name])
-            return
+            if node.type == "expression_statement" and parent_sym is None:
+                for ch in node.named_children:
+                    if ch.type == "assignment":
+                        left = ch.child_by_field_name("left")
+                        right = ch.child_by_field_name("right")
+                        if left is not None and left.type == "identifier":
+                            add_symbol(
+                                parent_id=None,
+                                scope_names=scope,
+                                sym_kind="variable",
+                                name_node=left,
+                                decl_start=node.start_byte,
+                                decl_end=node.end_byte,
+                                body_node=right,
+                                header_end_override=left.end_byte,
+                            )
 
-        if node.type == "expression_statement" and parent_sym is None:
-            # Check module-level assignment
-            for ch in node.named_children:
-                if ch.type == "assignment":
-                    left = ch.child_by_field_name("left")
-                    right = ch.child_by_field_name("right")
-                    if left is not None and left.type == "identifier":
-                        add_symbol(
-                            parent_id=None,
-                            scope_names=scope,
-                            sym_kind="variable",
-                            name_node=left,
-                            decl_start=node.start_byte,
-                            decl_end=node.end_byte,
-                            body_node=right,
-                            header_end_override=left.end_byte,
-                        )
-
-        if node.type == "assignment" and parent_sym is None and (node.parent is None or node.parent.type != "expression_statement"):
-            left = node.child_by_field_name("left")
-            right = node.child_by_field_name("right")
-            if left is not None and left.type == "identifier":
-                add_symbol(
-                    parent_id=None,
-                    scope_names=scope,
-                    sym_kind="variable",
-                    name_node=left,
-                    decl_start=node.start_byte,
-                    decl_end=node.end_byte,
-                    body_node=right,
-                    header_end_override=left.end_byte,
-                )
-
-        if node.type == "import_statement":
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                "import",
-                node.start_byte,
-                node.end_byte,
-            )
-        elif node.type == "import_from_statement":
-            has_rel = any(c.type == "relative_import" for c in node.children)
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                "relative_import" if has_rel else "import",
-                node.start_byte,
-                node.end_byte,
-            )
-        elif node.type == "call":
-            fn_node = node.child_by_field_name("function")
-            if fn_node is not None:
-                raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
-                if "." in raw_callee:
-                    recv, short_c = raw_callee.rsplit(".", 1)
-                    add_occurrence(
-                        parent_sym.id if parent_sym else None,
-                        "call",
-                        node.start_byte,
-                        node.end_byte,
-                        details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
-                    )
-                else:
-                    add_occurrence(
-                        parent_sym.id if parent_sym else None,
-                        "call",
-                        node.start_byte,
-                        node.end_byte,
-                        details={"callee": raw_callee, "raw_callee": raw_callee},
+            if node.type == "assignment" and parent_sym is None and (node.parent is None or node.parent.type != "expression_statement"):
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                if left is not None and left.type == "identifier":
+                    add_symbol(
+                        parent_id=None,
+                        scope_names=scope,
+                        sym_kind="variable",
+                        name_node=left,
+                        decl_start=node.start_byte,
+                        decl_end=node.end_byte,
+                        body_node=right,
+                        header_end_override=left.end_byte,
                     )
 
-        for ch in node.children:
-            check_deadline()
-            walk_python(ch, parent_sym, scope)
+            if node.type == "type" and parent_sym is not None:
+                # Nested `type` nodes (generics, unions) are covered by the outermost one. The walk still
+                # descends because annotations can hold real calls, such as `Annotated[int, Field(...)]`.
+                anc = node.parent
+                while anc is not None and anc.type not in ("type", "block", "module") and not anc.type.endswith("statement"):
+                    anc = anc.parent
+                if anc is None or anc.type != "type":
+                    emit_type_refs(parent_sym.id, [node])
 
-    def walk_js_ts(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
-        # Handle export_statement wrapping a declaration so display range includes export
-        if node.type == "export_statement":
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                "export",
-                node.start_byte,
-                node.end_byte,
-            )
-            decl = node.child_by_field_name("declaration")
-            if decl is not None:
-                _handle_js_ts_declaration(
-                    decl,
-                    outer_node=node,
-                    parent_sym=parent_sym,
-                    scope=scope,
-                )
-                return
-
-        if _handle_js_ts_declaration(node, outer_node=node, parent_sym=parent_sym, scope=scope):
-            return
-
-        if node.type == "import_statement":
-            raw_imp = blob_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
-            imp_kind = "type_import" if raw_imp.lstrip().startswith("import type") else "import"
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                imp_kind,
-                node.start_byte,
-                node.end_byte,
-            )
-        elif node.type == "call_expression":
-            fn_node = node.child_by_field_name("function")
-            if fn_node is not None:
-                raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
-                if "." in raw_callee:
-                    recv, short_c = raw_callee.rsplit(".", 1)
-                    add_occurrence(
-                        parent_sym.id if parent_sym else None,
-                        "call",
-                        node.start_byte,
-                        node.end_byte,
-                        details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
-                    )
-                else:
-                    add_occurrence(
-                        parent_sym.id if parent_sym else None,
-                        "call",
-                        node.start_byte,
-                        node.end_byte,
-                        details={"callee": raw_callee, "raw_callee": raw_callee},
-                    )
-        elif node.type in ("jsx_opening_element", "jsx_self_closing_element"):
-            name_n = node.child_by_field_name("name")
-            if name_n is not None:
-                comp = blob_bytes[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace").strip()
+            if node.type == "import_statement":
                 add_occurrence(
                     parent_sym.id if parent_sym else None,
-                    "jsx_component",
+                    "import",
                     node.start_byte,
                     node.end_byte,
-                    details={"component": comp},
                 )
+            elif node.type == "import_from_statement":
+                has_rel = any(c.type == "relative_import" for c in node.children)
+                add_occurrence(
+                    parent_sym.id if parent_sym else None,
+                    "relative_import" if has_rel else "import",
+                    node.start_byte,
+                    node.end_byte,
+                )
+                mod_n = node.child_by_field_name("module_name")
+                for name_n in node.children_by_field_name("name") if mod_n is not None else []:
+                    orig_n = name_n.child_by_field_name("name") if name_n.type == "aliased_import" else name_n
+                    alias_n = name_n.child_by_field_name("alias") if name_n.type == "aliased_import" else name_n
+                    if orig_n is not None and alias_n is not None:
+                        emit_import(parent_sym.id if parent_sym else None, name_n, text_of(mod_n), text_of(orig_n), text_of(alias_n))
+            elif node.type == "call":
+                fn_node = node.child_by_field_name("function")
+                if fn_node is not None:
+                    raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
+                    if "." in raw_callee:
+                        recv, short_c = raw_callee.rsplit(".", 1)
+                        add_occurrence(
+                            parent_sym.id if parent_sym else None,
+                            "call",
+                            node.start_byte,
+                            node.end_byte,
+                            details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
+                        )
+                    else:
+                        add_occurrence(
+                            parent_sym.id if parent_sym else None,
+                            "call",
+                            node.start_byte,
+                            node.end_byte,
+                            details={"callee": raw_callee, "raw_callee": raw_callee},
+                        )
 
-        for ch in node.children:
-            check_deadline()
-            walk_js_ts(ch, parent_sym, scope)
+            _push_children(stack, node.children, parent_sym, scope)
+
+    def walk_js_ts(root_node: Node) -> None:
+        # A non-None fourth item marks a variable declarator and carries the statement that owns its display range.
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str], Node | None]] = [(root_node, None, [], None)]
+        visited = 0
+        while stack:
+            node, parent_sym, scope, declarator_outer = stack.pop()
+            visited += 1
+            if visited % DEADLINE_CHECK_INTERVAL == 0:
+                check_deadline()
+            if declarator_outer is not None:
+                _handle_js_ts_declarator(node, declarator_outer, parent_sym, scope, stack)
+                continue
+
+            # The export keyword belongs to the declaration's display range.
+            if node.type == "export_statement":
+                add_occurrence(
+                    parent_sym.id if parent_sym else None,
+                    "export",
+                    node.start_byte,
+                    node.end_byte,
+                )
+                decl = node.child_by_field_name("declaration")
+                if decl is not None:
+                    _handle_js_ts_declaration(decl, outer_node=node, parent_sym=parent_sym, scope=scope, stack=stack)
+                    continue
+
+            if _handle_js_ts_declaration(node, outer_node=node, parent_sym=parent_sym, scope=scope, stack=stack):
+                continue
+
+            if node.type == "import_statement":
+                raw_imp = blob_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+                imp_kind = "type_import" if raw_imp.lstrip().startswith("import type") else "import"
+                add_occurrence(
+                    parent_sym.id if parent_sym else None,
+                    imp_kind,
+                    node.start_byte,
+                    node.end_byte,
+                )
+                src_n = node.child_by_field_name("source")
+                clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+                if src_n is not None and clause is not None:
+                    module = text_of(src_n).strip("'\"")
+                    enc_id = parent_sym.id if parent_sym else None
+                    for part in clause.named_children:
+                        if part.type == "identifier":
+                            emit_import(enc_id, part, module, text_of(part), text_of(part))
+                        elif part.type == "named_imports":
+                            for spec in part.named_children:
+                                orig_n = spec.child_by_field_name("name")
+                                if spec.type != "import_specifier" or orig_n is None:
+                                    continue
+                                alias_n = spec.child_by_field_name("alias") or orig_n
+                                emit_import(enc_id, spec, module, text_of(orig_n), text_of(alias_n))
+            elif node.type == "call_expression":
+                fn_node = node.child_by_field_name("function")
+                if fn_node is not None:
+                    raw_callee = blob_bytes[fn_node.start_byte : fn_node.end_byte].decode("utf-8", errors="replace").strip()
+                    if "." in raw_callee:
+                        recv, short_c = raw_callee.rsplit(".", 1)
+                        add_occurrence(
+                            parent_sym.id if parent_sym else None,
+                            "call",
+                            node.start_byte,
+                            node.end_byte,
+                            details={"callee": short_c.strip(), "raw_callee": raw_callee, "receiver": recv.strip()},
+                        )
+                    else:
+                        add_occurrence(
+                            parent_sym.id if parent_sym else None,
+                            "call",
+                            node.start_byte,
+                            node.end_byte,
+                            details={"callee": raw_callee, "raw_callee": raw_callee},
+                        )
+            elif node.type in ("jsx_opening_element", "jsx_self_closing_element"):
+                name_n = node.child_by_field_name("name")
+                if name_n is not None:
+                    comp = blob_bytes[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace").strip()
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "jsx_component",
+                        node.start_byte,
+                        node.end_byte,
+                        details={"component": comp},
+                    )
+            elif node.type == "type_annotation" and parent_sym is not None:
+                # Function types nest further annotations; this outermost one already covers them.
+                emit_type_refs(parent_sym.id, [node])
+                continue
+
+            stack.extend((ch, parent_sym, scope, None) for ch in reversed(node.children))
 
     def _handle_js_ts_declaration(
         decl: Node,
@@ -791,6 +1229,7 @@ def parse_blob(
         outer_node: Node,
         parent_sym: ExtractedSymbol | None,
         scope: list[str],
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str], Node | None]],
     ) -> bool:
         dtype = decl.type
         if dtype in (
@@ -837,199 +1276,225 @@ def parse_blob(
                 decl_end=outer_node.end_byte,
                 body_node=body_n,
             )
+            if sym is not None:
+                emit_declaration_edges(sym.id, decl, outer_node)
             target_walk = body_n if body_n is not None else decl
             next_sym = sym if sym is not None else parent_sym
             next_scope = [*scope, sym.name] if sym is not None else scope
-            for ch in target_walk.children:
-                walk_js_ts(ch, next_sym, next_scope)
+            stack.extend((ch, next_sym, next_scope, None) for ch in reversed(target_walk.children))
             return True
 
         if dtype in ("lexical_declaration", "variable_declaration"):
             declarators = [c for c in decl.named_children if c.type == "variable_declarator"]
-            for idx, vdecl in enumerate(declarators):
-                name_n = vdecl.child_by_field_name("name")
-                val_n = vdecl.child_by_field_name("value")
-                if name_n is not None and name_n.type == "identifier":
-                    is_fn = val_n is not None and val_n.type in (
-                        "arrow_function",
-                        "function_expression",
-                        "function",
-                        "generator_function",
-                    )
-                    skind = "function" if is_fn else "variable"
-                    body_n = (
-                        val_n.child_by_field_name("body")
-                        if is_fn and val_n is not None
-                        else val_n
-                    )
-                    d_start = outer_node.start_byte if len(declarators) == 1 and idx == 0 else vdecl.start_byte
-                    d_end = outer_node.end_byte if len(declarators) == 1 and idx == 0 else vdecl.end_byte
-                    sym = add_symbol(
-                        parent_id=parent_sym.id if parent_sym else None,
-                        scope_names=scope,
-                        sym_kind=skind,
-                        name_node=name_n,
-                        decl_start=d_start,
-                        decl_end=d_end,
-                        body_node=body_n,
-                        header_end_override=name_n.end_byte,
-                    )
-                    if val_n is not None:
-                        next_sym = sym if sym is not None else parent_sym
-                        next_scope = [*scope, sym.name] if sym is not None else scope
-                        for ch in val_n.children:
-                            walk_js_ts(ch, next_sym, next_scope)
+            stack.extend((vdecl, parent_sym, scope, outer_node) for vdecl in reversed(declarators))
             return True
 
         return False
 
-    def walk_kotlin_java(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
-        ntype = node.type
-        if ntype in (
-            "class_declaration",
-            "object_declaration",
-            "interface_declaration",
-            "enum_declaration",
-            "function_declaration",
-            "method_declaration",
-            "constructor_declaration",
-        ):
-            name_n = node.child_by_field_name("name")
-            if name_n is None:
-                for ch in node.named_children:
-                    if ch.type in ("identifier", "type_identifier"):
-                        name_n = ch
-                        break
-            body_n = node.child_by_field_name("body")
-            if body_n is None:
-                for ch in node.named_children:
-                    if ch.type in ("class_body", "function_body", "enum_class_body", "block"):
-                        body_n = ch
-                        break
-
-            kind_map = {
-                "class_declaration": "class",
-                "object_declaration": "class",
-                "interface_declaration": "interface",
-                "enum_declaration": "enum",
-                "function_declaration": "method" if parent_sym is not None else "function",
-                "method_declaration": "method",
-                "constructor_declaration": "method",
-            }
-            sym = add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=scope,
-                sym_kind=kind_map[ntype],
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=body_n,
-            )
-            target_walk = body_n if body_n is not None else node
+    def _handle_js_ts_declarator(
+        vdecl: Node,
+        outer_node: Node,
+        parent_sym: ExtractedSymbol | None,
+        scope: list[str],
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str], Node | None]],
+    ) -> None:
+        name_n = vdecl.child_by_field_name("name")
+        val_n = vdecl.child_by_field_name("value")
+        if name_n is None or name_n.type != "identifier":
+            return
+        is_fn = val_n is not None and val_n.type in (
+            "arrow_function",
+            "function_expression",
+            "function",
+            "generator_function",
+        )
+        skind = "function" if is_fn else "variable"
+        body_n = (
+            val_n.child_by_field_name("body")
+            if is_fn and val_n is not None
+            else val_n
+        )
+        siblings = [c for c in vdecl.parent.named_children if c.type == "variable_declarator"] if vdecl.parent else [vdecl]
+        single = len(siblings) == 1
+        d_start = outer_node.start_byte if single else vdecl.start_byte
+        d_end = outer_node.end_byte if single else vdecl.end_byte
+        sym = add_symbol(
+            parent_id=parent_sym.id if parent_sym else None,
+            scope_names=scope,
+            sym_kind=skind,
+            name_node=name_n,
+            decl_start=d_start,
+            decl_end=d_end,
+            body_node=body_n,
+            header_end_override=name_n.end_byte,
+        )
+        if val_n is not None:
             next_sym = sym if sym is not None else parent_sym
             next_scope = [*scope, sym.name] if sym is not None else scope
-            for ch in target_walk.children:
-                walk_kotlin_java(ch, next_sym, next_scope)
-            return
+            stack.extend((ch, next_sym, next_scope, None) for ch in reversed(val_n.children))
 
-        if language == "kotlin" and ntype == "property_declaration" and parent_sym is not None and parent_sym.kind == "class":
-            variable = next((c for c in node.named_children if c.type == "variable_declaration"), None)
-            if variable is not None and variable.named_children:
-                type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
-                if type_node is not None:
-                    name_node = variable.named_children[0]
-                    add_occurrence(parent_sym.id, "property_type", node.start_byte, node.end_byte,
-                                   details={"name": blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8"),
-                                            "type": blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?")})
-        if ntype in ("import", "import_declaration"):
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                "import",
-                node.start_byte,
-                node.end_byte,
-            )
-        elif ntype in ("call_expression", "method_invocation"):
-            name_n = node.child_by_field_name("name")
-            recv_str: str | None = None
-            obj_n = node.child_by_field_name("object")
-            if obj_n is not None:
-                recv_str = blob_bytes[obj_n.start_byte : obj_n.end_byte].decode("utf-8", errors="replace").strip()
-            if name_n is None and node.named_children:
-                first_ch = node.named_children[0]
-                if first_ch.type == "navigation_expression" and first_ch.named_children:
-                    name_n = first_ch.named_children[-1]
-                    if len(first_ch.named_children) >= 2:
-                        r_n = first_ch.named_children[0]
-                        recv_str = blob_bytes[r_n.start_byte : r_n.end_byte].decode("utf-8", errors="replace").strip()
-                elif first_ch.type == "identifier":
-                    name_n = first_ch
-            if name_n is not None:
-                callee = blob_bytes[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace").strip()
-                # Extract top-level Gradle Kotlin DSL blocks (`plugins`, `android`, `dependencies`, `buildTypes`, etc.) as symbols
-                gradle_blocks = {
-                    "plugins",
-                    "android",
-                    "dependencies",
-                    "defaultConfig",
-                    "buildTypes",
-                    "buildFeatures",
-                    "pluginManagement",
-                    "dependencyResolutionManagement",
+    def walk_kotlin_java(root_node: Node) -> None:
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str]]] = [(root_node, None, [])]
+        visited = 0
+        while stack:
+            node, parent_sym, scope = stack.pop()
+            visited += 1
+            if visited % DEADLINE_CHECK_INTERVAL == 0:
+                check_deadline()
+            ntype = node.type
+            if ntype in (
+                "class_declaration",
+                "object_declaration",
+                "interface_declaration",
+                "enum_declaration",
+                "function_declaration",
+                "method_declaration",
+                "constructor_declaration",
+            ):
+                name_n = node.child_by_field_name("name")
+                if name_n is None:
+                    for ch in node.named_children:
+                        if ch.type in ("identifier", "type_identifier"):
+                            name_n = ch
+                            break
+                body_n = node.child_by_field_name("body")
+                if body_n is None:
+                    for ch in node.named_children:
+                        if ch.type in ("class_body", "function_body", "enum_class_body", "block"):
+                            body_n = ch
+                            break
+
+                kind_map = {
+                    "class_declaration": "class",
+                    "object_declaration": "class",
+                    "interface_declaration": "interface",
+                    "enum_declaration": "enum",
+                    "function_declaration": "method" if parent_sym is not None else "function",
+                    "method_declaration": "method",
+                    "constructor_declaration": "method",
                 }
-                lambda_body = next(
-                    (c for c in node.named_children if c.type in ("annotated_lambda", "lambda_literal", "call_suffix")),
-                    None,
+                sym = add_symbol(
+                    parent_id=parent_sym.id if parent_sym else None,
+                    scope_names=scope,
+                    sym_kind=kind_map[ntype],
+                    name_node=name_n,
+                    decl_start=node.start_byte,
+                    decl_end=node.end_byte,
+                    body_node=body_n,
                 )
-                if language == "kotlin" and callee in gradle_blocks and lambda_body is not None:
-                    sym = add_symbol(
-                        parent_id=parent_sym.id if parent_sym else None,
-                        scope_names=scope,
-                        sym_kind="namespace",
-                        name_node=name_n,
-                        decl_start=node.start_byte,
-                        decl_end=node.end_byte,
-                        body_node=lambda_body,
-                    )
-                    next_sym = sym if sym is not None else parent_sym
-                    next_scope = [*scope, sym.name] if sym is not None else scope
-                    for ch in lambda_body.children:
-                        walk_kotlin_java(ch, next_sym, next_scope)
-                    return
+                if sym is not None:
+                    emit_declaration_edges(sym.id, node, node)
+                target_walk = body_n if body_n is not None else node
+                next_sym = sym if sym is not None else parent_sym
+                next_scope = [*scope, sym.name] if sym is not None else scope
+                _push_children(stack, target_walk.children, next_sym, next_scope)
+                continue
 
-                det_dict: dict[str, Any] = {"callee": callee}
-                if recv_str:
-                    det_dict["receiver"] = recv_str
-                    if language == "kotlin":
-                        ancestor = node.parent
-                        while ancestor is not None and ancestor.type != "function_declaration" and "receiver_type" not in det_dict:
-                            for declaration in reversed(ancestor.named_children):
-                                if declaration.type != "property_declaration":
-                                    continue
-                                if ancestor.type != "class_body" and declaration.start_byte >= node.start_byte:
-                                    continue
-                                variable = next((c for c in declaration.named_children if c.type == "variable_declaration"), None)
-                                if variable is None or not variable.named_children:
-                                    continue
-                                name_node = variable.named_children[0]
-                                var_name = blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8")
-                                if var_name != re.split(r"[?.!]", recv_str)[0]:
-                                    continue
-                                type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
-                                # An untyped local still shadows a typed parameter or field.
-                                det_dict["receiver_type"] = blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?") if type_node else ""
-                                break
-                            ancestor = ancestor.parent
+            if ntype in ("property_declaration", "call_expression"):
+                # These branches scan siblings and ancestors, so their cost is not bounded by the node count.
+                check_deadline()
+            if language == "kotlin" and ntype == "property_declaration" and parent_sym is not None:
+                variable = next((c for c in node.named_children if c.type == "variable_declaration"), None)
+                if variable is not None and variable.named_children:
+                    type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
+                    if type_node is not None:
+                        emit_type_refs(parent_sym.id, [type_node])
+                        if parent_sym.kind == "class":
+                            name_node = variable.named_children[0]
+                            add_occurrence(parent_sym.id, "property_type", node.start_byte, node.end_byte,
+                                           details={"name": blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8"),
+                                                    "type": blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?")})
+            if language == "java" and ntype in ("field_declaration", "local_variable_declaration") and parent_sym is not None:
+                type_node = node.child_by_field_name("type")
+                if type_node is not None:
+                    emit_type_refs(parent_sym.id, [type_node])
+            if ntype in ("import", "import_declaration"):
                 add_occurrence(
                     parent_sym.id if parent_sym else None,
-                    "call",
+                    "import",
                     node.start_byte,
                     node.end_byte,
-                    details=det_dict,
                 )
+                emit_qualified_import(parent_sym.id if parent_sym else None, node)
+            elif ntype in ("call_expression", "method_invocation"):
+                name_n = node.child_by_field_name("name")
+                recv_str: str | None = None
+                obj_n = node.child_by_field_name("object")
+                if obj_n is not None:
+                    recv_str = blob_bytes[obj_n.start_byte : obj_n.end_byte].decode("utf-8", errors="replace").strip()
+                if name_n is None and node.named_children:
+                    first_ch = node.named_children[0]
+                    if first_ch.type == "navigation_expression" and first_ch.named_children:
+                        name_n = first_ch.named_children[-1]
+                        if len(first_ch.named_children) >= 2:
+                            r_n = first_ch.named_children[0]
+                            recv_str = blob_bytes[r_n.start_byte : r_n.end_byte].decode("utf-8", errors="replace").strip()
+                    elif first_ch.type == "identifier":
+                        name_n = first_ch
+                if name_n is not None:
+                    callee = blob_bytes[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace").strip()
+                    # Gradle Kotlin DSL blocks (`plugins`, `android`, ...) act as named sections, so they become symbols.
+                    gradle_blocks = {
+                        "plugins",
+                        "android",
+                        "dependencies",
+                        "defaultConfig",
+                        "buildTypes",
+                        "buildFeatures",
+                        "pluginManagement",
+                        "dependencyResolutionManagement",
+                    }
+                    lambda_body = next(
+                        (c for c in node.named_children if c.type in ("annotated_lambda", "lambda_literal", "call_suffix")),
+                        None,
+                    )
+                    if language == "kotlin" and callee in gradle_blocks and lambda_body is not None:
+                        sym = add_symbol(
+                            parent_id=parent_sym.id if parent_sym else None,
+                            scope_names=scope,
+                            sym_kind="namespace",
+                            name_node=name_n,
+                            decl_start=node.start_byte,
+                            decl_end=node.end_byte,
+                            body_node=lambda_body,
+                        )
+                        next_sym = sym if sym is not None else parent_sym
+                        next_scope = [*scope, sym.name] if sym is not None else scope
+                        _push_children(stack, lambda_body.children, next_sym, next_scope)
+                        continue
 
-        for ch in node.children:
-            check_deadline()
-            walk_kotlin_java(ch, parent_sym, scope)
+                    det_dict: dict[str, Any] = {"callee": callee}
+                    if recv_str:
+                        det_dict["receiver"] = recv_str
+                        if language == "kotlin":
+                            ancestor = node.parent
+                            while ancestor is not None and ancestor.type != "function_declaration" and "receiver_type" not in det_dict:
+                                for declaration in reversed(ancestor.named_children):
+                                    if declaration.type != "property_declaration":
+                                        continue
+                                    if ancestor.type != "class_body" and declaration.start_byte >= node.start_byte:
+                                        continue
+                                    variable = next((c for c in declaration.named_children if c.type == "variable_declaration"), None)
+                                    if variable is None or not variable.named_children:
+                                        continue
+                                    name_node = variable.named_children[0]
+                                    var_name = blob_bytes[name_node.start_byte : name_node.end_byte].decode("utf-8")
+                                    if var_name != re.split(r"[?.!]", recv_str)[0]:
+                                        continue
+                                    type_node = next((c for c in variable.named_children if c.type in ("user_type", "nullable_type")), None)
+                                    # An untyped local still shadows a typed parameter or field.
+                                    det_dict["receiver_type"] = blob_bytes[type_node.start_byte : type_node.end_byte].decode("utf-8").rstrip("?") if type_node else ""
+                                    break
+                                ancestor = ancestor.parent
+                    add_occurrence(
+                        parent_sym.id if parent_sym else None,
+                        "call",
+                        node.start_byte,
+                        node.end_byte,
+                        details=det_dict,
+                    )
+
+            _push_children(stack, node.children, parent_sym, scope)
 
     def _find_c_declarator_name(decl: Node | None) -> Node | None:
         cur = decl
@@ -1055,171 +1520,169 @@ def parse_blob(
             cur = found
         return None
 
-    def walk_go_rust_c_cpp(node: Node, parent_sym: ExtractedSymbol | None, scope: list[str]) -> None:
-        ntype = node.type
+    def walk_go_rust_c_cpp(root_node: Node) -> None:
+        stack: list[tuple[Node, ExtractedSymbol | None, list[str]]] = [(root_node, None, [])]
+        visited = 0
+        while stack:
+            node, parent_sym, scope = stack.pop()
+            visited += 1
+            if visited % DEADLINE_CHECK_INTERVAL == 0:
+                check_deadline()
+            ntype = node.type
 
-        # Go type_spec (`type Foo struct{}` / `type Bar interface{}`)
-        if language == "go" and ntype == "type_spec":
-            name_n = node.child_by_field_name("name")
-            type_n = node.child_by_field_name("type")
-            skind = "interface" if (type_n is not None and type_n.type == "interface_type") else "class"
-            add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=scope,
-                sym_kind=skind,
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=type_n,
-            )
-            return
+            if language == "go" and ntype == "type_spec":
+                name_n = node.child_by_field_name("name")
+                type_n = node.child_by_field_name("type")
+                skind = "interface" if (type_n is not None and type_n.type == "interface_type") else "class"
+                add_symbol(
+                    parent_id=parent_sym.id if parent_sym else None,
+                    scope_names=scope,
+                    sym_kind=skind,
+                    name_node=name_n,
+                    decl_start=node.start_byte,
+                    decl_end=node.end_byte,
+                    body_node=type_n,
+                )
+                continue
 
-        # Go method_declaration with receiver type
-        if language == "go" and ntype == "method_declaration":
-            name_n = node.child_by_field_name("name")
-            body_n = node.child_by_field_name("body")
-            recv_n = node.child_by_field_name("receiver")
-            recv_type_name: str | None = None
-            if recv_n is not None:
-                for ch in recv_n.named_children:
-                    t_node = ch.child_by_field_name("type")
-                    if t_node is not None:
-                        recv_type_name = (
-                            blob_bytes[t_node.start_byte : t_node.end_byte]
-                            .decode("utf-8", errors="replace")
-                            .lstrip("*")
-                            .strip()
+            # Go methods are scoped under their receiver type, which lives outside the method body.
+            if language == "go" and ntype == "method_declaration":
+                name_n = node.child_by_field_name("name")
+                body_n = node.child_by_field_name("body")
+                recv_n = node.child_by_field_name("receiver")
+                recv_type_name: str | None = None
+                if recv_n is not None:
+                    for ch in recv_n.named_children:
+                        t_node = ch.child_by_field_name("type")
+                        if t_node is not None:
+                            recv_type_name = (
+                                blob_bytes[t_node.start_byte : t_node.end_byte]
+                                .decode("utf-8", errors="replace")
+                                .lstrip("*")
+                                .strip()
+                            )
+                            break
+                m_scope = [*scope, recv_type_name] if recv_type_name else scope
+                sym = add_symbol(
+                    parent_id=parent_sym.id if parent_sym else None,
+                    scope_names=m_scope,
+                    sym_kind="method",
+                    name_node=name_n,
+                    decl_start=node.start_byte,
+                    decl_end=node.end_byte,
+                    body_node=body_n,
+                )
+                if body_n is not None:
+                    _push_children(stack, body_n.children, sym or parent_sym, [*m_scope, sym.name] if sym else m_scope)
+                continue
+
+            # A Rust `impl` block is not a symbol itself; it only scopes the methods inside it.
+            if language == "rust" and ntype == "impl_item":
+                type_n = node.child_by_field_name("type")
+                body_n = node.child_by_field_name("body")
+                impl_name = (
+                    blob_bytes[type_n.start_byte : type_n.end_byte].decode("utf-8", errors="replace").strip()
+                    if type_n is not None
+                    else None
+                )
+                next_scope = [*scope, impl_name] if impl_name else scope
+                if body_n is not None:
+                    _push_children(stack, body_n.children, parent_sym, next_scope)
+                continue
+
+            if language in ("c", "cpp") and ntype == "function_definition":
+                decl_n = node.child_by_field_name("declarator")
+                name_n = _find_c_declarator_name(decl_n)
+                body_n = node.child_by_field_name("body")
+                skind = "method" if (parent_sym is not None and parent_sym.kind == "class") else "function"
+                sym = add_symbol(
+                    parent_id=parent_sym.id if parent_sym else None,
+                    scope_names=scope,
+                    sym_kind=skind,
+                    name_node=name_n,
+                    decl_start=node.start_byte,
+                    decl_end=node.end_byte,
+                    body_node=body_n,
+                    header_end_override=body_n.start_byte if body_n is not None else node.end_byte,
+                )
+                if body_n is not None:
+                    _push_children(stack, body_n.children, sym or parent_sym, [*scope, sym.name] if sym else scope)
+                continue
+
+            if ntype in (
+                "function_declaration",
+                "function_item",
+                "struct_item",
+                "enum_item",
+                "trait_item",
+                "struct_specifier",
+                "class_specifier",
+                "enum_specifier",
+                "namespace_definition",
+            ):
+                name_n = node.child_by_field_name("name")
+                body_n = node.child_by_field_name("body")
+                if ntype in ("struct_specifier", "class_specifier", "enum_specifier") and body_n is None:
+                    # A forward declaration has no body and defines nothing.
+                    continue
+                kind_map = {
+                    "function_declaration": "function",
+                    "function_item": "method" if scope else "function",
+                    "struct_item": "class",
+                    "enum_item": "enum",
+                    "trait_item": "interface",
+                    "struct_specifier": "class",
+                    "class_specifier": "class",
+                    "enum_specifier": "enum",
+                    "namespace_definition": "namespace",
+                }
+                sym = add_symbol(
+                    parent_id=parent_sym.id if parent_sym else None,
+                    scope_names=scope,
+                    sym_kind=kind_map[ntype],
+                    name_node=name_n,
+                    decl_start=node.start_byte,
+                    decl_end=node.end_byte,
+                    body_node=body_n,
+                )
+                target_walk = body_n if body_n is not None else node
+                next_sym = sym if sym is not None else parent_sym
+                next_scope = [*scope, sym.name] if sym is not None else scope
+                _push_children(stack, target_walk.children, next_sym, next_scope)
+                continue
+
+            if ntype in ("import_declaration", "use_declaration", "preproc_include"):
+                add_occurrence(
+                    parent_sym.id if parent_sym else None,
+                    "import",
+                    node.start_byte,
+                    node.end_byte,
+                )
+            elif ntype == "call_expression":
+                fn_n = node.child_by_field_name("function")
+                if fn_n is not None:
+                    raw_callee = blob_bytes[fn_n.start_byte : fn_n.end_byte].decode("utf-8", errors="replace").strip()
+                    # Calls resolve by their last name segment; `.`, `::` and `->` all qualify it.
+                    callee = re.split(r"(?:\.|::|->)", raw_callee)[-1].strip()
+                    if callee:
+                        add_occurrence(
+                            parent_sym.id if parent_sym else None,
+                            "call",
+                            node.start_byte,
+                            node.end_byte,
+                            details={"callee": callee, "raw_callee": raw_callee},
                         )
-                        break
-            m_scope = [*scope, recv_type_name] if recv_type_name else scope
-            sym = add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=m_scope,
-                sym_kind="method",
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=body_n,
-            )
-            if body_n is not None:
-                for ch in body_n.children:
-                    walk_go_rust_c_cpp(ch, sym or parent_sym, [*m_scope, sym.name] if sym else m_scope)
-            return
 
-        # Rust impl_item (`impl Foo { ... }`)
-        if language == "rust" and ntype == "impl_item":
-            type_n = node.child_by_field_name("type")
-            body_n = node.child_by_field_name("body")
-            impl_name = (
-                blob_bytes[type_n.start_byte : type_n.end_byte].decode("utf-8", errors="replace").strip()
-                if type_n is not None
-                else None
-            )
-            next_scope = [*scope, impl_name] if impl_name else scope
-            if body_n is not None:
-                for ch in body_n.children:
-                    walk_go_rust_c_cpp(ch, parent_sym, next_scope)
-            return
-
-        # C/C++ function_definition
-        if language in ("c", "cpp") and ntype == "function_definition":
-            decl_n = node.child_by_field_name("declarator")
-            name_n = _find_c_declarator_name(decl_n)
-            body_n = node.child_by_field_name("body")
-            skind = "method" if (parent_sym is not None and parent_sym.kind == "class") else "function"
-            sym = add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=scope,
-                sym_kind=skind,
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=body_n,
-                header_end_override=body_n.start_byte if body_n is not None else node.end_byte,
-            )
-            if body_n is not None:
-                for ch in body_n.children:
-                    walk_go_rust_c_cpp(ch, sym or parent_sym, [*scope, sym.name] if sym else scope)
-            return
-
-        # Structs, classes, traits, enums, namespaces, Go/Rust functions
-        if ntype in (
-            "function_declaration",
-            "function_item",
-            "struct_item",
-            "enum_item",
-            "trait_item",
-            "struct_specifier",
-            "class_specifier",
-            "enum_specifier",
-            "namespace_definition",
-        ):
-            name_n = node.child_by_field_name("name")
-            body_n = node.child_by_field_name("body")
-            if ntype in ("struct_specifier", "class_specifier", "enum_specifier") and body_n is None:
-                # Forward declaration without body
-                return
-            kind_map = {
-                "function_declaration": "function",
-                "function_item": "method" if scope else "function",
-                "struct_item": "class",
-                "enum_item": "enum",
-                "trait_item": "interface",
-                "struct_specifier": "class",
-                "class_specifier": "class",
-                "enum_specifier": "enum",
-                "namespace_definition": "namespace",
-            }
-            sym = add_symbol(
-                parent_id=parent_sym.id if parent_sym else None,
-                scope_names=scope,
-                sym_kind=kind_map[ntype],
-                name_node=name_n,
-                decl_start=node.start_byte,
-                decl_end=node.end_byte,
-                body_node=body_n,
-            )
-            target_walk = body_n if body_n is not None else node
-            next_sym = sym if sym is not None else parent_sym
-            next_scope = [*scope, sym.name] if sym is not None else scope
-            for ch in target_walk.children:
-                walk_go_rust_c_cpp(ch, next_sym, next_scope)
-            return
-
-        if ntype in ("import_declaration", "use_declaration", "preproc_include"):
-            add_occurrence(
-                parent_sym.id if parent_sym else None,
-                "import",
-                node.start_byte,
-                node.end_byte,
-            )
-        elif ntype == "call_expression":
-            fn_n = node.child_by_field_name("function")
-            if fn_n is not None:
-                raw_callee = blob_bytes[fn_n.start_byte : fn_n.end_byte].decode("utf-8", errors="replace").strip()
-                # Extract trailing identifier after `.` or `::` or `->`
-                callee = re.split(r"(?:\.|::|->)", raw_callee)[-1].strip()
-                if callee:
-                    add_occurrence(
-                        parent_sym.id if parent_sym else None,
-                        "call",
-                        node.start_byte,
-                        node.end_byte,
-                        details={"callee": callee, "raw_callee": raw_callee},
-                    )
-
-        for ch in node.children:
-            check_deadline()
-            walk_go_rust_c_cpp(ch, parent_sym, scope)
+            _push_children(stack, node.children, parent_sym, scope)
 
     if language == "python":
-        walk_python(root, None, [])
+        walk_python(root)
     elif language in ("kotlin", "java"):
-        walk_kotlin_java(root, None, [])
+        walk_kotlin_java(root)
     elif language in ("go", "rust", "c", "cpp"):
-        walk_go_rust_c_cpp(root, None, [])
+        walk_go_rust_c_cpp(root)
     else:
-        walk_js_ts(root, None, [])
+        walk_js_ts(root)
 
     # Resolve same-file lexical call candidates where a named definition exists
     symbols_by_id = {s.id: s for s in symbols}
@@ -1276,8 +1739,10 @@ def index_blob_into_store(
     blob_oid: str,
     blob_bytes: bytes,
     language: str,
+    parsed: ParseResult | None = None,
 ) -> tuple[ParseResult, bool]:
     """Ensure `(blob_oid, language, extractor_fingerprint)` is extracted in `extractions` and `symbols`.
+    `parsed` is a result already computed off this thread; it is used only when the store has no extraction yet.
     Returns `(parse_result, was_cache_hit)`.
     """
     fp = get_extractor_fingerprint(language)
@@ -1330,7 +1795,7 @@ def index_blob_into_store(
             True,
         )
 
-    res = parse_blob(blob_bytes, language, fp, blob_oid=blob_oid)
+    res = parsed if parsed is not None else parse_blob(blob_bytes, language, fp, blob_oid=blob_oid)
     conn.execute(
         """
         INSERT INTO extractions (id, blob_oid, language, extractor_fingerprint, state, diagnostics_json)
@@ -1455,6 +1920,54 @@ def index_blob_into_store(
     return res, False
 
 
+def _parse_pending_blobs(
+    store: Store,
+    rows: list[sqlite3.Row],
+    blob_payloads: dict[str, tuple[int, bytes] | None],
+) -> tuple[dict[str, ParseResult], set[str]]:
+    """Parse the uncached blobs behind `rows` on a thread pool.
+    Returns `(parsed, unparsed)`, both keyed by `"<blob_oid>:<language>"`. `unparsed` holds jobs cut off by the
+    sync deadline. Small batches return two empty values and the caller parses inline.
+    No SQLite connection leaves this thread.
+    """
+    jobs: dict[str, tuple[str, str, bytes]] = {}
+    for row in rows:
+        oid = str(row["blob_oid"])
+        lang = detect_language_for_path(bytes(row["path"]))
+        payload = blob_payloads.get(oid)
+        if lang is not None and payload is not None:
+            jobs.setdefault(f"{oid}:{lang}", (oid, lang, payload[1]))
+    if len(jobs) < PARALLEL_PARSE_MIN_BLOBS:
+        return {}, set()
+    with store.connect_read() as r_conn:
+        for key, (oid, lang, _) in list(jobs.items()):
+            ext_id = make_extraction_id(blob_oid=oid, language=lang, extractor_fingerprint=get_extractor_fingerprint(lang))
+            if r_conn.execute("SELECT 1 FROM extractions WHERE id = ?", (ext_id,)).fetchone():
+                del jobs[key]
+    if len(jobs) < PARALLEL_PARSE_MIN_BLOBS:
+        return {}, set()
+    parsed: dict[str, ParseResult] = {}
+    with ThreadPoolExecutor(max_workers=PARSE_WORKERS) as pool:
+        # Pool threads do not inherit context variables, and the sync deadline lives in one.
+        futures = {
+            key: pool.submit(contextvars.copy_context().run, parse_blob, data, lang, blob_oid=oid)
+            for key, (oid, lang, data) in jobs.items()
+        }
+        try:
+            for key, future in futures.items():
+                try:
+                    parsed[key] = future.result()
+                except (SyncDeadlineExceeded, CancelledError):
+                    # Keep finished results so the caller can checkpoint them; a stuck batch would never progress.
+                    for pending in futures.values():
+                        pending.cancel()
+        except BaseException:
+            for pending in futures.values():
+                pending.cancel()
+            raise
+    return parsed, set(jobs) - set(parsed)
+
+
 def index_active_snapshot_files(
     store: Store,
     mirror: GitMirror,
@@ -1493,127 +2006,139 @@ def index_active_snapshot_files(
     # Keep one reader open and checkpoint each file before starting the next.
     blob_payloads: dict[str, tuple[int, bytes] | None] = {}
     with mirror.open_batch_session() as batch:
-        for row in pending_rows:
-            check_deadline()
-            oid = str(row["blob_oid"])
-            if oid not in blob_payloads:
-                obj = batch.read_object(oid)
-                blob_payloads[oid] = None if obj is None else (obj[1], obj[2])
-            with store.write_transaction(bump_generation=True) as conn:
-                path_bytes = bytes(row["path"])
-                blob_oid = str(row["blob_oid"])
-                disp_path, path_b64 = path_bytes_to_display(path_bytes)
-                payload = blob_payloads.get(blob_oid)
-
-                if payload is None:
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    Store.upsert_gap(
-                        conn,
-                        repository_id=repo_id,
-                        code="MISSING_GIT_OBJECT",
-                        scope=f"blob:{blob_oid}",
-                        message=f"Git blob {blob_oid[:12]} for {disp_path} is missing from object store.",
-                        retryable=True,
-                    )
+        for chunk_start in range(0, len(pending_rows), PARSE_BATCH_SIZE):
+            chunk = pending_rows[chunk_start : chunk_start + PARSE_BATCH_SIZE]
+            for row in chunk:
+                check_deadline()
+                oid = str(row["blob_oid"])
+                if oid not in blob_payloads:
+                    obj = batch.read_object(oid)
+                    blob_payloads[oid] = None if obj is None else (obj[1], obj[2])
+            parsed_ahead, unparsed = _parse_pending_blobs(store, chunk, blob_payloads)
+            for row in chunk:
+                if f"{row['blob_oid']}:{detect_language_for_path(bytes(row['path']))}" in unparsed:
                     continue
+                # After a pooled parse every remaining write is cheap, so finish them before honouring the deadline.
+                if not parsed_ahead and not unparsed:
+                    check_deadline()
+                with store.write_transaction(bump_generation=True) as conn:
+                    path_bytes = bytes(row["path"])
+                    blob_oid = str(row["blob_oid"])
+                    disp_path, path_b64 = path_bytes_to_display(path_bytes)
+                    payload = blob_payloads.get(blob_oid)
 
-                size, raw_bytes = payload
-                if is_lfs_pointer(raw_bytes):
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    Store.upsert_gap(
-                        conn,
-                        repository_id=repo_id,
-                        code="LFS_CONTENT_NOT_FETCHED",
-                        scope=f"blob:{blob_oid}",
-                        message=f"File {disp_path} is a Git LFS pointer; external asset content was not fetched.",
-                        retryable=False,
-                    )
-                    continue
-
-                if size > MAX_PARSE_BYTES:
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    Store.upsert_gap(
-                        conn,
-                        repository_id=repo_id,
-                        code="BLOB_TOO_LARGE",
-                        scope=f"blob:{blob_oid}",
-                        message=f"File {disp_path} ({size} bytes) exceeds the 2 MiB limit.",
-                        retryable=False,
-                    )
-                    continue
-
-                if b"\x00" in raw_bytes:
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    Store.upsert_gap(
-                        conn,
-                        repository_id=repo_id,
-                        code="BINARY_CONTENT",
-                        scope=f"blob:{blob_oid}",
-                        message=f"File {disp_path} is binary.",
-                        retryable=False,
-                    )
-                    continue
-
-                try:
-                    raw_bytes.decode("utf-8", errors="strict")
-                except UnicodeDecodeError:
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    Store.upsert_gap(
-                        conn,
-                        repository_id=repo_id,
-                        code="TEXT_DECODE_FAILED",
-                        scope=f"blob:{blob_oid}",
-                        message=f"File {disp_path} is not valid UTF-8.",
-                        retryable=False,
-                    )
-                    continue
-
-                lang = detect_language_for_path(path_bytes)
-                if lang is not None:
-                    parse_res, is_hit = index_blob_into_store(
-                        conn,
-                        repository_id=repo_id,
-                        blob_oid=blob_oid,
-                        blob_bytes=raw_bytes,
-                        language=lang,
-                    )
-                    if is_hit:
-                        cache_hits += 1
-                    else:
-                        blobs_parsed += 1
-                    conn.execute(
-                        "UPDATE snapshot_files SET extraction_id = ?, content_state = 'indexed' WHERE path = ?",
-                        (parse_res.extraction_id, path_bytes),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE snapshot_files SET content_state = 'text_only' WHERE path = ?",
-                        (path_bytes,),
-                    )
-                    if not is_indexable_text_path(path_bytes):
+                    if payload is None:
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
                         Store.upsert_gap(
                             conn,
                             repository_id=repo_id,
-                            code="UNSUPPORTED_SYNTAX",
+                            code="MISSING_GIT_OBJECT",
                             scope=f"blob:{blob_oid}",
-                            message=f"File {disp_path} uses an unsupported language; indexed as UTF-8 text.",
+                            message=f"Git blob {blob_oid[:12]} for {disp_path} is missing from object store.",
+                            retryable=True,
+                        )
+                        continue
+
+                    size, raw_bytes = payload
+                    if is_lfs_pointer(raw_bytes):
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
+                        Store.upsert_gap(
+                            conn,
+                            repository_id=repo_id,
+                            code="LFS_CONTENT_NOT_FETCHED",
+                            scope=f"blob:{blob_oid}",
+                            message=f"File {disp_path} is a Git LFS pointer; external asset content was not fetched.",
                             retryable=False,
                         )
+                        continue
+
+                    if size > MAX_PARSE_BYTES:
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
+                        Store.upsert_gap(
+                            conn,
+                            repository_id=repo_id,
+                            code="BLOB_TOO_LARGE",
+                            scope=f"blob:{blob_oid}",
+                            message=f"File {disp_path} ({size} bytes) exceeds the 2 MiB limit.",
+                            retryable=False,
+                        )
+                        continue
+
+                    if b"\x00" in raw_bytes:
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
+                        Store.upsert_gap(
+                            conn,
+                            repository_id=repo_id,
+                            code="BINARY_CONTENT",
+                            scope=f"blob:{blob_oid}",
+                            message=f"File {disp_path} is binary.",
+                            retryable=False,
+                        )
+                        continue
+
+                    try:
+                        raw_bytes.decode("utf-8", errors="strict")
+                    except UnicodeDecodeError:
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'metadata_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
+                        Store.upsert_gap(
+                            conn,
+                            repository_id=repo_id,
+                            code="TEXT_DECODE_FAILED",
+                            scope=f"blob:{blob_oid}",
+                            message=f"File {disp_path} is not valid UTF-8.",
+                            retryable=False,
+                        )
+                        continue
+
+                    lang = detect_language_for_path(path_bytes)
+                    if lang is not None:
+                        parse_res, is_hit = index_blob_into_store(
+                            conn,
+                            repository_id=repo_id,
+                            blob_oid=blob_oid,
+                            blob_bytes=raw_bytes,
+                            language=lang,
+                            parsed=parsed_ahead.get(f"{blob_oid}:{lang}"),
+                        )
+                        if is_hit:
+                            cache_hits += 1
+                        else:
+                            blobs_parsed += 1
+                        conn.execute(
+                            "UPDATE snapshot_files SET extraction_id = ?, content_state = 'indexed' WHERE path = ?",
+                            (parse_res.extraction_id, path_bytes),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE snapshot_files SET content_state = 'text_only' WHERE path = ?",
+                            (path_bytes,),
+                        )
+                        if not is_indexable_text_path(path_bytes):
+                            Store.upsert_gap(
+                                conn,
+                                repository_id=repo_id,
+                                code="UNSUPPORTED_SYNTAX",
+                                scope=f"blob:{blob_oid}",
+                                message=f"File {disp_path} uses an unsupported language; indexed as UTF-8 text.",
+                                retryable=False,
+                            )
+            if unparsed:
+                raise SyncDeadlineExceeded
 
     with mirror.open_batch_session() as cached_batch:
         while True:
@@ -1917,29 +2442,47 @@ PARAM_TYPE_RE = re.compile(
 )
 
 
-def _module_spec_matches_path(mod_spec: str, file_path: str) -> bool:
-    """Check whether an import module specifier (`a`, `pkg.a`, `./service.js`, `com.example.Repo`)
-    matches an indexed repository `file_path` (`a.py`, `src/pkg/a.py`, `src/service.ts`, etc.).
-    """
+def _module_spec_key(mod_spec: str) -> str:
+    """Normalize an import specifier to the slash path that `_module_spec_matches_path` compares."""
     clean_spec = mod_spec.strip().strip("'\"").lstrip("./")
     for ext in EXTENSION_TO_LANGUAGE:
         if clean_spec.endswith(ext):
             clean_spec = clean_spec[: -len(ext)]
             break
-    spec_slash = clean_spec.replace(".", "/").strip("/")
-    if not spec_slash:
-        return False
+    return clean_spec.replace(".", "/").strip("/")
 
+
+def _path_module_forms(file_path: str) -> tuple[str, str]:
     fp_no_ext = file_path
     for ext in EXTENSION_TO_LANGUAGE:
         if fp_no_ext.endswith(ext):
             fp_no_ext = fp_no_ext[: -len(ext)]
             break
     if fp_no_ext.endswith("/__init__") or fp_no_ext.endswith("/index"):
-        fp_pkg = fp_no_ext.rsplit("/", 1)[0]
-    else:
-        fp_pkg = fp_no_ext
+        return fp_no_ext, fp_no_ext.rsplit("/", 1)[0]
+    return fp_no_ext, fp_no_ext
 
+
+def _segment_suffixes(value: str, sep: str) -> set[str]:
+    """Every `t` where `value == t` or `value.endswith(sep + t)`."""
+    parts = value.split(sep)
+    return {sep.join(parts[i:]) for i in range(len(parts))}
+
+
+def _path_module_keys(file_path: str) -> set[str]:
+    """Every spec key that `_module_spec_matches_path` would accept for `file_path`."""
+    fp_no_ext, fp_pkg = _path_module_forms(file_path)
+    return _segment_suffixes(fp_no_ext, "/") | _segment_suffixes(fp_pkg, "/")
+
+
+def _module_spec_matches_path(mod_spec: str, file_path: str) -> bool:
+    """Check whether an import module specifier (`a`, `pkg.a`, `./service.js`, `com.example.Repo`)
+    matches an indexed repository `file_path` (`a.py`, `src/pkg/a.py`, `src/service.ts`, etc.).
+    """
+    spec_slash = _module_spec_key(mod_spec)
+    if not spec_slash:
+        return False
+    fp_no_ext, fp_pkg = _path_module_forms(file_path)
     return (
         fp_no_ext == spec_slash
         or fp_no_ext.endswith("/" + spec_slash)
@@ -2043,15 +2586,41 @@ def _extract_receiver_types_from_signature(signature: str) -> dict[str, str]:
     return var_to_type
 
 
+SNAPSHOT_RELATION_METHODS = (
+    "lexical_snapshot",
+    "ast_imports",
+    "ast_inherits",
+    "ast_implements",
+    "ast_decorates",
+    "ast_references_type",
+    "override_resolution",
+    "test_convention",
+)
+TYPE_TARGET_KINDS = frozenset({"class", "interface"})
+DECORATOR_TARGET_KINDS = frozenset({"function", "async_function", "class"})
+
+
+def _root_name(name: str) -> str:
+    return re.split(r"[?.!(]", name.removeprefix("this.").removeprefix("self."))[0]
+
+
+def _import_matches(module: str, imported: str, path: str) -> bool:
+    # Python and JS name the defining file; Java and Kotlin name the package, so try `module.imported` as the file.
+    return _module_spec_matches_path(module, path) or _module_spec_matches_path(f"{module}.{imported}", path)
+
+
 def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
-    """Resolve cross-file `calls_candidate` and `imports_candidate` relations using:
+    """Resolve cross-file `calls_candidate` relations using:
     1. Explicit import target matching (`from a import save` binds `save()` ONLY to `a.py`'s `save`, never `b.py`'s `save`)
     2. Module alias receiver matching (`a.save()` where `import a` binds to `a.py`'s `save`)
     3. Parameter/field receiver type matching (`repo.save()` where `repo: UserRepository` binds to `UserRepository.save`)
     4. Same-directory/package preference
     5. Global fallback ONLY when the symbol name is globally unique (1 match) across the snapshot.
+    Then resolve `imports`, `inherits`, `implements`, `decorates`, `references_type`, `overrides` and `tests`.
     """
-    previous_relations = {r[0] for r in conn.execute("SELECT id FROM relations WHERE method = 'lexical_snapshot'")}
+    placeholders = ",".join("?" for _ in SNAPSHOT_RELATION_METHODS)
+    previous_relations = {r[0] for r in conn.execute(
+        f"SELECT id FROM relations WHERE method IN ({placeholders})", SNAPSHOT_RELATION_METHODS)}
     active_relations: set[str] = set()
 
     active_rows = conn.execute(
@@ -2064,7 +2633,6 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
 
-    # Map symbol metadata and index by short name
     sym_meta: dict[str, dict[str, Any]] = {}
     by_name: dict[str, list[dict[str, Any]]] = {}
     ext_to_path: dict[str, str] = {}
@@ -2087,7 +2655,26 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         sym_meta[sid] = info
         by_name.setdefault(info["name"], []).append(info)
 
-    # Load imports per active extraction_id
+    # Per-name indexes so each call resolves by lookup instead of scanning every same-named definition.
+    def index_by(keys_of: Callable[[dict[str, Any]], Iterable[Any]]) -> dict[tuple[str, Any], list[dict[str, Any]]]:
+        index: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+        for infos in by_name.values():
+            for info in infos:
+                for key in keys_of(info):
+                    index.setdefault((info["name"], key), []).append(info)
+        return index
+
+    by_name_ext = index_by(lambda c: (c["extraction_id"],))
+    by_name_dir = index_by(lambda c: (c["path"].rsplit("/", 1)[0] if "/" in c["path"] else "",))
+    by_name_module = index_by(lambda c: _path_module_keys(c["path"]))
+    by_name_qname = index_by(lambda c: (c["qualified_name"],))
+    by_name_qsuffix = index_by(lambda c: _segment_suffixes(c["qualified_name"], "."))
+    by_name_parent = index_by(lambda c: (c["parent_symbol_id"],))
+
+    def module_matches(name: str, mod_spec: str) -> list[dict[str, Any]]:
+        key = _module_spec_key(mod_spec)
+        return by_name_module.get((name, key), []) if key else []
+
     imp_rows = conn.execute(
         """
         SELECT so.extraction_id, so.text
@@ -2124,29 +2711,39 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
 
+    # Module-level imports have no enclosing symbol, so an import is credited to the symbols that use the name.
+    name_users: dict[tuple[str, str], set[str]] = {}
     for cr in call_rows:
         check_deadline()
         enc_id = str(cr["enclosing_symbol_id"])
         ext_id = str(cr["extraction_id"])
+        det = json.loads(str(cr["details_json"])) if cr["details_json"] else {}
+        callee = det.get("callee") or det.get("component")
+        receiver = det.get("receiver")
+        used = receiver or callee
+        if isinstance(used, str) and used:
+            name_users.setdefault((ext_id, _root_name(used)), set()).add(enc_id)
         enc_info = sym_meta.get(enc_id)
         if enc_info is None:
             continue
 
-        det = json.loads(str(cr["details_json"])) if cr["details_json"] else {}
-        callee = det.get("callee") or det.get("component")
-        receiver = det.get("receiver")
         if not isinstance(callee, str) or callee not in by_name:
             continue
 
-        candidates = [c for c in by_name[callee] if c["id"] != enc_id]
-        if not candidates:
+        def others(found: list[dict[str, Any]], enc_id: str = enc_id) -> list[dict[str, Any]]:
+            return [c for c in found if c["id"] != enc_id]
+
+        # A symbol id belongs to one extraction, so the caller's own rows all sit in that bucket.
+        own_rows = by_name_ext.get((callee, enc_info["extraction_id"]), [])
+        candidate_count = len(by_name[callee]) - sum(1 for c in own_rows if c["id"] == enc_id)
+        if candidate_count == 0:
             continue
 
         sym_imps, mod_aliases, wildcards = ext_parsed_imports.get(ext_id, ({}, {}, []))
         caller_path = enc_info["path"]
         caller_dir = caller_path.rsplit("/", 1)[0] if "/" in caller_path else ""
 
-        # Gather receiver type map from enclosing function and its parent class (e.g. constructor injection)
+        # Constructor-injected fields live in the parent class signature, so both signatures supply receiver types.
         recv_types: dict[str, str] = {}
         parent_id = enc_info.get("parent_symbol_id")
         if parent_id and str(parent_id) in sym_meta:
@@ -2177,72 +2774,50 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                     owner["id"] for type_name in types
                     for owner in by_name.get(type_name.rsplit(".", 1)[-1], []) if owner["kind"] == "class"
                 }
-                resolved_targets = [c for c in candidates if c["parent_symbol_id"] in owner_ids]
-            # 1A. Receiver is an imported module alias (`a.save()` where `import a` or `from pkg import a`)
+                resolved_targets = [
+                    c for owner_id in owner_ids for c in others(by_name_parent.get((callee, owner_id), []))
+                ]
+            # `a.save()` after `import a` or `from pkg import a`.
             if not resolved_targets and clean_recv in mod_aliases:
-                mod_spec = mod_aliases[clean_recv]
-                resolved_targets = [
-                    c for c in candidates if _module_spec_matches_path(mod_spec, c["path"])
-                ]
+                resolved_targets = others(module_matches(callee, mod_aliases[clean_recv]))
             elif clean_recv in sym_imps:
-                # Receiver is an imported class or module (`Service.run()`)
-                mod_spec = sym_imps[clean_recv]
-                resolved_targets = [
-                    c
-                    for c in candidates
-                    if c["qualified_name"] == f"{clean_recv}.{callee}"
-                    or _module_spec_matches_path(mod_spec, c["path"])
-                ]
-            # 1B. Receiver is a typed parameter/field (`api.getUser()` where `api: Api`)
+                # `Service.run()` where `Service` was imported.
+                resolved_targets = others(
+                    by_name_qname.get((callee, f"{clean_recv}.{callee}"), [])
+                    + module_matches(callee, sym_imps[clean_recv])
+                )
+            # `api.getUser()` where `api: Api` is a parameter or field.
             if not resolved_targets and len(chain) == 1 and root_types:
                 resolved_targets = [
-                    c
-                    for c in candidates
-                    if any(c["qualified_name"] == f"{t_name}.{callee}"
-                           or c["qualified_name"].endswith(f".{t_name}.{callee}") for t_name in root_types)
+                    c for t_name in root_types
+                    for c in others(by_name_qsuffix.get((callee, f"{t_name}.{callee}"), []))
                 ]
-            # 1C. Receiver is `self`/`this` -> same class methods only
+            # `self` and `this` can only reach methods of the same class.
             if not resolved_targets and receiver in ("self", "this") and parent_id and str(parent_id) in sym_meta:
                 p_qname = sym_meta[str(parent_id)]["qualified_name"]
-                resolved_targets = [
-                    c for c in candidates if c["qualified_name"] == f"{p_qname}.{callee}"
-                ]
+                resolved_targets = others(by_name_qname.get((callee, f"{p_qname}.{callee}"), []))
         else:
-            # Unqualified call `save()`
-            # 2A. Same-file definition takes precedence (already linked by `lexical_same_blob`)
-            same_file = [c for c in candidates if c["extraction_id"] == ext_id]
-            if same_file:
+            # A same-file definition shadows imports and is already linked by `lexical_same_blob`.
+            if others(by_name_ext.get((callee, ext_id), [])):
                 continue
 
-            # 2B. Explicitly imported symbol (`from a import save` or `import { save } from './a'`)
+            # `from a import save` or `import { save } from './a'`.
             if callee in sym_imps:
-                mod_spec = sym_imps[callee]
-                resolved_targets = [
-                    c for c in candidates if _module_spec_matches_path(mod_spec, c["path"])
-                ]
+                resolved_targets = others(module_matches(callee, sym_imps[callee]))
 
-            # 2C. Wildcard imports (`from a import *`)
+            # `from a import *`.
             if not resolved_targets and wildcards:
-                resolved_targets = [
-                    c
-                    for c in candidates
-                    if any(_module_spec_matches_path(w, c["path"]) for w in wildcards)
-                ]
+                resolved_targets = [c for w in wildcards for c in others(module_matches(callee, w))]
 
-            # 2D. Same directory/package definition if unique in that directory
+            # Code often calls a sibling module without importing it (same Go or Java package).
             if not resolved_targets and caller_dir:
-                same_dir = [
-                    c
-                    for c in candidates
-                    if (c["path"].rsplit("/", 1)[0] if "/" in c["path"] else "") == caller_dir
-                ]
+                same_dir = others(by_name_dir.get((callee, caller_dir), []))
                 if len(same_dir) == 1:
                     resolved_targets = same_dir
 
-            # 2E. Global fallback ONLY when the symbol name is globally unique across the entire snapshot!
-            # (Prevents false edges when multiple modules define common names like `save` or `run`.)
-            if not resolved_targets and len(candidates) == 1:
-                resolved_targets = candidates
+            # Only a globally unique name is safe; common names like `save` or `run` would create false edges.
+            if not resolved_targets and candidate_count == 1:
+                resolved_targets = others(by_name[callee])
 
         for tgt in resolved_targets:
             rel_id = make_relation_id(
@@ -2266,4 +2841,157 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                 (rel_id, enc_id, tgt["id"]),
             )
 
+    def link(from_id: str, to_id: str, rel_kind: str, method: str) -> None:
+        rel_id = make_relation_id(
+            from_kind="symbol", from_id=from_id, to_kind="symbol", to_id=to_id, relation_kind=rel_kind, method=method
+        )
+        active_relations.add(rel_id)
+        conn.execute(
+            """
+            INSERT INTO relations (
+                id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+            ) VALUES (?, 'symbol', ?, 'symbol', ?, ?, ?, 'candidate', NULL, '{}', 'active')
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (rel_id, from_id, to_id, rel_kind, method),
+        )
+
+    occ_rows = conn.execute(
+        """
+        SELECT DISTINCT o.extraction_id, o.enclosing_symbol_id, o.kind, o.details_json
+        FROM syntax_occurrences o
+        JOIN snapshot_files sf ON sf.extraction_id = o.extraction_id
+        WHERE o.kind IN ('inherits', 'implements', 'decorates', 'references_type')
+          AND o.enclosing_symbol_id IS NOT NULL
+        """
+    ).fetchall()
+
+    class_inheritance: dict[str, set[str]] = {}
+    for orow in occ_rows:
+        check_deadline()
+        enc_id = str(orow["enclosing_symbol_id"])
+        ext_id = str(orow["extraction_id"])
+        okind = str(orow["kind"])
+        try:
+            odetails = json.loads(str(orow["details_json"]))
+        except json.JSONDecodeError:
+            odetails = {}
+
+        target_name = odetails.get("base_class") or odetails.get("decorator") or odetails.get("type_name")
+        if not isinstance(target_name, str) or not target_name:
+            continue
+        name_users.setdefault((ext_id, _root_name(target_name)), set()).add(enc_id)
+        short_target = target_name.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
+        wanted_kinds = DECORATOR_TARGET_KINDS if okind == "decorates" else TYPE_TARGET_KINDS
+        cands = [c for c in by_name.get(short_target, []) if c["id"] != enc_id and c["kind"] in wanted_kinds]
+        if not cands:
+            continue
+        # Same rules as calls: same file, then the file's imports, then a globally unique name.
+        targets = [c for c in cands if c["extraction_id"] == ext_id]
+        sym_imps = ext_parsed_imports.get(ext_id, ({}, {}, []))[0]
+        imported_from = sym_imps.get(_root_name(target_name))
+        if not targets and imported_from:
+            targets = [c for c in cands if _import_matches(imported_from, short_target, c["path"])]
+        if not targets and len(cands) == 1:
+            targets = cands
+        for tgt in targets:
+            link(enc_id, tgt["id"], okind, f"ast_{okind}")
+            if okind in ("inherits", "implements"):
+                class_inheritance.setdefault(enc_id, set()).add(tgt["id"])
+
+    import_rows = conn.execute(
+        """
+        SELECT DISTINCT o.extraction_id, o.enclosing_symbol_id, o.details_json
+        FROM syntax_occurrences o
+        JOIN snapshot_files sf ON sf.extraction_id = o.extraction_id
+        WHERE o.kind = 'imports'
+        """
+    ).fetchall()
+    for irow in import_rows:
+        check_deadline()
+        ext_id = str(irow["extraction_id"])
+        idetails = json.loads(str(irow["details_json"]))
+        imported, module, local = idetails.get("imported"), idetails.get("module"), idetails.get("name")
+        if not (isinstance(imported, str) and isinstance(module, str) and isinstance(local, str)):
+            continue
+        cands = [c for c in by_name.get(imported, []) if c["extraction_id"] != ext_id]
+        targets = [c for c in cands if _import_matches(module, imported, c["path"])]
+        if not targets and len(cands) == 1:
+            targets = cands
+        if not targets:
+            continue
+        enc = irow["enclosing_symbol_id"]
+        sources = [str(enc)] if enc else sorted(name_users.get((ext_id, local), ()))
+        for src in sources:
+            for tgt in targets:
+                if src != tgt["id"]:
+                    link(src, tgt["id"], "imports", "ast_imports")
+
+    # A method overrides a same-named method of a resolved superclass or interface.
+    methods_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for _sid, sinfo in sym_meta.items():
+        if sinfo.get("parent_symbol_id"):
+            methods_by_parent.setdefault(str(sinfo["parent_symbol_id"]), []).append(sinfo)
+
+    for child_cls_id, parent_cls_ids in class_inheritance.items():
+        child_methods = methods_by_parent.get(child_cls_id, [])
+        for p_id in parent_cls_ids:
+            parent_methods = {m["name"]: m for m in methods_by_parent.get(p_id, [])}
+            for cm in child_methods:
+                if cm["name"] in parent_methods:
+                    pm = parent_methods[cm["name"]]
+                    rel_id = make_relation_id(
+                        from_kind="symbol",
+                        from_id=cm["id"],
+                        to_kind="symbol",
+                        to_id=pm["id"],
+                        relation_kind="overrides",
+                        method="override_resolution",
+                    )
+                    active_relations.add(rel_id)
+                    conn.execute(
+                        """
+                        INSERT INTO relations (
+                            id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                        ) VALUES (?, 'symbol', ?, 'symbol', ?, 'overrides', 'override_resolution', 'exact', NULL, '{}', 'active')
+                        ON CONFLICT(id) DO NOTHING
+                        """,
+                        (rel_id, cm["id"], pm["id"]),
+                    )
+
+    # Test names follow `test_x`, `XTest` or `x_test` conventions, which point at the tested symbol.
+    for sid, sinfo in sym_meta.items():
+        sname = sinfo["name"]
+        if sname.startswith("test_") or sname.endswith("Test") or sname.endswith("_test"):
+            cand_tested: list[str] = []
+            if sname.startswith("test_"):
+                cand_tested.append(sname[5:])
+            if sname.endswith("Test"):
+                cand_tested.append(sname[:-4])
+            if sname.endswith("_test"):
+                cand_tested.append(sname[:-5])
+            for ct in cand_tested:
+                if ct in by_name:
+                    for tgt in by_name[ct]:
+                        rel_id = make_relation_id(
+                            from_kind="symbol",
+                            from_id=sid,
+                            to_kind="symbol",
+                            to_id=tgt["id"],
+                            relation_kind="tests",
+                            method="test_convention",
+                        )
+                        active_relations.add(rel_id)
+                        conn.execute(
+                            """
+                            INSERT INTO relations (
+                                id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                            ) VALUES (?, 'symbol', ?, 'symbol', ?, 'tests', 'test_convention', 'candidate', NULL, '{}', 'active')
+                            ON CONFLICT(id) DO NOTHING
+                            """,
+                            (rel_id, sid, tgt["id"]),
+                        )
+
     conn.executemany("DELETE FROM relations WHERE id = ?", [(rid,) for rid in previous_relations - active_relations])
+    # SCIP edges come from a separate import, so only retire the ones whose symbols left the snapshot.
+    retire_dangling_scip_relations(conn)

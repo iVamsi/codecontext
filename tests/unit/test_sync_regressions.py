@@ -276,7 +276,7 @@ def test_sync_deadline_covers_syntax_and_resumes(
     original = syntax.parse_blob
 
     def slow_parse(*args, **kwargs):
-        time.sleep(0.04)
+        time.sleep(0.3)
         return original(*args, **kwargs)
 
     with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:

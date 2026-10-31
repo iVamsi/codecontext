@@ -11,17 +11,28 @@ import shutil
 import sqlite3
 import tempfile
 import urllib.parse
-from datetime import UTC, datetime
 from pathlib import Path
 
 from codecontext.archive import execute_export, sanitized_bare_git_config
 from codecontext.errors import CodeContextError
 from codecontext.git import run_safe_git
-from codecontext.identity import sha256_bytes
-from codecontext.models import ExportReport, ExportRequest
-from codecontext.store import Store, inspect_local_git_repository
+from codecontext.identity import datetime_to_us, parse_iso_utc, sha256_bytes, us_to_iso_z
+from codecontext.models import ExportReport, ExportRequest, TeamMergeReport
+from codecontext.store import Store, inspect_local_git_repository, now_us
 
 TEAM_FILE = "team.json"
+
+
+def _published_us(team: dict) -> int:
+    # us_to_iso_z drops a zero fraction, so the strings do not sort lexically; compare instants.
+    try:
+        return datetime_to_us(parse_iso_utc(str(team["published_at"])))
+    except ValueError as exc:
+        raise CodeContextError(
+            code="STORE_VERSION_UNSUPPORTED",
+            message="Shared memory team.json has an invalid published_at timestamp.",
+            retryable=False,
+        ) from exc
 
 
 def project_remote_key(url: str) -> str:
@@ -191,8 +202,8 @@ def execute_publish(store: Store, destination: Path) -> ExportReport:
                 retryable=False,
             )
         local_team = _local_team(store)
-        local_published = str(local_team["published_at"]) if local_team else None
-        share_published = str(current["published_at"])
+        local_published = _published_us(local_team) if local_team else None
+        share_published = _published_us(current)
         # ponytail: UTC timestamps order publishes; skewed clocks can reorder them. Upgrade: a shared counter.
         share_is_newer = local_published is not None and (
             share_published > local_published
@@ -226,7 +237,7 @@ def execute_publish(store: Store, destination: Path) -> ExportReport:
         "active_revision": report.revision,
         "generation": report.generation,
         "project_remote": remote_key,
-        "published_at": datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "published_at": us_to_iso_z(now_us()),
         "repository_id": report.repository_id,
         "schema_version": 1,
     }
@@ -275,7 +286,10 @@ def _copy_regular_tree(src: Path, dst: Path) -> None:
             _refuse_symlink(child, "Shared snapshot contains a symlink.")
             if not child.is_file():
                 continue
-            shutil.copyfile(child, current / name)
+            dest_file = current / name
+            if dest_file.exists():
+                continue
+            shutil.copyfile(child, dest_file)
 
 
 def _import_share(share_dir: Path, store_path: Path) -> None:
@@ -435,8 +449,8 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
             local_published = None
             local_team = dest / TEAM_FILE
             if local_team.is_file() and not local_team.is_symlink():
-                local_published = str(_read_team(dest)["published_at"])
-            share_published = str(team["published_at"])
+                local_published = _published_us(_read_team(dest))
+            share_published = _published_us(team)
             if local_published is not None and local_published > share_published:
                 raise CodeContextError(
                     code="INVALID_REQUEST",
@@ -466,3 +480,112 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
         if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> TeamMergeReport:
+    """Non-destructive record-level union merge of a shared team memory into an existing local store."""
+    raw_share = share_dir.expanduser()
+    if raw_share.is_symlink():
+        raise CodeContextError(code="INVALID_REQUEST", message="Refusing to join through a symlinked share directory.", retryable=False)
+    share = raw_share.resolve()
+    team = _read_team(share)
+    remote_key = detect_project_remote(repo_path)
+    if team["project_remote"] != remote_key:
+        raise CodeContextError(code="REPOSITORY_MISMATCH", message="This checkout's origin does not match the shared memory.", retryable=False)
+
+    dest = store_path.expanduser().resolve()
+    if not dest.exists() or not (dest / "memory.sqlite3").is_file():
+        execute_join(store_path, share_dir, repo_path)
+        store = Store.open(dest, read_only=True)
+        try:
+            return TeamMergeReport(
+                repository_id=str(team["repository_id"]),
+                generation=_store_generation(store),
+                git_objects_fetched=True,
+                sources_merged=0,
+                source_versions_merged=0,
+                claims_merged=0,
+                summaries_merged=0,
+            )
+        finally:
+            store.close()
+
+    if not _matching_store(dest, str(team["repository_id"])):
+        raise CodeContextError(code="REPOSITORY_MISMATCH", message="Local store belongs to a different project memory.", retryable=False)
+
+    share_db_path = share / "memory.sqlite3"
+    if not share_db_path.is_file() or share_db_path.is_symlink():
+        raise CodeContextError(code="STORE_NOT_INITIALIZED", message="Shared memory is missing memory.sqlite3.", retryable=False)
+
+    share_git_objs = share / "repository.git" / "objects"
+    local_git_objs = dest / "repository.git" / "objects"
+    git_objs_copied = False
+    if share_git_objs.is_dir() and local_git_objs.is_dir():
+        _copy_regular_tree(share_git_objs, local_git_objs)
+        git_objs_copied = True
+
+    local_store = Store.open(dest, read_only=False)
+    sources_merged = 0
+    source_versions_merged = 0
+    claims_merged = 0
+    summaries_merged = 0
+
+    try:
+        share_uri = f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro"
+        share_conn = sqlite3.connect(share_uri, uri=True)
+        try:
+            tables = [
+                "sources",
+                "source_versions",
+                "commits",
+                "changes",
+                "hunks",
+                "extractions",
+                "symbols",
+                "syntax_occurrences",
+                "relations",
+                "claims",
+                "summaries",
+                "episodes",
+            ]
+            with local_store.write_transaction(bump_generation=True) as conn:
+                for tbl in tables:
+                    c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    col_rows = share_conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                    cols = [c[1] for c in col_rows]
+                    col_names = ", ".join(cols)
+                    placeholders = ", ".join("?" for _ in cols)
+                    rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
+                    if rows:
+                        conn.executemany(
+                            f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
+                            rows,
+                        )
+                    c_after = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    diff = c_after - c_before
+                    if tbl == "sources":
+                        sources_merged = diff
+                    elif tbl == "source_versions":
+                        source_versions_merged = diff
+                    elif tbl == "claims":
+                        claims_merged = diff
+                    elif tbl == "summaries":
+                        summaries_merged = diff
+        finally:
+            share_conn.close()
+
+        local_team_file = dest / TEAM_FILE
+        if local_team_file.is_file():
+            _write_team(dest, team)
+
+        return TeamMergeReport(
+            repository_id=str(team["repository_id"]),
+            generation=_store_generation(local_store),
+            git_objects_fetched=git_objs_copied,
+            sources_merged=sources_merged,
+            source_versions_merged=source_versions_merged,
+            claims_merged=claims_merged,
+            summaries_merged=summaries_merged,
+        )
+    finally:
+        local_store.close()

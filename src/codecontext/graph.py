@@ -1,16 +1,33 @@
+import os
+import posixpath
 import re
+import stat
 from collections import deque
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 
 from pydantic import Field
 
 from codecontext.enrichment import compute_snapshot_groups
 from codecontext.errors import CodeContextError
-from codecontext.git import GitMirror, run_safe_git
+from codecontext.git import (
+    CatFileBatchSession,
+    GitMirror,
+    ParsedHunk,
+    compute_unified_zero_hunks,
+    parse_diff_tree_raw_z,
+    run_safe_git,
+)
 from codecontext.identity import path_bytes_to_display
 from codecontext.models import NonNegative, Positive, PublicModel, RecordID
 from codecontext.store import Store
+from codecontext.syntax import (
+    MAX_PARSE_BYTES,
+    ExtractedSymbol,
+    detect_language_for_path,
+    is_lfs_pointer,
+    parse_blob,
+)
 
 
 class GraphNode(PublicModel):
@@ -43,7 +60,18 @@ class SearchGraphRequest(PublicModel):
     qn_pattern: Annotated[str, Field(min_length=1, max_length=1000)] | None = None
     file_pattern: Annotated[str, Field(min_length=1, max_length=1000)] | None = None
     label: Annotated[str, Field(min_length=1, max_length=100)] | None = None
-    relationship: Literal["CALLS", "CONTAINS", "ALL"] = "CALLS"
+    relationship: Literal[
+        "CALLS",
+        "CONTAINS",
+        "INHERITS",
+        "IMPLEMENTS",
+        "OVERRIDES",
+        "REFERENCES_TYPE",
+        "DECORATES",
+        "IMPORTS",
+        "TESTS",
+        "ALL",
+    ] = "CALLS"
     direction: Literal["inbound", "outbound", "both"] = "both"
     min_degree: NonNegative | None = None
     max_degree: NonNegative | None = None
@@ -108,6 +136,8 @@ class GetArchitectureResult(PublicModel):
     languages: dict[str, NonNegative]
     clusters: list[ArchitectureCluster]
     hotspots: list[GraphNode]
+    cycles: list[list[str]] = Field(default_factory=list)
+    coupling: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class DetectChangesRequest(PublicModel):
@@ -121,6 +151,10 @@ class DetectChangesResult(PublicModel):
     directly_modified_symbols: list[GraphNode]
     affected_callers: list[GraphNode]
     impact_edges: list[GraphEdge]
+    affected_symbols: list[GraphNode] = Field(default_factory=list)
+    deleted_symbols: list[str] = Field(default_factory=list)
+    classifications: dict[str, str] = Field(default_factory=dict)
+    affected_tests: list[str] = Field(default_factory=list)
 
 
 class GetCodeSnippetRequest(PublicModel):
@@ -257,7 +291,7 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
 def _load_active_graph(
     store: Store,
 ) -> tuple[dict[str, GraphNode], list[tuple[str, str, str, str]], int]:
-    """Load active snapshot symbols, active symbol-to-symbol edges (`CALLS`, `CONTAINS`), and `access_epoch`."""
+    """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`."""
     with store.read_snapshot() as snap:
         conn = snap.conn
         expected_epoch = snap.access_epoch
@@ -371,11 +405,15 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
             conditions.append(f"name NOT IN ({placeholders}) AND substr(name, 1, 5) != 'test_' AND instr(file_path, 'Test') = 0")
             params.extend(sorted(ENTRY_POINT_NAMES))
         where = " AND ".join(conditions) or "1"
-        relation_filter = {
-            "CALLS": "AND r.relation_kind = 'calls_candidate'",
-            "CONTAINS": "AND r.relation_kind = 'contains'",
-            "ALL": "",
-        }[request.relationship]
+        if request.relationship == "ALL":
+            relation_filter = ""
+        else:
+            relation_kind = (
+                "calls_candidate"
+                if request.relationship == "CALLS"
+                else request.relationship.lower()
+            )
+            relation_filter = f"AND r.relation_kind = '{relation_kind}'"
         degrees = []
         for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
             degrees.append(f"""(SELECT COUNT(*) FROM (
@@ -507,8 +545,6 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
         edges=collected_edges,
     )
 
-
-# --- Cypher Query Executor over SQLite symbol/relation graph ---
 
 CYPHER_NODE_RE = re.compile(
     r"^\s*MATCH\s*\(\s*(?P<var>[A-Za-z_]\w*)(?::(?P<label>[A-Za-z_]\w*))?\s*(?:\{(?P<props>[^}]*)\})?\s*\)\s*"
@@ -772,7 +808,6 @@ def _apply_order_by_and_count(
     order_by_clause: str | None,
     cap: int,
 ) -> tuple[list[str], list[dict[str, Any]], bool]:
-    # Check if RETURN is a `count(...)` aggregation
     if len(ret_cols) == 1 and re.match(r"^count\s*\(.+\)(?:\s+AS\s+\w+)?$", ret_cols[0], flags=re.IGNORECASE):
         as_parts = re.split(r"\s+AS\s+", ret_cols[0].strip(), flags=re.IGNORECASE)
         col_name = as_parts[1].strip() if len(as_parts) > 1 else ret_cols[0].strip()
@@ -861,7 +896,6 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                 if _matches_where(bindings, where_c):
                     matched_bindings.append(bindings)
         else:
-            # Variable-length path `-[r:CALLS*min..max]->`
             adj: dict[str, list[tuple[str, str, str]]] = {}
             for f_id, t_id, etype, method in edges:
                 if req_edge_type and etype != req_edge_type:
@@ -943,11 +977,177 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
     )
 
 
+def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
+    """Find all cyclic Strongly Connected Components using Tarjan's algorithm."""
+    index = 0
+    indices: dict[str, int] = {}
+    lowlinks: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    cycles: list[list[str]] = []
+
+    def strongconnect(v: str) -> None:
+        nonlocal index
+        indices[v] = index
+        lowlinks[v] = index
+        index += 1
+        stack.append(v)
+        on_stack.add(v)
+
+        for w in sorted(adj.get(v, set())):
+            if w not in indices:
+                strongconnect(w)
+                lowlinks[v] = min(lowlinks[v], lowlinks[w])
+            elif w in on_stack:
+                lowlinks[v] = min(lowlinks[v], indices[w])
+
+        if lowlinks[v] == indices[v]:
+            scc: list[str] = []
+            while True:
+                w = stack.pop()
+                on_stack.remove(w)
+                scc.append(w)
+                if w == v:
+                    break
+            if len(scc) > 1 or (len(scc) == 1 and v in adj.get(v, set())):
+                cycles.append(sorted(scc))
+
+    for node in sorted(adj.keys()):
+        if node not in indices:
+            strongconnect(node)
+    return sorted(cycles, key=lambda c: (len(c), c))
+
+
+def detect_louvain_communities(
+    nodes: list[str],
+    edges: list[tuple[str, str, float]],
+    *,
+    resolution: float = 1.0,
+) -> list[list[str]]:
+    """Partition nodes into cohesive functional communities using modularity optimization."""
+    if not nodes:
+        return []
+    adj: dict[str, dict[str, float]] = {n: {} for n in nodes}
+    degrees: dict[str, float] = {n: 0.0 for n in nodes}
+    total_weight = 0.0
+    for u, v, w in edges:
+        if u in adj and v in adj:
+            adj[u][v] = adj[u].get(v, 0.0) + w
+            adj[v][u] = adj[v].get(u, 0.0) + w
+            degrees[u] += w
+            degrees[v] += w
+            total_weight += w
+
+    if total_weight <= 0:
+        return [[n] for n in sorted(nodes)]
+
+    community: dict[str, str] = {n: n for n in nodes}
+    comm_nodes: dict[str, set[str]] = {n: {n} for n in nodes}
+    comm_degrees: dict[str, float] = {n: degrees[n] for n in nodes}
+
+    m2 = 2.0 * total_weight
+    improved = True
+    passes = 0
+    while improved and passes < 10:
+        improved = False
+        passes += 1
+        for u in sorted(nodes):
+            c_u = community[u]
+            k_u = degrees[u]
+            neigh_comms: dict[str, float] = {}
+            for v, w in adj[u].items():
+                c_v = community[v]
+                neigh_comms[c_v] = neigh_comms.get(c_v, 0.0) + w
+
+            best_comm = c_u
+            best_gain = 0.0
+            w_u_in = neigh_comms.get(c_u, 0.0)
+            deg_c_u = comm_degrees[c_u] - k_u
+
+            # Sorted so ties resolve the same way regardless of edge insertion order.
+            for c_cand, w_u_cand in sorted(neigh_comms.items()):
+                if c_cand == c_u:
+                    continue
+                deg_c_cand = comm_degrees[c_cand]
+                gain = (w_u_cand - w_u_in) - resolution * (k_u * (deg_c_cand - deg_c_u)) / m2
+                if gain > best_gain:
+                    best_gain = gain
+                    best_comm = c_cand
+
+            if best_comm != c_u and best_gain > 1e-6:
+                comm_nodes[c_u].remove(u)
+                comm_degrees[c_u] -= k_u
+                community[u] = best_comm
+                comm_nodes[best_comm].add(u)
+                comm_degrees[best_comm] += k_u
+                improved = True
+
+    result: list[list[str]] = [sorted(c_set) for c_set in comm_nodes.values() if c_set]
+    return sorted(result, key=lambda c: (-len(c), c[0] if c else ""))
+
+
+def _cluster_files(
+    groups: list[Any],
+    nodes: dict[str, GraphNode],
+    edges: list[tuple[str, str, str, str]],
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, tuple[str, str]]]:
+    """Cluster files by Louvain over the cross-file call graph; files without calls stay in their snapshot group.
+
+    Clustering files rather than symbols keeps the graph small on large repositories while still
+    following call cohesion. Returns `(file -> cluster id, cluster id -> files, cluster id -> (scope_kind, path))`.
+    """
+    pair_weights: dict[tuple[str, str], float] = {}
+    for f_id, t_id, etype, _ in edges:
+        if etype != "CALLS":
+            continue
+        f_file = nodes[f_id].file_path
+        t_file = nodes[t_id].file_path
+        if f_file != t_file:
+            key = (f_file, t_file) if f_file < t_file else (t_file, f_file)
+            pair_weights[key] = pair_weights.get(key, 0.0) + 1.0
+    linked_files = sorted({f for pair in pair_weights for f in pair})
+    communities = detect_louvain_communities(
+        linked_files,
+        [(a, b, w) for (a, b), w in sorted(pair_weights.items())],
+    )
+
+    file_to_cluster: dict[str, str] = {}
+    cluster_files: dict[str, list[str]] = {}
+    cluster_meta: dict[str, tuple[str, str]] = {}
+    for members in communities:
+        if len(members) < 2:
+            continue
+        common = posixpath.commonpath(members) if all("/" in m for m in members) else ""
+        if common in members:
+            common = posixpath.dirname(common)
+        path = common or "."
+        cid = f"community:{path}"
+        suffix = 2
+        while cid in cluster_meta:
+            cid = f"community:{path}#{suffix}"
+            suffix += 1
+        cluster_meta[cid] = ("community", path)
+        cluster_files[cid] = list(members)
+        for fs in members:
+            file_to_cluster[fs] = cid
+
+    for g in groups:
+        rest = [fs for fs in (path_bytes_to_display(fb)[0] for fb in g.files) if fs not in file_to_cluster]
+        if not rest:
+            continue
+        cid = g.path_display
+        cluster_meta[cid] = (g.scope_kind, g.path_display)
+        cluster_files[cid] = rest
+        for fs in rest:
+            file_to_cluster[fs] = cid
+    return file_to_cluster, cluster_files, cluster_meta
+
+
 def execute_get_architecture(
     store: Store,
     request: GetArchitectureRequest,
 ) -> GetArchitectureResult:
-    """Compute structural architecture overview: package/directory clusters, cohesion scores,
+    """Compute structural architecture overview: Louvain call-graph clusters, cohesion scores,
     inter-cluster call dependencies, language breakdown, and top degree hotspots.
     """
     nodes, edges, expected_epoch = _load_active_graph(store)
@@ -963,18 +1163,13 @@ def execute_get_architecture(
         lang_counts[n.language] = lang_counts.get(n.language, 0) + 1
         file_to_nodes.setdefault(n.file_path, []).append(n)
 
-    node_to_cluster: dict[str, str] = {}
-    cluster_files: dict[str, list[str]] = {}
-    cluster_meta: dict[str, tuple[str, str]] = {}
-
-    for g in groups:
-        cid = g.path_display
-        cluster_meta[cid] = (g.scope_kind, g.path_display)
-        f_strs = [path_bytes_to_display(fb)[0] for fb in g.files]
-        cluster_files[cid] = f_strs
-        for fs in f_strs:
-            for gn in file_to_nodes.get(fs, []):
-                node_to_cluster[gn.id] = cid
+    file_to_cluster, cluster_files, cluster_meta = _cluster_files(groups, nodes, edges)
+    node_to_cluster: dict[str, str] = {
+        gn.id: file_to_cluster[fs]
+        for fs, f_nodes in file_to_nodes.items()
+        if fs in file_to_cluster
+        for gn in f_nodes
+    }
 
     internal_calls: dict[str, int] = {cid: 0 for cid in cluster_meta}
     external_calls: dict[str, int] = {cid: 0 for cid in cluster_meta}
@@ -1027,6 +1222,14 @@ def execute_get_architecture(
         key=lambda n: (-(n.inbound_degree + n.outbound_degree), -n.line_count, n.id),
     )[:15]
 
+    scc_cycles = find_scc_cycles(cluster_deps)
+    coupling: dict[str, dict[str, float]] = {}
+    for cid in cluster_meta:
+        ce = float(len(cluster_deps[cid]))
+        ca = float(sum(1 for other, deps in cluster_deps.items() if cid in deps))
+        instability = round(ce / (ca + ce), 4) if (ca + ce) > 0 else 0.0
+        coupling[cid] = {"ca": ca, "ce": ce, "instability": instability}
+
     store.verify_access_epoch_and_authorize(expected_epoch)
     return GetArchitectureResult(
         revision=rev,
@@ -1036,7 +1239,145 @@ def execute_get_architecture(
         languages=lang_counts,
         clusters=clusters_out[: request.max_clusters],
         hotspots=hotspots,
+        cycles=scc_cycles,
+        coupling=coupling,
     )
+
+
+MAX_CLASSIFIED_FILES = 1000
+
+
+class _FileChange(NamedTuple):
+    old_path: bytes | None
+    new_path: bytes | None
+    old_blob_oid: str | None
+    new_blob_oid: str | None
+    worktree_bytes: bytes | None = None
+
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test", "__tests__"})
+_TEST_FILE_RE = re.compile(
+    r"(?:^test_.*\.py|.*_test\.(?:py|go)|.*\.(?:test|spec)\.(?:ts|tsx|js|jsx)|.*Test\.(?:java|kt))$"
+)
+
+
+def is_test_path(path: str) -> bool:
+    """Match test files by directory segment or filename convention, never by substring."""
+    *dirs, leaf = path.split("/")
+    return any(d in _TEST_DIR_SEGMENTS for d in dirs) or bool(_TEST_FILE_RE.match(leaf))
+
+
+def _workspace_changes(
+    mirror: GitMirror,
+    workspace_path: Path,
+    active_rev: str,
+) -> list[_FileChange]:
+    """Diff the active revision's tree against the worktree, reading new content from disk.
+
+    Falls back to HEAD when the workspace clone lacks the active revision.
+    """
+    proc = None
+    for base in (active_rev, "HEAD"):
+        proc = run_safe_git(
+            ["diff-index", "-z", "--raw", "--no-abbrev", "--no-renames", "--end-of-options", base],
+            cwd=workspace_path,
+            empty_hooks_dir=mirror.empty_hooks_dir,
+            check=False,
+        )
+        if proc.returncode == 0:
+            break
+    if proc is None or proc.returncode != 0:
+        return []
+    root = workspace_path.resolve()
+    out: list[_FileChange] = []
+    for rc in parse_diff_tree_raw_z(proc.stdout, parent_index=0, parent_oid=None):
+        new_bytes = _read_worktree_file(root, rc.new_path) if rc.new_path is not None else None
+        out.append(_FileChange(rc.old_path, rc.new_path, rc.old_blob_oid, None, new_bytes))
+    return out
+
+
+def _read_worktree_file(root: Path, rel: bytes) -> bytes | None:
+    """Read a regular file inside `root`; symlinks and oversized files yield None."""
+    full = root / os.fsdecode(rel)
+    try:
+        st = full.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_PARSE_BYTES:
+            return None
+        if not full.resolve().is_relative_to(root):
+            return None
+        return full.read_bytes()
+    except OSError:
+        return None
+
+
+def _blob_symbols(
+    batch: CatFileBatchSession,
+    path: bytes | None,
+    blob_oid: str | None,
+    content: bytes | None,
+) -> tuple[bytes | None, list[ExtractedSymbol]]:
+    """Return a text blob's bytes and parsed symbols; binary, LFS, oversized, or unsupported blobs yield no symbols."""
+    if path is None:
+        return None, []
+    if content is None and blob_oid is not None:
+        obj = batch.read_object_bounded(blob_oid, max_bytes=MAX_PARSE_BYTES)
+        if obj is not None and obj[0] == "blob":
+            content = obj[2]
+    if content is None or b"\x00" in content or is_lfs_pointer(content):
+        return None, []
+    lang = detect_language_for_path(path)
+    if lang is None:
+        return content, []
+    return content, parse_blob(content, lang, blob_oid=blob_oid).symbols
+
+
+def _hunk_side_touches(start: int, count: int, line_start: int, line_end: int) -> bool:
+    if count == 0:
+        # A pure insertion sits after `start`, so it only lands inside a multi-line symbol.
+        return line_start <= start < line_end
+    return max(start, line_start) <= min(start + count - 1, line_end)
+
+
+def _classify_symbol_changes(
+    old_syms: list[ExtractedSymbol],
+    new_syms: list[ExtractedSymbol],
+    hunks: list[ParsedHunk],
+) -> list[tuple[str, str]]:
+    """Classify symbols by qualified name as added, deleted, signature_modified, or body_modified.
+
+    Symbols present on both sides that no hunk touches are left out.
+    """
+    # ponytail: overloads sharing a qualified name collapse to the first occurrence.
+    old_by_qn: dict[str, ExtractedSymbol] = {}
+    for sym in old_syms:
+        old_by_qn.setdefault(sym.qualified_name, sym)
+    new_by_qn: dict[str, ExtractedSymbol] = {}
+    for sym in new_syms:
+        new_by_qn.setdefault(sym.qualified_name, sym)
+
+    out: list[tuple[str, str]] = []
+    for qn in sorted(old_by_qn.keys() | new_by_qn.keys()):
+        old_sym = old_by_qn.get(qn)
+        new_sym = new_by_qn.get(qn)
+        if old_sym is None:
+            out.append((qn, "added"))
+            continue
+        if new_sym is None:
+            out.append((qn, "deleted"))
+            continue
+        touched = any(
+            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_end)
+            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_end)
+            for h in hunks
+        )
+        if not touched:
+            continue
+        header_touched = old_sym.signature != new_sym.signature or any(
+            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_start)
+            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_start)
+            for h in hunks
+        )
+        out.append((qn, "signature_modified" if header_touched else "body_modified"))
+    return out
 
 
 def execute_detect_changes(
@@ -1046,8 +1387,8 @@ def execute_detect_changes(
     *,
     workspace_path: Path | None = None,
 ) -> DetectChangesResult:
-    """Map git changes (either since a ref/commit `request.since` or dirty workspace files)
-    to directly modified symbols and trace inbound callers up to `request.depth`.
+    """Diff old and new blobs (since `request.since`, against the worktree, or the active commit's
+    own changes) to classify touched symbols, then trace inbound callers up to `request.depth`.
     """
     nodes, edges, expected_epoch = _load_active_graph(store)
     with store.read_snapshot() as snap:
@@ -1059,78 +1400,87 @@ def execute_detect_changes(
                 retryable=False,
             )
 
-    changed_paths: set[str] = set()
+    file_changes: list[_FileChange] = []
     compared = False
     if request.since:
         compared = True
         src_repo = mirror.verify_source_binding()
         base_oid = mirror.resolve_source_revision(src_repo, request.since)
-        raw_changes = mirror.diff_tree_parent(base_oid, active_rev, parent_index=0)
-        for rc in raw_changes:
-            if rc.new_path is not None:
-                changed_paths.add(path_bytes_to_display(rc.new_path)[0])
-            if rc.old_path is not None:
-                changed_paths.add(path_bytes_to_display(rc.old_path)[0])
+        for rc in mirror.diff_tree_parent(base_oid, active_rev, parent_index=0):
+            file_changes.append(_FileChange(rc.old_path, rc.new_path, rc.old_blob_oid, rc.new_blob_oid))
     elif workspace_path is not None and workspace_path.exists():
         compared = True
-        ws_head_proc = run_safe_git(
-            ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
-            cwd=workspace_path,
-            empty_hooks_dir=mirror.empty_hooks_dir,
-            check=False,
-        )
-        if ws_head_proc.returncode == 0:
-            ws_head_oid = ws_head_proc.stdout.decode("ascii", errors="replace").strip()
-            if ws_head_oid and ws_head_oid != active_rev:
-                raw_changes = mirror.diff_tree_parent(active_rev, ws_head_oid, parent_index=0)
-                for rc in raw_changes:
-                    if rc.new_path is not None:
-                        changed_paths.add(path_bytes_to_display(rc.new_path)[0])
-                    if rc.old_path is not None:
-                        changed_paths.add(path_bytes_to_display(rc.old_path)[0])
-        for diff_args in (
-            ["diff-index", "-z", "--name-only", "--cached", "HEAD"],
-            ["diff-files", "-z", "--name-only"],
-        ):
-            diff_proc = run_safe_git(
-                diff_args,
-                cwd=workspace_path,
-                empty_hooks_dir=mirror.empty_hooks_dir,
-                check=False,
-            )
-            if diff_proc.returncode != 0:
-                continue
-            for part in diff_proc.stdout.split(b"\0"):
-                if part:
-                    changed_paths.add(path_bytes_to_display(part)[0])
+        file_changes = _workspace_changes(mirror, workspace_path, active_rev)
 
-    if not changed_paths and not compared:
+    if not file_changes and not compared:
         with store.connect_read() as conn:
             c_rows = conn.execute(
-                "SELECT new_path, old_path FROM changes WHERE commit_oid = ?",
+                """
+                SELECT old_path, new_path, old_blob_oid, new_blob_oid FROM changes
+                WHERE commit_oid = ? ORDER BY parent_index ASC, id ASC
+                """,
                 (active_rev,),
             ).fetchall()
-            for cr in c_rows:
-                if cr["new_path"]:
-                    changed_paths.add(path_bytes_to_display(bytes(cr["new_path"]))[0])
-                if cr["old_path"]:
-                    changed_paths.add(path_bytes_to_display(bytes(cr["old_path"]))[0])
+        seen_change_paths: set[bytes] = set()
+        for cr in c_rows:
+            old_p = bytes(cr["old_path"]) if cr["old_path"] is not None else None
+            new_p = bytes(cr["new_path"]) if cr["new_path"] is not None else None
+            key = new_p if new_p is not None else old_p
+            if key is None or key in seen_change_paths:
+                continue
+            seen_change_paths.add(key)
+            file_changes.append(_FileChange(old_p, new_p, cr["old_blob_oid"], cr["new_blob_oid"]))
 
-    modified_syms = [
-        n for n in nodes.values() if n.file_path in changed_paths
-    ]
+    changed_paths: set[str] = set()
+    for old_p, new_p, _, _, _ in file_changes:
+        for p in (old_p, new_p):
+            if p is not None:
+                changed_paths.add(path_bytes_to_display(p)[0])
+
+    classifications: dict[str, str] = {}
+    seed_keys: set[tuple[str, str]] = set()
+    deleted_symbols: list[str] = []
+    with mirror.open_batch_session() as batch:
+        # ponytail: only the first MAX_CLASSIFIED_FILES changes are parsed; huge diffs list files but not every symbol.
+        for old_p, new_p, old_oid, new_oid, new_bytes_ws in file_changes[:MAX_CLASSIFIED_FILES]:
+            old_bytes, old_syms = _blob_symbols(batch, old_p, old_oid, None)
+            new_bytes, new_syms = _blob_symbols(batch, new_p, new_oid, new_bytes_ws)
+            if not old_syms and not new_syms:
+                continue
+            hunks = compute_unified_zero_hunks(old_bytes, new_bytes)
+            old_disp = path_bytes_to_display(old_p)[0] if old_p is not None else None
+            new_disp = path_bytes_to_display(new_p)[0] if new_p is not None else None
+            for qn, kind in _classify_symbol_changes(old_syms, new_syms, hunks):
+                classifications[qn] = kind
+                if kind == "deleted":
+                    deleted_symbols.append(qn)
+                for disp in (new_disp, old_disp):
+                    if disp is not None:
+                        seed_keys.add((disp, qn))
+
+    deleted_set = set(deleted_symbols)
+    seed_ids: set[str] = set()
+    modified_syms: list[GraphNode] = []
+    for n in nodes.values():
+        if (n.file_path, n.qualified_name) in seed_keys:
+            seed_ids.add(n.id)
+            if n.qualified_name not in deleted_set:
+                modified_syms.append(n)
     modified_ids = {n.id for n in modified_syms}
 
     inbound_adj: dict[str, list[tuple[str, str, str]]] = {}
+    tested_by: dict[str, list[str]] = {}
     for f_id, t_id, etype, method in edges:
         if etype == "CALLS":
             inbound_adj.setdefault(t_id, []).append((f_id, etype, method))
+        elif etype == "TESTS":
+            tested_by.setdefault(t_id, []).append(f_id)
 
     affected_callers: dict[str, GraphNode] = {}
     impact_edges: list[GraphEdge] = []
     seen_edges: set[tuple[str, str]] = set()
-    queue: deque[tuple[str, int]] = deque((nid, 0) for nid in modified_ids)
-    visited = set(modified_ids)
+    queue: deque[tuple[str, int]] = deque((nid, 0) for nid in sorted(seed_ids))
+    visited = set(seed_ids)
 
     while queue and len(impact_edges) < request.limit:
         cur_id, d = queue.popleft()
@@ -1157,12 +1507,25 @@ def execute_detect_changes(
                 visited.add(caller_id)
                 queue.append((caller_id, nd))
 
+    affected_syms_list = modified_syms[: request.limit] + list(affected_callers.values())[: request.limit]
+
+    affected_tests_set: set[str] = set()
+    for sid in seed_ids | affected_callers.keys():
+        if is_test_path(nodes[sid].file_path):
+            affected_tests_set.add(nodes[sid].qualified_name)
+        for test_id in tested_by.get(sid, []):
+            affected_tests_set.add(nodes[test_id].qualified_name)
+
     store.verify_access_epoch_and_authorize(expected_epoch)
     return DetectChangesResult(
         changed_files=sorted(changed_paths),
         directly_modified_symbols=modified_syms[: request.limit],
         affected_callers=list(affected_callers.values())[: request.limit],
         impact_edges=impact_edges,
+        affected_symbols=affected_syms_list[: request.limit],
+        deleted_symbols=sorted(deleted_set),
+        classifications=classifications,
+        affected_tests=sorted(affected_tests_set),
     )
 
 
@@ -1197,7 +1560,6 @@ def execute_get_code_snippet(
             retryable=False,
         )
 
-    # Prefer exact qualified_name match
     exact_q = [n for n in candidates if n.qualified_name == q]
     target_node = exact_q[0] if exact_q else candidates[0]
 
