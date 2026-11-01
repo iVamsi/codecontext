@@ -141,7 +141,8 @@ def _drain_commit_diff_jobs(
                         Store.resolve_gaps_in_scope(
                             job_conn, scope=f"git:commit:{commit_oid}", code="IO_ERROR"
                         )
-                except SyncDeadlineExceeded:
+                except (SyncDeadlineExceeded, sqlite3.Error):
+                    # Deadline interrupts and busy/locked errors are store-level, not this commit's fault.
                     raise
                 except CodeContextError as exc:
                     failed_this_sync.append(job_id)

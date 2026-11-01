@@ -488,6 +488,33 @@ def test_unexpected_error_in_one_commit_does_not_block_others(
         assert sum(r["state"] == "complete" for r in jobs.values()) == len(jobs) - 1
 
 
+def test_sqlite_error_in_job_propagates_without_burning_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from codecontext import sync
+
+    repo = _linear_repo(tmp_path / "repo", 3)
+    bad = run_git_fixture(repo, ["rev-parse", "HEAD~1"]).decode().strip()
+    original = sync.index_commit_changes_and_hunks
+
+    def interrupted(store, mirror, commit_oid, **kwargs):
+        if commit_oid == bad:
+            raise sqlite3.OperationalError("interrupted")
+        return original(store, mirror, commit_oid, **kwargs)
+
+    monkeypatch.setattr(sync, "index_commit_changes_and_hunks", interrupted)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            mem.sync(SyncRequest(offline=True))
+        with mem._store.connect_read() as conn:
+            row = conn.execute(
+                "SELECT attempts, last_error_code FROM jobs WHERE owner_id = ?", (bad,)
+            ).fetchone()
+        assert row["attempts"] == 0 and row["last_error_code"] is None
+
+
 def test_missing_parent_skip_waits_for_every_parent(tmp_path: Path) -> None:
     from codecontext.store import Store
 
