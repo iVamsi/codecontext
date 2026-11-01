@@ -1,13 +1,16 @@
 import functools
 import itertools
+import json
 import os
 import posixpath
 import re
 import sqlite3
 import stat
-from collections import deque
-from collections.abc import Callable, Iterator
+import threading
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, NamedTuple
 
 from pydantic import Field
@@ -390,32 +393,70 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
         ) from exc
 
 
-def _load_active_graph(
-    store: Store,
-) -> tuple[dict[str, GraphNode], list[tuple[str, str, str, str]], int]:
-    """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`."""
-    with store.read_snapshot() as snap:
-        conn = snap.conn
-        expected_epoch = snap.access_epoch
-        sym_rows = conn.execute(
-            """
-            SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
-                   sf.path, e.language
-            FROM symbols s
-            JOIN extractions e ON e.id = s.extraction_id
-            JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
-            ORDER BY sf.path ASC, s.byte_start ASC, s.id ASC
-            """
-        ).fetchall()
+MAX_NODE_NAME_CHARS = 1000
+MAX_NODE_QUALIFIED_NAME_CHARS = 2000
+MAX_NODE_SIGNATURE_CHARS = 4000
 
-        rel_rows = conn.execute(
-            """
-            SELECT from_id, to_id, relation_kind, method
-            FROM relations
-            WHERE from_kind = 'symbol' AND to_kind = 'symbol' AND state = 'active'
-            ORDER BY id ASC
-            """
-        ).fetchall()
+
+def _graph_node(**fields: Any) -> GraphNode:
+    """Build a node with display text cut to the public model's limits; ids stay exact."""
+    fields["name"] = fields["name"][:MAX_NODE_NAME_CHARS]
+    fields["qualified_name"] = fields["qualified_name"][:MAX_NODE_QUALIFIED_NAME_CHARS]
+    fields["signature"] = fields["signature"][:MAX_NODE_SIGNATURE_CHARS]
+    return GraphNode(**fields)
+
+
+type GraphEdgeRow = tuple[str, str, str, str]
+type ActiveGraph = tuple[Mapping[str, GraphNode], tuple[GraphEdgeRow, ...]]
+
+GRAPH_CACHE_MAX_ENTRIES = 2
+_graph_cache: OrderedDict[tuple[str, str | None, int, int], ActiveGraph] = OrderedDict()
+_graph_cache_lock = threading.Lock()
+
+
+def _load_active_graph(store: Store) -> tuple[Mapping[str, GraphNode], tuple[GraphEdgeRow, ...], int]:
+    """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`.
+
+    Results are shared between calls, so the node map is read-only and edges are a tuple.
+    Every store write bumps `generation`, which changes the cache key.
+    """
+    with store.read_snapshot() as snap:
+        expected_epoch = snap.access_epoch
+        key = (str(store.db_path), snap.revision, snap.generation, snap.access_epoch)
+        with _graph_cache_lock:
+            cached = _graph_cache.get(key)
+            if cached is not None:
+                _graph_cache.move_to_end(key)
+        if cached is None:
+            cached = _read_active_graph(snap.conn)
+            with _graph_cache_lock:
+                _graph_cache[key] = cached
+                while len(_graph_cache) > GRAPH_CACHE_MAX_ENTRIES:
+                    _graph_cache.popitem(last=False)
+    nodes, edges = cached
+    return nodes, edges, expected_epoch
+
+
+def _read_active_graph(conn: sqlite3.Connection) -> ActiveGraph:
+    sym_rows = conn.execute(
+        """
+        SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
+               sf.path, e.language
+        FROM symbols s
+        JOIN extractions e ON e.id = s.extraction_id
+        JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+        ORDER BY sf.path ASC, s.byte_start ASC, s.id ASC
+        """
+    ).fetchall()
+
+    rel_rows = conn.execute(
+        """
+        SELECT from_id, to_id, relation_kind, method
+        FROM relations
+        WHERE from_kind = 'symbol' AND to_kind = 'symbol' AND state = 'active'
+        ORDER BY id ASC
+        """
+    ).fetchall()
 
     raw_nodes: dict[str, dict[str, Any]] = {}
     for r in sym_rows:
@@ -429,7 +470,6 @@ def _load_active_graph(
             "file_path": disp_p,
             "id": sid,
             "inbound": 0,
-            "kind": str(r["kind"]),
             "label": _kind_to_label(str(r["kind"])),
             "language": str(r["language"]),
             "line_count": max(1, l_end - l_start + 1),
@@ -441,7 +481,7 @@ def _load_active_graph(
             "signature": str(r["signature"]),
         }
 
-    edges: list[tuple[str, str, str, str]] = []
+    edges: list[GraphEdgeRow] = []
     seen_pairs: set[tuple[str, str, str]] = set()
     for rr in rel_rows:
         f_id = str(rr["from_id"])
@@ -459,8 +499,8 @@ def _load_active_graph(
             raw_nodes[f_id]["outbound"] += 1
             raw_nodes[t_id]["inbound"] += 1
 
-    nodes: dict[str, GraphNode] = {
-        sid: GraphNode(
+    nodes = {
+        sid: _graph_node(
             id=d["id"],
             label=d["label"],
             name=d["name"],
@@ -476,7 +516,25 @@ def _load_active_graph(
         )
         for sid, d in raw_nodes.items()
     }
-    return nodes, edges, expected_epoch
+    return MappingProxyType(nodes), tuple(edges)
+
+
+def _degree_columns(owner_id: str, relation_filter: str) -> str:
+    """SQL columns counting distinct active symbol neighbours inside the snapshot, per direction."""
+    columns = []
+    for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
+        columns.append(f"""(SELECT COUNT(*) FROM (
+            SELECT DISTINCT r.{other}, r.relation_kind
+            FROM relations r INDEXED BY relations_{own.removesuffix("_id")}
+            WHERE r.{own} = {owner_id} AND r.from_kind = 'symbol'
+              AND r.to_kind = 'symbol' AND r.state = 'active' {relation_filter}
+              AND EXISTS (
+                SELECT 1 FROM symbols endpoint
+                JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
+                WHERE endpoint.id = r.{other}
+              )
+        )) AS {alias}""")
+    return ", ".join(columns)
 
 
 @_bounded_by_graph_time_limit
@@ -517,19 +575,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
                 else request.relationship.lower()
             )
             relation_filter = f"AND r.relation_kind = '{relation_kind}'"
-        degrees = []
-        for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
-            degrees.append(f"""(SELECT COUNT(*) FROM (
-                SELECT DISTINCT r.{other}, r.relation_kind
-                FROM relations r INDEXED BY relations_{own.removesuffix("_id")}
-                WHERE r.{own} = filtered.id AND r.from_kind = 'symbol'
-                  AND r.to_kind = 'symbol' AND r.state = 'active' {relation_filter}
-                  AND EXISTS (
-                    SELECT 1 FROM symbols endpoint
-                    JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
-                    WHERE endpoint.id = r.{other}
-                  )
-            )) AS {alias}""")
+        degrees = _degree_columns("filtered.id", relation_filter)
         degree_expr = {"inbound": "inbound_degree", "outbound": "outbound_degree", "both": "inbound_degree + outbound_degree"}[request.direction]
         degree_conditions = []
         for op, bound in [(">=", request.min_degree), ("<=", request.max_degree)]:
@@ -551,17 +597,25 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
             ), filtered AS (
                 SELECT * FROM nodes WHERE {where}
             ), degrees AS (
-                SELECT filtered.*, {', '.join(degrees)} FROM filtered
-            ), matched AS (
+                SELECT filtered.*, {degrees} FROM filtered
+            ), matched AS MATERIALIZED (
                 SELECT * FROM degrees WHERE {degree_where}
             )
+            SELECT page.*, total.matched_count
+            FROM (SELECT COUNT(*) AS matched_count FROM matched) AS total
+            LEFT JOIN (
+                SELECT * FROM matched ORDER BY file_path, line_start, id LIMIT ? OFFSET ?
+            ) AS page ON 1
+            ORDER BY page.file_path, page.line_start, page.id
         """
-        total = int(conn.execute(sql + "SELECT COUNT(*) FROM matched", params).fetchone()[0])
-        rows = conn.execute(
-            sql + "SELECT * FROM matched ORDER BY file_path, line_start, id LIMIT ? OFFSET ?",
-            [*params, request.limit, request.offset],
-        ).fetchall()
-        nodes = [GraphNode(**dict(row)) for row in rows]
+        # The LEFT JOIN keeps one row carrying the total even when the page is empty.
+        rows = conn.execute(sql, [*params, request.limit, request.offset]).fetchall()
+        total = int(rows[0]["matched_count"])
+        nodes = [
+            _graph_node(**{k: row[k] for k in row.keys() if k != "matched_count"})
+            for row in rows
+            if row["id"] is not None
+        ]
         expected_epoch = snap.access_epoch
     store.verify_access_epoch_and_authorize(expected_epoch)
     return SearchGraphResult(
@@ -1131,7 +1185,10 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
 
 
 def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
-    """Find all cyclic Strongly Connected Components using Tarjan's algorithm."""
+    """Find all cyclic Strongly Connected Components using Tarjan's algorithm.
+
+    Uses an explicit work stack so long call chains cannot hit Python's recursion limit.
+    """
     index = 0
     indices: dict[str, int] = {}
     lowlinks: dict[str, int] = {}
@@ -1139,35 +1196,45 @@ def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
     stack: list[str] = []
     cycles: list[list[str]] = []
 
-    def strongconnect(v: str) -> None:
-        nonlocal index
-        indices[v] = index
-        lowlinks[v] = index
+    for root in sorted(adj.keys()):
+        if root in indices:
+            continue
+        work: list[tuple[str, Iterator[str]]] = []
+        indices[root] = lowlinks[root] = index
         index += 1
-        stack.append(v)
-        on_stack.add(v)
-
-        for w in sorted(adj.get(v, set())):
-            if w not in indices:
-                strongconnect(w)
-                lowlinks[v] = min(lowlinks[v], lowlinks[w])
-            elif w in on_stack:
-                lowlinks[v] = min(lowlinks[v], indices[w])
-
-        if lowlinks[v] == indices[v]:
-            scc: list[str] = []
-            while True:
-                w = stack.pop()
-                on_stack.remove(w)
-                scc.append(w)
-                if w == v:
+        stack.append(root)
+        on_stack.add(root)
+        work.append((root, iter(sorted(adj.get(root, set())))))
+        while work:
+            v, successors = work[-1]
+            descended = False
+            for w in successors:
+                if w not in indices:
+                    indices[w] = lowlinks[w] = index
+                    index += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(sorted(adj.get(w, set())))))
+                    descended = True
                     break
-            if len(scc) > 1 or (len(scc) == 1 and v in adj.get(v, set())):
-                cycles.append(sorted(scc))
-
-    for node in sorted(adj.keys()):
-        if node not in indices:
-            strongconnect(node)
+                if w in on_stack:
+                    lowlinks[v] = min(lowlinks[v], indices[w])
+            if descended:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlinks[parent] = min(lowlinks[parent], lowlinks[v])
+            if lowlinks[v] == indices[v]:
+                scc: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack.remove(w)
+                    scc.append(w)
+                    if w == v:
+                        break
+                if len(scc) > 1 or v in adj.get(v, set()):
+                    cycles.append(sorted(scc))
     return sorted(cycles, key=lambda c: (len(c), c))
 
 
@@ -1241,8 +1308,8 @@ def detect_louvain_communities(
 
 def _cluster_files(
     groups: list[Any],
-    nodes: dict[str, GraphNode],
-    edges: list[tuple[str, str, str, str]],
+    nodes: Mapping[str, GraphNode],
+    edges: tuple[GraphEdgeRow, ...],
 ) -> tuple[dict[str, str], dict[str, list[str]], dict[str, tuple[str, str]]]:
     """Cluster files by Louvain over the cross-file call graph; files without calls stay in their snapshot group.
 
@@ -1592,9 +1659,8 @@ def execute_detect_changes(
             if p is not None:
                 changed_paths.add(path_bytes_to_display(p)[0])
 
-    classifications: dict[str, str] = {}
-    seed_keys: set[tuple[str, str]] = set()
-    deleted_symbols: list[str] = []
+    # Keyed by (display path, qualified name) so the same name in two files stays separate.
+    classifications: dict[tuple[str, str], str] = {}
     with mirror.open_batch_session() as batch:
         # ponytail: only the first MAX_CLASSIFIED_FILES changes are parsed; huge diffs list files but not every symbol.
         for old_p, new_p, old_oid, new_oid, new_bytes_ws in file_changes[:MAX_CLASSIFIED_FILES]:
@@ -1606,20 +1672,17 @@ def execute_detect_changes(
             old_disp = path_bytes_to_display(old_p)[0] if old_p is not None else None
             new_disp = path_bytes_to_display(new_p)[0] if new_p is not None else None
             for qn, kind in _classify_symbol_changes(old_syms, new_syms, hunks):
-                classifications[qn] = kind
-                if kind == "deleted":
-                    deleted_symbols.append(qn)
                 for disp in (new_disp, old_disp):
                     if disp is not None:
-                        seed_keys.add((disp, qn))
+                        classifications[(disp, qn[:MAX_NODE_QUALIFIED_NAME_CHARS])] = kind
 
-    deleted_set = set(deleted_symbols)
     seed_ids: set[str] = set()
     modified_syms: list[GraphNode] = []
     for n in nodes.values():
-        if (n.file_path, n.qualified_name) in seed_keys:
+        kind = classifications.get((n.file_path, n.qualified_name))
+        if kind is not None:
             seed_ids.add(n.id)
-            if n.qualified_name not in deleted_set:
+            if kind != "deleted":
                 modified_syms.append(n)
     modified_ids = {n.id for n in modified_syms}
 
@@ -1678,9 +1741,53 @@ def execute_detect_changes(
         affected_callers=list(affected_callers.values())[: request.limit],
         impact_edges=impact_edges,
         affected_symbols=affected_syms_list[: request.limit],
-        deleted_symbols=sorted(deleted_set),
-        classifications=classifications,
+        deleted_symbols=sorted({qn for (_, qn), kind in classifications.items() if kind == "deleted"}),
+        classifications={qn: kind for (_, qn), kind in sorted(classifications.items())},
         affected_tests=sorted(affected_tests_set),
+    )
+
+
+_SNAPSHOT_SYMBOL_SQL = """
+    SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
+           s.byte_start, s.byte_end, e.blob_oid, e.language, MIN(sf.path) AS path {extra_columns}
+    FROM symbols s
+    JOIN extractions e ON e.id = s.extraction_id
+    JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+    WHERE {where}
+    GROUP BY s.id
+    ORDER BY path, s.byte_start, s.id
+"""
+
+_CALL_NEIGHBOUR_SQL = """
+    SELECT r.{other} FROM relations r INDEXED BY relations_{own_index}
+    WHERE r.{own} = ? AND r.from_kind = 'symbol' AND r.to_kind = 'symbol'
+      AND r.state = 'active' AND r.relation_kind = 'calls_candidate' {extra}
+      AND EXISTS (
+        SELECT 1 FROM symbols endpoint
+        JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
+        WHERE endpoint.id = r.{other}
+      )
+    GROUP BY r.{other} ORDER BY MIN(r.id) LIMIT ?
+"""
+MAX_SNIPPET_NEIGHBOURS = 25
+
+
+def _row_to_graph_node(row: sqlite3.Row) -> GraphNode:
+    l_start = int(row["line_start"])
+    l_end = int(row["line_end"])
+    return _graph_node(
+        id=str(row["id"]),
+        label=_kind_to_label(str(row["kind"])),
+        name=str(row["name"]),
+        qualified_name=str(row["qualified_name"]),
+        file_path=path_bytes_to_display(bytes(row["path"]))[0],
+        language=str(row["language"]),
+        line_start=l_start,
+        line_end=l_end,
+        signature=str(row["signature"]),
+        inbound_degree=int(row["inbound_degree"]),
+        outbound_degree=int(row["outbound_degree"]),
+        line_count=max(1, l_end - l_start + 1),
     )
 
 
@@ -1693,73 +1800,90 @@ def execute_get_code_snippet(
     """Retrieve exact symbol source code by `qualified_name` (or short `name`) and optional `file_path`,
     along with direct callers and callees when `include_neighbors=True`.
     """
-    nodes, edges, expected_epoch = _load_active_graph(store)
     q = request.qualified_name.strip()
 
-    candidates = [
-        n
-        for n in nodes.values()
-        if (n.id == q or n.qualified_name == q or n.name == q)
-        and (request.file_path is None or n.file_path == request.file_path)
-    ]
-    if not candidates:
+    def in_requested_file(row: sqlite3.Row) -> bool:
+        return request.file_path is None or path_bytes_to_display(bytes(row["path"]))[0] == request.file_path
+
+    with store.read_snapshot() as snap:
+        conn = snap.conn
         candidates = [
-            n
-            for n in nodes.values()
-            if q.lower() in n.qualified_name.lower()
-            and (request.file_path is None or n.file_path == request.file_path)
+            row
+            for row in conn.execute(
+                _SNAPSHOT_SYMBOL_SQL.format(
+                    extra_columns="", where="(s.id = ? OR s.qualified_name = ? OR s.name = ?)"
+                ),
+                (q, q, q),
+            )
+            if in_requested_file(row)
         ]
-    if not candidates:
-        raise CodeContextError(
-            code="RECORD_NOT_FOUND",
-            message=f"Symbol {q!r} not found in active snapshot.",
-            retryable=False,
-        )
+        if not candidates:
+            needle = q.lower()
+            conn.create_function(
+                "contains_needle", 1, lambda value: needle in str(value).lower(), deterministic=True
+            )
+            candidates = [
+                row
+                for row in conn.execute(
+                    _SNAPSHOT_SYMBOL_SQL.format(extra_columns="", where="contains_needle(s.qualified_name)")
+                )
+                if in_requested_file(row)
+            ]
+        if not candidates:
+            raise CodeContextError(
+                code="RECORD_NOT_FOUND",
+                message=f"Symbol {q!r} not found in active snapshot.",
+                retryable=False,
+            )
+        exact_q = [row for row in candidates if row["qualified_name"] == q]
+        target = exact_q[0] if exact_q else candidates[0]
+        target_id = str(target["id"])
 
-    exact_q = [n for n in candidates if n.qualified_name == q]
-    target_node = exact_q[0] if exact_q else candidates[0]
-
-    with store.connect_read() as conn:
-        srow = conn.execute(
-            """
-            SELECT s.byte_start, s.byte_end, e.blob_oid
-            FROM symbols s
-            JOIN extractions e ON e.id = s.extraction_id
-            WHERE s.id = ?
-            """,
-            (target_node.id,),
-        ).fetchone()
-    if not srow:
-        raise CodeContextError(
-            code="RECORD_NOT_FOUND",
-            message=f"Symbol {target_node.id} not found.",
-            retryable=False,
-        )
+        caller_ids: list[str] = []
+        callee_ids: list[str] = []
+        if request.include_neighbors:
+            caller_ids = [
+                str(r[0])
+                for r in conn.execute(
+                    _CALL_NEIGHBOUR_SQL.format(own="to_id", other="from_id", own_index="to", extra=""),
+                    (target_id, MAX_SNIPPET_NEIGHBOURS),
+                )
+            ]
+            callee_ids = [
+                str(r[0])
+                for r in conn.execute(
+                    _CALL_NEIGHBOUR_SQL.format(
+                        own="from_id", other="to_id", own_index="from", extra="AND r.to_id != r.from_id"
+                    ),
+                    (target_id, MAX_SNIPPET_NEIGHBOURS),
+                )
+            ]
+        wanted = [target_id, *caller_ids, *callee_ids]
+        by_id = {
+            str(row["id"]): _row_to_graph_node(row)
+            for row in conn.execute(
+                _SNAPSHOT_SYMBOL_SQL.format(
+                    extra_columns=", " + _degree_columns("s.id", "AND r.relation_kind = 'calls_candidate'"),
+                    where="s.id IN (SELECT value FROM json_each(?))",
+                ),
+                (json.dumps(wanted),),
+            )
+        }
+        expected_epoch = snap.access_epoch
 
     with mirror.open_batch_session() as batch:
-        b_obj = batch.read_object(str(srow["blob_oid"]))
+        b_obj = batch.read_object(str(target["blob_oid"]))
     code_text = ""
     if b_obj is not None:
         raw_b = b_obj[2]
-        code_text = raw_b[int(srow["byte_start"]) : int(srow["byte_end"])].decode(
+        code_text = raw_b[int(target["byte_start"]) : int(target["byte_end"])].decode(
             "utf-8", errors="replace"
         )[:16384]
 
-    callers: list[GraphNode] = []
-    callees: list[GraphNode] = []
-    if request.include_neighbors:
-        for f_id, t_id, etype, _ in edges:
-            if etype != "CALLS":
-                continue
-            if t_id == target_node.id and f_id in nodes:
-                callers.append(nodes[f_id])
-            elif f_id == target_node.id and t_id in nodes:
-                callees.append(nodes[t_id])
-
     store.verify_access_epoch_and_authorize(expected_epoch)
     return GetCodeSnippetResult(
-        node=target_node,
+        node=by_id[target_id],
         code=code_text,
-        callers=callers[:25],
-        callees=callees[:25],
+        callers=[by_id[i] for i in caller_ids if i in by_id],
+        callees=[by_id[i] for i in callee_ids if i in by_id],
     )

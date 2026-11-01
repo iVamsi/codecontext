@@ -1,3 +1,4 @@
+import sqlite3
 import time
 from pathlib import Path
 
@@ -8,12 +9,15 @@ from codecontext.errors import CodeContextError
 from codecontext.graph import (
     DetectChangesRequest,
     GetArchitectureRequest,
+    GetCodeSnippetRequest,
     QueryGraphRequest,
     SearchGraphRequest,
     TracePathRequest,
     compile_safe_regex,
+    find_scc_cycles,
     is_test_path,
 )
+from codecontext.store import Store
 from tests.fixtures.builders import GitCommitSpec, commit_fixture_spec, init_fixture_repo
 
 MOD_V0 = (
@@ -340,3 +344,139 @@ def test_trace_path_roots_capped(tmp_path: Path) -> None:
         assert everything.total_matched == 7
         res = mem.trace_path(TracePathRequest(function_name="__init__", limit=5))
         assert len(res.root_nodes) <= 5
+
+
+def _trace_sql(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    statements: list[str] = []
+    original = Store._open_raw_connection
+
+    def traced(self: Store, *, for_write: bool) -> sqlite3.Connection:
+        conn = original(self, for_write=for_write)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(Store, "_open_raw_connection", traced)
+    return statements
+
+
+def test_scc_long_chain_no_recursion_error() -> None:
+    assert find_scc_cycles({f"c{i:05d}": {f"c{i + 1:05d}"} for i in range(5000)}) == []
+    ring = {f"r{i:05d}": {f"r{(i + 1) % 5000:05d}"} for i in range(5000)}
+    assert find_scc_cycles(ring) == [sorted(ring)]
+    assert find_scc_cycles({"a": {"a", "b"}, "b": {"c"}, "c": {"b"}}) == [["a"], ["b", "c"]]
+
+
+def test_detect_changes_same_name_in_two_files(tmp_path: Path) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    base = commit_fixture_spec(
+        repo,
+        GitCommitSpec(
+            message="C0",
+            files={
+                "a.py": b"def main():\n    return 1\n\ndef other():\n    return 2\n",
+                "b.py": b"def main():\n    return 1\n",
+            },
+        ),
+    )
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(
+            message="C1",
+            files={"a.py": b"def other():\n    return 2\n", "b.py": b"def main():\n    return 3\n"},
+        ),
+    )
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        res = mem.detect_changes(DetectChangesRequest(since=base))
+
+    assert ("b.py", "main") in {(s.file_path, s.qualified_name) for s in res.directly_modified_symbols}
+    assert res.deleted_symbols == ["main"]
+
+
+def test_get_code_snippet_does_not_scan_symbols(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, _ = _build_repo(tmp_path)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        traced_sql = _trace_sql(monkeypatch)
+        res = mem.get_code_snippet(GetCodeSnippetRequest(qualified_name="body", include_neighbors=True))
+
+    assert res.node.file_path == "src/mod.py"
+    assert res.code == "def body(a):\n    return a + 1"
+    assert {n.name for n in res.callers} == {"attest", "test_body"}
+    assert res.node.inbound_degree == 2
+    assert res.callees == []
+    assert traced_sql
+    assert not any("FROM symbols" in s and "WHERE" not in s for s in traced_sql)
+
+
+def test_search_graph_degree_computed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        traced_sql = _trace_sql(monkeypatch)
+        res = mem.search_graph(SearchGraphRequest(name_pattern="load", limit=3, offset=1))
+        assert len(res.nodes) == 3
+        assert res.total_matched == 7
+        assert res.has_more is True
+        assert sum("inbound_degree" in s for s in traced_sql) == 1
+
+        past_end = mem.search_graph(SearchGraphRequest(name_pattern="load", offset=50))
+        assert past_end.nodes == []
+        assert past_end.total_matched == 7
+        assert past_end.has_more is False
+
+
+def test_graph_cache_sees_newly_synced_symbol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="C0", files={"m.py": b"def first():\n    return 1\n"}))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        assert mem.trace_path(TracePathRequest(function_name="first")).root_nodes
+        traced_sql = _trace_sql(monkeypatch)
+        assert mem.trace_path(TracePathRequest(function_name="first")).root_nodes
+        assert not any("FROM symbols" in s for s in traced_sql)
+
+        commit_fixture_spec(
+            repo, GitCommitSpec(message="C1", files={"m.py": b"def second():\n    return 2\n"})
+        )
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        assert [n.name for n in mem.trace_path(TracePathRequest(function_name="second")).root_nodes] == [
+            "second"
+        ]
+        assert mem.query_graph(QueryGraphRequest(query="MATCH (n) RETURN n.name")).rows == [
+            {"n.name": "second"}
+        ]
+
+
+def test_graph_cache_cannot_be_mutated_by_callers(tmp_path: Path) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        nodes, edges, _ = graph._load_active_graph(mem._store)
+        with pytest.raises(TypeError):
+            nodes["x"] = next(iter(nodes.values()))  # type: ignore[index]
+        with pytest.raises(AttributeError):
+            edges.append(edges[0])  # type: ignore[attr-defined]
+
+
+def test_long_symbol_names_do_not_break_graph_tools(tmp_path: Path) -> None:
+    long_name = "f" * 3000
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(
+            message="C0",
+            files={
+                "src/m.py": (
+                    f"def {long_name}():\n    return 1\n\n"
+                    f"def caller():\n    return {long_name}()\n"
+                ).encode()
+            },
+        ),
+    )
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        traced = mem.trace_path(TracePathRequest(function_name="caller", direction="outbound"))
+        assert {len(n.name) for n in traced.visited_nodes} == {6, 1000}
+        rows = mem.query_graph(QueryGraphRequest(query="MATCH (n) RETURN n.name")).rows
+        assert sorted(len(r["n.name"]) for r in rows) == [6, 1000]
+        assert mem.get_architecture(GetArchitectureRequest()).total_symbols == 2
+        found = mem.search_graph(SearchGraphRequest(name_pattern="^fff"))
+        assert found.total_matched == 1
+        assert len(found.nodes[0].qualified_name) == 2000
