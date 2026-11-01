@@ -11,7 +11,7 @@ from pathlib import Path
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import NotificationParams, ToolAnnotations
 
 from codecontext import __version__
 from codecontext.errors import CodeContextError
@@ -139,10 +139,10 @@ def _submodule_discovery_key(root: Path) -> tuple[int, ...]:
 def _auto_bootstrap_store_if_needed(
     store_path: Path | None,
     workspace_path: Path | None,
+    *,
+    auto_init: bool,
 ) -> tuple[Path, Path | None]:
-    """Resolve `store_path` and `workspace_path`, auto-initializing `<workspace>/.codecontext`
-    and running an initial snapshot preparation if the store is not yet prepared.
-    """
+    """Resolve `store_path` and `workspace_path`, then prepare the store (see `_prepare_store`)."""
     ws = workspace_path.expanduser().resolve() if workspace_path is not None else None
     if ws is not None:
         git_top = _find_git_toplevel(ws)
@@ -158,8 +158,25 @@ def _auto_bootstrap_store_if_needed(
         if ws is None and st_path.name == ".codecontext":
             ws = st_path.parent
 
-    store_json = st_path / "store.json"
-    if not store_json.exists():
+    return st_path, _prepare_store(st_path, ws, auto_init=auto_init)
+
+
+def _prepare_store(st_path: Path, ws: Path | None, *, auto_init: bool) -> Path | None:
+    """Check the store exists and return the workspace to bind.
+
+    Only `auto_init` may write: it initializes a missing store for a Git workspace and
+    prepares HEAD when the store has no revision yet.
+    """
+    if not (st_path / "store.json").exists():
+        if not auto_init:
+            raise CodeContextError(
+                code="STORE_NOT_INITIALIZED",
+                message=(
+                    f"Store is not initialized at {st_path}. Run `codecontext init`, "
+                    "or start the server with `serve --auto-init`."
+                ),
+                retryable=False,
+            )
         git_top = _find_git_toplevel(ws) if ws is not None and ws.exists() else None
         if git_top is None:
             raise CodeContextError(
@@ -168,22 +185,19 @@ def _auto_bootstrap_store_if_needed(
                 retryable=False,
             )
         ws = git_top
-        if store_path is None:
-            st_path = ws / ".codecontext"
         gh_repo = detect_github_repository_from_git(ws)
         with Memory.initialize(
             st_path,
             InitRequest(repo_path=ws, github_repository=gh_repo),
         ) as mem:
             mem.sync(SyncRequest(revision="HEAD", offline=True, max_seconds=5))
-    elif ws is not None:
+    elif auto_init and ws is not None:
         with Memory.open(st_path, read_only=True) as ro_mem:
             needs_sync = ro_mem.status().revision is None
         if needs_sync:
             with Memory.open(st_path, read_only=False) as rw_mem:
                 rw_mem.sync(SyncRequest(revision="HEAD", offline=True, max_seconds=5))
-
-    return st_path, ws
+    return ws
 
 
 class _DynamicMemoryHolder:
@@ -194,19 +208,24 @@ class _DynamicMemoryHolder:
         pinned_memory: Memory | None,
         *,
         auto_sync: bool = False,
+        auto_init: bool = False,
         embedding_adapter: EmbeddingAdapter | None = None,
     ) -> None:
         self._pinned = pinned_memory
         self._auto_sync = auto_sync
+        self._auto_init = auto_init
         self._embedding_adapter = embedding_adapter
         self._initial_cwd_top = _find_git_toplevel(Path.cwd().resolve())
         self._default_root = self._initial_cwd_top
         self._memories: dict[Path, Memory] = {}
         self._submodule_cache: dict[Path, tuple[tuple[int, ...], list[Path]]] = {}
+        # Client root path -> Git toplevel; cleared on roots/list_changed.
+        self._toplevel_cache: dict[Path, Path | None] = {}
         self._last_sync_time: dict[Path, float] = {}
         # The event loop keeps only weak references to tasks.
         self._sync_tasks: set[asyncio.Task[object]] = set()
-        self._lock = asyncio.Lock()
+        # Per root, so a slow bootstrap does not block reads from other repositories.
+        self._root_locks: dict[Path, asyncio.Lock] = {}
 
     async def repositories(self, ctx: Context | None) -> list[Path]:
         roots: list[Path] = []
@@ -230,7 +249,11 @@ class _DynamicMemoryHolder:
                         if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
                             continue
                         path = Path(urllib.parse.unquote(uri.path))
-                        git_top = await asyncio.to_thread(_find_git_toplevel, path)
+                        if path not in self._toplevel_cache:
+                            self._toplevel_cache[path] = await asyncio.to_thread(
+                                _find_git_toplevel, path
+                            )
+                        git_top = self._toplevel_cache[path]
                         if git_top is not None and (not hasattr(os, "getuid") or git_top.stat().st_uid == os.getuid()):
                             roots.append(git_top)
 
@@ -265,6 +288,9 @@ class _DynamicMemoryHolder:
             self._default_root = found[0]
         return found
 
+    def clear_roots_cache(self) -> None:
+        self._toplevel_cache.clear()
+
     def _pinned_memory(self) -> Memory:
         assert self._pinned is not None
         if self._auto_sync:
@@ -294,21 +320,27 @@ class _DynamicMemoryHolder:
         if self._pinned is not None and candidate_ws == roots[0]:
             return self._pinned_memory()
 
+        mem = self._memories.get(candidate_ws)
+        if mem is None:
+            mem = await self._open_root(candidate_ws)
+        if self._auto_sync:
+            self._maybe_trigger_auto_sync(candidate_ws, mem)
+        return mem
+
+    async def _open_root(self, root: Path) -> Memory:
         def bootstrap() -> Memory:
-            st_path, ws_path = _auto_bootstrap_store_if_needed(None, candidate_ws)
+            st_path = root / ".codecontext"
+            ws_path = _prepare_store(st_path, root, auto_init=self._auto_init)
             mem = Memory.open(st_path, read_only=True)
             mem.configure_embedding_adapter(self._embedding_adapter)
             if ws_path is not None:
                 mem.configure_workspace(ws_path)
             return mem
 
-        async with self._lock:
-            if candidate_ws not in self._memories:
-                self._memories[candidate_ws] = await asyncio.to_thread(bootstrap)
-            mem = self._memories[candidate_ws]
-            if self._auto_sync:
-                self._maybe_trigger_auto_sync(candidate_ws, mem)
-            return mem
+        async with self._root_locks.setdefault(root, asyncio.Lock()):
+            if root not in self._memories:
+                self._memories[root] = await asyncio.to_thread(bootstrap)
+            return self._memories[root]
 
     def _maybe_trigger_auto_sync(self, root: Path, mem: Memory) -> asyncio.Task[object] | None:
         """Start a background offline sync at most once per 15 seconds per root."""
@@ -358,10 +390,13 @@ def create_mcp_server(
     model_adapter: ModelAdapter | None = None,
     enrich_concurrency: int = 1,
     embedding_adapter: EmbeddingAdapter | None = None,
+    auto_init: bool = False,
 ) -> tuple[MCPServer, _DynamicMemoryHolder]:
     """Create a read-only MCPServer bound to `store_path` and optional `workspace_path`.
-    If both are omitted, resolves the active project dynamically per session/root and
-    auto-bootstraps `<repo>/.codecontext`.
+    If both are omitted, resolves the active project dynamically per session/root.
+
+    Without `auto_init`, a missing store raises `STORE_NOT_INITIALIZED` and nothing is
+    written. With it, missing `<repo>/.codecontext` stores are initialized and synced.
 
     `allow_enrich` requires `model_adapter`. `embedding_adapter` turns on hybrid search.
     """
@@ -376,20 +411,33 @@ def create_mcp_server(
 
     pinned_memory: Memory | None = None
     if st_in is not None or ws_in is not None:
-        resolved_store, resolved_ws = _auto_bootstrap_store_if_needed(st_in, ws_in)
+        resolved_store, resolved_ws = _auto_bootstrap_store_if_needed(
+            st_in, ws_in, auto_init=auto_init
+        )
         pinned_memory = Memory.open(resolved_store, read_only=True)
         pinned_memory.configure_embedding_adapter(embedding_adapter)
         if resolved_ws is not None:
             pinned_memory.configure_workspace(resolved_ws)
 
     holder = _DynamicMemoryHolder(
-        pinned_memory, auto_sync=auto_sync, embedding_adapter=embedding_adapter
+        pinned_memory,
+        auto_sync=auto_sync,
+        auto_init=auto_init,
+        embedding_adapter=embedding_adapter,
     )
     semaphore = asyncio.Semaphore(4)
     server = MCPServer(
         name="codecontext",
         version=__version__,
         instructions=SERVER_INSTRUCTIONS,
+    )
+
+    async def on_roots_list_changed(_ctx: object, _params: object) -> None:
+        holder.clear_roots_cache()
+
+    # MCPServer has no public hook for client notifications.
+    server._lowlevel_server.add_notification_handler(
+        "notifications/roots/list_changed", NotificationParams, on_roots_list_changed
     )
 
     @server.tool(
@@ -403,6 +451,14 @@ def create_mcp_server(
             return {"repositories": [{"path": str(root), "default": i == 0} for i, root in enumerate(roots)]}
         except CodeContextError as exc:
             raise ToolError(exc.to_json(pretty=False)) from exc
+        except Exception as exc:
+            sanitized = CodeContextError(
+                code="IO_ERROR",
+                message="Internal error during list_repositories.",
+                retryable=False,
+                details={"exception_type": type(exc).__name__},
+            )
+            raise ToolError(sanitized.to_json(pretty=False)) from exc
 
     @server.tool(
         name="search",
@@ -697,6 +753,7 @@ def run_stdio_server(
     model_adapter: ModelAdapter | None = None,
     enrich_concurrency: int = 1,
     embedding_adapter: EmbeddingAdapter | None = None,
+    auto_init: bool = False,
 ) -> None:
     server, mem_or_holder = create_mcp_server(
         store_path,
@@ -708,6 +765,7 @@ def run_stdio_server(
         model_adapter=model_adapter,
         enrich_concurrency=enrich_concurrency,
         embedding_adapter=embedding_adapter,
+        auto_init=auto_init,
     )
     try:
         server.run(transport="stdio")

@@ -381,6 +381,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Expose structural graph tools (enabled by default).",
     )
+    p_serve.add_argument(
+        "--auto-init",
+        action="store_true",
+        default=False,
+        help="Initialize and sync a repository's .codecontext store when it is missing.",
+    )
     p_serve.add_argument("--auto-sync", action="store_true", default=False, help="Automatically trigger background sync on workspace changes.")
     p_serve.add_argument("--allow-sync", action="store_true", default=False, help="Expose opt-in sync MCP tool.")
     p_serve.add_argument(
@@ -467,13 +473,15 @@ def main(argv: list[str] | None = None) -> int:
                 model_adapter=serve_model,
                 enrich_concurrency=serve_concurrency,
                 embedding_adapter=_embedding_from_args(args),
+                auto_init=bool(args.auto_init),
             )
             return 0
         except KeyboardInterrupt:
             return 130
         except CodeContextError as exc:
-            sys.stdout.write(exc.to_json(pretty=bool(args.pretty)) + "\n")
-            sys.stdout.flush()
+            # stdout carries the MCP protocol.
+            sys.stderr.write(exc.to_json(pretty=bool(args.pretty)) + "\n")
+            sys.stderr.flush()
             return 2 if exc.code == "INVALID_REQUEST" else 1
 
     if args.store is None:

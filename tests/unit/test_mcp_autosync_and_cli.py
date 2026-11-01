@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -68,7 +69,7 @@ def test_mcp_server_tool_registration(tmp_path: Path) -> None:
     _setup_git_repo(repo_dir)
     store_dir = tmp_path / "store"
 
-    server, holder = create_mcp_server(store_path=store_dir, workspace_path=repo_dir)
+    server, holder = create_mcp_server(store_path=store_dir, workspace_path=repo_dir, auto_init=True)
     tools = {t.name for t in server._tool_manager.list_tools()}
     assert {"search", "get", "context", "list_repositories", "search_graph", "get_architecture", "detect_changes"} <= tools
     assert "sync" not in tools
@@ -410,3 +411,179 @@ def test_auto_sync_failure_is_logged_without_details(
         assert not holder._sync_tasks
     finally:
         holder.close()
+
+
+def _roots_ctx(*roots: Path) -> SimpleNamespace:
+    async def list_roots() -> SimpleNamespace:
+        return SimpleNamespace(roots=[SimpleNamespace(uri=p.as_uri()) for p in roots])
+
+    return SimpleNamespace(session=SimpleNamespace(list_roots=list_roots))
+
+
+def test_search_on_uninitialized_root_does_not_create_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    _setup_git_repo(root)
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+    try:
+        with pytest.raises(CodeContextError) as exc:
+            asyncio.run(holder.get_memory(_roots_ctx(root)))
+        assert exc.value.code == "STORE_NOT_INITIALIZED"
+        assert "--auto-init" in exc.value.message
+        assert not (root / ".codecontext").exists()
+
+        with pytest.raises(CodeContextError) as pinned_exc:
+            create_mcp_server(workspace_path=root)
+        assert pinned_exc.value.code == "STORE_NOT_INITIALIZED"
+        assert not (root / ".codecontext").exists()
+    finally:
+        holder.close()
+
+
+def test_unsynced_store_stays_unsynced_without_auto_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    _setup_git_repo(root)
+    Memory.initialize(root / ".codecontext", InitRequest(repo_path=root)).close()
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+    try:
+        mem = asyncio.run(holder.get_memory(_roots_ctx(root)))
+        assert mem.status().revision is None
+    finally:
+        holder.close()
+    _, pinned = create_mcp_server(workspace_path=root)
+    try:
+        assert asyncio.run(pinned.get_memory()).status().revision is None
+    finally:
+        pinned.close()
+
+
+def test_auto_init_bootstraps_uninitialized_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    head = _setup_git_repo(root)
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None, auto_init=True)
+    try:
+        mem = asyncio.run(holder.get_memory(_roots_ctx(root)))
+        assert mem.status().revision == head
+    finally:
+        holder.close()
+
+
+def test_cached_repo_not_blocked_by_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codecontext.mcp_server as mcp_server
+
+    cached_root = tmp_path / "cached"
+    _setup_git_repo(cached_root)
+    slow_root = tmp_path / "slow"
+    _setup_git_repo(slow_root)
+    for root in (cached_root, slow_root):
+        with Memory.initialize(root / ".codecontext", InitRequest(repo_path=root)) as mem:
+            mem.sync(SyncRequest(revision="HEAD", offline=True))
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+    ctx = _roots_ctx(cached_root, slow_root)
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_prepare = mcp_server._prepare_store
+
+    def slow_prepare(st_path: Path, ws: Path | None, *, auto_init: bool) -> Path | None:
+        if ws == slow_root.resolve():
+            entered.set()
+            release.wait(10)
+        return real_prepare(st_path, ws, auto_init=auto_init)
+
+    async def run() -> None:
+        cached = await holder.get_memory(ctx, str(cached_root))
+        monkeypatch.setattr(mcp_server, "_prepare_store", slow_prepare)
+        slow = asyncio.create_task(holder.get_memory(ctx, str(slow_root)))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert await asyncio.wait_for(holder.get_memory(ctx, str(cached_root)), 5) is cached
+        finally:
+            release.set()
+        assert (await slow) is not cached
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        holder.close()
+
+
+def test_roots_resolved_once_per_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import codecontext.mcp_server as mcp_server
+
+    repo_dir, store_dir = _initialized_store(tmp_path)
+    with Memory.initialize(repo_dir / ".codecontext", InitRequest(repo_path=repo_dir)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+    monkeypatch.chdir(tmp_path)
+    server, holder = create_mcp_server()
+    ctx = _roots_ctx(repo_dir)
+    calls: list[Path] = []
+    real_find = mcp_server._find_git_toplevel
+
+    def counting_find(path: Path) -> Path | None:
+        calls.append(path)
+        return real_find(path)
+
+    monkeypatch.setattr(mcp_server, "_find_git_toplevel", counting_find)
+
+    async def fetch_ten() -> None:
+        for _ in range(10):
+            await holder.get_memory(ctx)
+
+    try:
+        asyncio.run(fetch_ten())
+        assert len(calls) <= 1
+
+        entry = server._lowlevel_server.get_notification_handler(
+            "notifications/roots/list_changed"
+        )
+        assert entry is not None
+        asyncio.run(entry.handler(None, None))
+        asyncio.run(fetch_ten())
+        assert len(calls) == 2
+    finally:
+        holder.close()
+
+
+def test_serve_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    missing = tmp_path / "missing"
+    capsys.readouterr()
+    assert main(["--store", str(missing), "serve"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "STORE_NOT_INITIALIZED" in err
+
+
+def test_list_repositories_wraps_os_errors(tmp_path: Path) -> None:
+    from mcp import Client
+
+    repo_dir, store_dir = _initialized_store(tmp_path)
+    server, holder = create_mcp_server(store_path=store_dir, workspace_path=repo_dir)
+
+    async def call() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool("list_repositories", {})
+
+    repo_dir.chmod(0)
+    try:
+        result = asyncio.run(call())
+    finally:
+        repo_dir.chmod(0o755)
+        holder.close()
+    assert result.is_error
+    text = result.content[0].text
+    error = json.loads(text[text.index("{"):])["error"]
+    assert error["code"] == "IO_ERROR"
+    assert error["details"] == {"exception_type": "PermissionError"}
