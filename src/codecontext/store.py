@@ -3,6 +3,7 @@ import fcntl
 import functools
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -70,6 +71,67 @@ def get_all_migrations() -> tuple[tuple[int, str, str], ...]:
         items.append((ver, raw.decode("utf-8"), sha256_bytes(raw)))
     items.sort(key=lambda t: t[0])
     return tuple(items)
+
+
+_TRIGGER_HEAD = re.compile(r"\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b", re.IGNORECASE)
+_WORD = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def split_sql_statements(sql: str) -> list[str]:
+    """Split a script on `;` outside quotes, comments and CREATE TRIGGER bodies.
+
+    Comments are dropped. A trigger body is the BEGIN ... END block, where CASE ... END
+    pairs nest inside it.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i, n = 0, len(sql)
+
+    def flush() -> None:
+        stmt = "".join(buf).strip()
+        if stmt:
+            statements.append(stmt)
+        buf.clear()
+
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end == -1 else end
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            buf.append(" ")
+        elif ch in "'\"`":
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i : j + 1])
+            i = j + 1
+        elif ch == ";" and depth == 0:
+            flush()
+            i += 1
+        elif ch.isalpha() or ch == "_":
+            word = _WORD.match(sql, i).group()  # type: ignore[union-attr]
+            upper = word.upper()
+            if _TRIGGER_HEAD.match("".join(buf)):
+                if upper in ("BEGIN", "CASE"):
+                    depth += 1
+                elif upper == "END" and depth > 0:
+                    depth -= 1
+            buf.append(word)
+            i += len(word)
+        else:
+            buf.append(ch)
+            i += 1
+    flush()
+    return statements
 
 
 def now_us() -> int:
@@ -823,7 +885,7 @@ class Store:
                     applied_us = now_us()
                     conn.execute("BEGIN IMMEDIATE")
                     try:
-                        for stmt in (s.strip() for s in mig_sql.split(";")):
+                        for stmt in split_sql_statements(mig_sql):
                             if not stmt or stmt.upper().startswith("PRAGMA "):
                                 continue
                             conn.execute(stmt)
@@ -1056,10 +1118,9 @@ class Store:
     ) -> set[tuple[str, str]]:
         """Iteratively traverse reverse dependencies and mark dependent claims/summaries stale,
         removing their ready search documents.
-        Guards against derivation cycles.
+        Each dependent is visited once, so diamonds and cycles both terminate.
         """
         queue: deque[tuple[str, str]] = deque(initial_inputs)
-        visited_inputs: set[tuple[str, str]] = set(initial_inputs)
         invalidated_dependents: set[tuple[str, str]] = set()
 
         while queue:
@@ -1070,12 +1131,6 @@ class Store:
             ).fetchall()
             for row in rows:
                 dep = (str(row["dependent_kind"]), str(row["dependent_id"]))
-                if dep in visited_inputs:
-                    raise CodeContextError(
-                        code="IO_ERROR",
-                        message=f"Derivation cycle detected involving {dep[0]}:{dep[1]}",
-                        retryable=False,
-                    )
                 if dep not in invalidated_dependents:
                     invalidated_dependents.add(dep)
                     dep_kind, dep_id = dep
@@ -1101,7 +1156,6 @@ class Store:
                             "DELETE FROM search_documents WHERE record_kind = 'summary' AND record_id = ?",
                             (dep_id,),
                         )
-                    visited_inputs.add(dep)
                     queue.append(dep)
         return invalidated_dependents
 
@@ -1529,11 +1583,14 @@ class Store:
                 semantic_embeddings_available=emb_cnt > 0,
             )
 
+            base_cov, base_gaps, base_omitted = self.build_coverage_and_gaps(
+                conn, max_detailed_gaps=10
+            )
             max_gaps = 10
             while max_gaps >= 0:
-                cov, gaps, omitted_gaps = self.build_coverage_and_gaps(
-                    conn, max_detailed_gaps=max_gaps
-                )
+                cov = base_cov
+                gaps = base_gaps[:max_gaps]
+                omitted_gaps = base_omitted + len(base_gaps) - len(gaps)
                 expand_list: list[Expand] = []
                 if cov.first_gap_id is not None:
                     expand_list.append(
