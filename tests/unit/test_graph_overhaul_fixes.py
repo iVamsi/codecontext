@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -162,7 +163,19 @@ def _many_inits_memory(tmp_path: Path) -> Memory:
     return mem
 
 
-@pytest.mark.parametrize("pattern", [".*" * 10 + "!", "a*" * 8 + "!", "(a|a)*b", "a{2,}b{3,}c+d"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        ".*" * 10 + "!",
+        "a*" * 8 + "!",
+        "(a|a)*b",
+        "a{2,}b{3,}c+d",
+        "a?" * 28 + "a" * 28,
+        ".{0,30}" * 7 + "!",
+        r"\w{0,60}" * 4 + "!",
+        "a?b?c?",
+    ],
+)
 def test_compile_safe_regex_rejects_backtracking(pattern: str) -> None:
     with pytest.raises(CodeContextError) as exc_info:
         compile_safe_regex(pattern)
@@ -171,7 +184,17 @@ def test_compile_safe_regex_rejects_backtracking(pattern: str) -> None:
 
 @pytest.mark.parametrize(
     "pattern",
-    [".*Handler", "^get_", "(foo|bar)", ".*foo.*", "process_.*", "(?:ab)+", "a*?b+c", "[*+]{1,3}x*"],
+    [
+        ".*Handler",
+        "^get_",
+        "(foo|bar)",
+        ".*foo.*",
+        "process_.*",
+        "(?:ab)+",
+        "a*?b+c",
+        "[*+]{1,3}x*",
+        "x{3}y{2,2}z?",
+    ],
 )
 def test_compile_safe_regex_keeps_ordinary_patterns(pattern: str) -> None:
     assert compile_safe_regex(pattern).pattern == pattern
@@ -206,18 +229,37 @@ def test_search_graph_regex_respects_time_limit(tmp_path: Path, monkeypatch: pyt
         assert "interrupted" in str(exc_info.value.__cause__.__cause__)
 
 
-def test_detect_changes_has_its_own_longer_limit() -> None:
+def test_detect_changes_uses_its_own_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert graph.DETECT_CHANGES_MAX_SECONDS == 60.0
-    seen: list[float] = []
+    repo, c0 = _build_repo(tmp_path)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        monkeypatch.setattr(graph, "GRAPH_TOOL_MAX_SECONDS", 0.0)
+        monkeypatch.setattr(graph, "DETECT_CHANGES_MAX_SECONDS", 1000.0)
+        assert mem.detect_changes(DetectChangesRequest(since=c0)).changed_files
 
-    @graph._time_limited(lambda: graph.DETECT_CHANGES_MAX_SECONDS)
-    def probe() -> None:
-        from codecontext.deadline import remaining_timeout
+        monkeypatch.setattr(graph, "GRAPH_TOOL_MAX_SECONDS", 1000.0)
+        monkeypatch.setattr(graph, "DETECT_CHANGES_MAX_SECONDS", 0.0)
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.detect_changes(DetectChangesRequest(since=c0))
+        assert exc_info.value.message == "Graph query exceeded its time limit"
 
-        seen.append(remaining_timeout(1000.0))
 
-    probe()
-    assert 10.0 < seen[0] <= 60.0
+def test_regex_sees_only_a_bounded_prefix_of_long_text(tmp_path: Path) -> None:
+    slow = r"\w*\w+!"
+    repo = init_fixture_repo(tmp_path / "repo")
+    long_name = "a" * 4000
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(message="C0", files={"src/m.py": f"def {long_name}():\n    return 1\n".encode()}),
+    )
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        started = time.perf_counter()
+        assert mem.search_graph(SearchGraphRequest(name_pattern=slow)).total_matched == 0
+        # `=~` on a relationship binding reads the raw value, so no GraphNode length cap applies.
+        assert not graph._eval_where_atom({"r": {"method": long_name}}, f"r.method =~ '{slow}'")
+        assert time.perf_counter() - started < 1.0
 
 
 def test_graph_time_limit_keeps_tighter_outer_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -251,33 +251,41 @@ _bounded_by_graph_time_limit = _time_limited(lambda: GRAPH_TOOL_MAX_SECONDS)
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
 
 
-MAX_UNBOUNDED_QUANTIFIERS = 2
+MAX_VARIABLE_QUANTIFIERS = 2
+# Even two variable quantifiers backtrack cubically (`\w*\w+!` takes ~0.1 s on 512 chars and
+# ~0.75 s on 1024), and a Python regex inside a SQLite UDF cannot be interrupted, so cap the text.
+MAX_REGEX_SUBJECT_CHARS = 512
 REGEX_BRACE_QUANTIFIER_RE = re.compile(r"\{(\d*)(,?)(\d*)\}")
 
 
 def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
-    """Return `(next_index, is_quantifier, is_unbounded)` for a quantifier starting at `i`."""
+    """Return `(next_index, is_quantifier, is_variable)` for a quantifier starting at `i`.
+
+    A quantifier is variable when it can match more than one repeat count: `*`, `+`, `?`,
+    `{n,}`, and `{n,m}` with m > n. Fixed `{n}` and `{n,n}` cannot backtrack.
+    """
     n = len(pattern)
     if i >= n:
         return i, False, False
     if pattern[i] in "*+?":
-        unbounded = pattern[i] != "?"
+        variable = True
         i += 1
     else:
         brace = REGEX_BRACE_QUANTIFIER_RE.match(pattern, i)
         if brace is None:
             return i, False, False
-        unbounded = bool(brace.group(2)) and not brace.group(3)
+        low = int(brace.group(1) or 0)
+        variable = bool(brace.group(2)) and (not brace.group(3) or int(brace.group(3)) > low)
         i = brace.end()
     if i < n and pattern[i] in "?+":
         i += 1
-    return i, True, unbounded
+    return i, True, variable
 
 
 def _regex_can_backtrack(pattern: str) -> bool:
-    """Reject a quantified group holding `|` or a quantifier, and too many unbounded quantifiers."""
+    """Reject a quantified group holding `|` or a quantifier, and too many variable quantifiers."""
     stack: list[list[bool]] = []
-    unbounded_count = 0
+    variable_count = 0
     i = 0
     n = len(pattern)
     while i < n:
@@ -311,8 +319,8 @@ def _regex_can_backtrack(pattern: str) -> bool:
             continue
         if char == ")" and stack:
             has_alt, has_quant = stack.pop()
-            i, quantified, unbounded = _read_quantifier(pattern, i + 1)
-            unbounded_count += unbounded
+            i, quantified, variable = _read_quantifier(pattern, i + 1)
+            variable_count += variable
             if quantified and (has_alt or has_quant):
                 return True
             if stack and has_alt:
@@ -320,15 +328,15 @@ def _regex_can_backtrack(pattern: str) -> bool:
             if stack and (quantified or has_quant):
                 stack[-1][1] = True
             continue
-        next_i, quantified, unbounded = _read_quantifier(pattern, i)
+        next_i, quantified, variable = _read_quantifier(pattern, i)
         if quantified:
-            unbounded_count += unbounded
+            variable_count += variable
             if stack:
                 stack[-1][1] = True
             i = next_i
             continue
         i += 1
-    return unbounded_count > MAX_UNBOUNDED_QUANTIFIERS
+    return variable_count > MAX_VARIABLE_QUANTIFIERS
 
 
 def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
@@ -344,7 +352,7 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
             code="INVALID_REQUEST",
             message=(
                 "Unsafe regex pattern rejected (nested quantifiers, more than "
-                f"{MAX_UNBOUNDED_QUANTIFIERS} unbounded quantifiers, lookarounds, "
+                f"{MAX_VARIABLE_QUANTIFIERS} variable quantifiers, lookarounds, "
                 "or backreferences are forbidden)."
             ),
             retryable=False,
@@ -464,7 +472,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
         for field, pattern in [("name", name_re), ("qualified_name", qn_re), ("file_path", file_re)]:
             if pattern is not None:
                 fn = f"matches_{field}"
-                conn.create_function(fn, 1, lambda value, regex=pattern: bool(regex.search(value)), deterministic=True)
+                conn.create_function(fn, 1, lambda value, regex=pattern: bool(regex.search(value[:MAX_REGEX_SUBJECT_CHARS])), deterministic=True)
                 conditions.append(f"{fn}({field})")
         if request.label:
             if request.label.lower() == "function":
@@ -810,7 +818,7 @@ def _eval_where_atom(bindings: dict[str, Any], atom_str: str) -> bool:
             res = lhs_s.endswith(rhs_s)
         elif op == "=~":
             compiled_re = compile_safe_regex(rhs_s)
-            res = bool(compiled_re.search(lhs_s))
+            res = bool(compiled_re.search(lhs_s[:MAX_REGEX_SUBJECT_CHARS]))
         else:
             raise CodeContextError(
                 code="INVALID_REQUEST",
@@ -902,38 +910,31 @@ def _return_column_name(expr: str) -> str:
     return as_parts[1].strip() if len(as_parts) > 1 else as_parts[0].strip()
 
 
-def _collect_matches(
-    matches: Iterator[dict[str, Any]], ret_cols: list[str], order_by_clause: str | None, cap: int
-) -> list[dict[str, Any]]:
-    """Without ORDER BY or count, rows past `cap + 1` can never be returned or change `truncated`."""
-    if order_by_clause or _is_count_return(ret_cols):
-        return list(matches)
-    return list(itertools.islice(matches, cap + 1))
-
-
 def _apply_order_by_and_count(
-    matched_bindings: list[dict[str, Any]],
+    matches: Iterator[dict[str, Any]],
     ret_cols: list[str],
     order_by_clause: str | None,
     cap: int,
 ) -> tuple[list[str], list[dict[str, Any]], bool]:
     if _is_count_return(ret_cols):
-        as_parts = re.split(r"\s+AS\s+", ret_cols[0].strip(), flags=re.IGNORECASE)
-        col_name = as_parts[1].strip() if len(as_parts) > 1 else ret_cols[0].strip()
-        return ([col_name], [{col_name: len(matched_bindings)}], False)
+        col_name = _return_column_name(ret_cols[0])
+        return ([col_name], [{col_name: sum(1 for _ in matches)}], False)
 
-    projected = [_project_return_row(b, ret_cols) for b in matched_bindings]
+    order_parts = [p.strip() for p in (order_by_clause or "").split(",") if p.strip()]
+    returned = {_return_column_name(c) for c in ret_cols}
+    for opart in order_parts:
+        if opart.split()[0] not in returned:
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message=f"ORDER BY {opart.split()[0]!r} must name a RETURN column.",
+                retryable=False,
+            )
+    if not order_parts:
+        # Rows past `cap + 1` can never be returned or change `truncated`.
+        matches = itertools.islice(matches, cap + 1)
+    projected = [_project_return_row(b, ret_cols) for b in matches]
 
-    if order_by_clause:
-        returned = {_return_column_name(c) for c in ret_cols}
-        order_parts = [p.strip() for p in order_by_clause.split(",") if p.strip()]
-        for opart in order_parts:
-            if opart.split()[0] not in returned:
-                raise CodeContextError(
-                    code="INVALID_REQUEST",
-                    message=f"ORDER BY {opart.split()[0]!r} must name a RETURN column.",
-                    retryable=False,
-                )
+    if order_parts:
         for opart in reversed(order_parts):
             tokens = opart.split()
             expr_key = tokens[0]
@@ -1051,14 +1052,11 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                             seen_at_start.add(nxt_id)
                             bfs_q.append((nxt_id, nd))
 
-        matched_bindings = _collect_matches(
+        cols_out, rows_out, truncated = _apply_order_by_and_count(
             single_hop_matches() if max_hop == 1 else variable_length_matches(),
             ret_cols,
             order_c,
             cap,
-        )
-        cols_out, rows_out, truncated = _apply_order_by_and_count(
-            matched_bindings, ret_cols, order_c, cap
         )
         store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
@@ -1091,10 +1089,8 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                 if _matches_where(bindings, where_c):
                     yield bindings
 
-        matched_bindings = _collect_matches(node_matches(), ret_cols, order_c, cap)
-
         cols_out, rows_out, truncated = _apply_order_by_and_count(
-            matched_bindings, ret_cols, order_c, cap
+            node_matches(), ret_cols, order_c, cap
         )
         store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
