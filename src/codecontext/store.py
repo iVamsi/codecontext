@@ -436,7 +436,12 @@ def _try_file_lock(lock_path: Path) -> int | None:
 
 @contextmanager
 def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[int]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # No parents: recreating a store directory that a team join has just renamed away would
+        # make the join's second rename, and its rollback, fail.
+        lock_path.parent.mkdir(exist_ok=True)
+    except FileNotFoundError:
+        pass
     deadline = time.monotonic() + timeout_seconds
     fd = _try_file_lock(lock_path)
     while fd is None:

@@ -209,6 +209,31 @@ def test_file_lock_retries_when_directory_is_swapped_after_open(tmp_path: Path, 
     assert swapped
 
 
+def test_file_lock_waits_instead_of_recreating_a_swapped_out_store(tmp_path: Path) -> None:
+    import threading
+
+    from codecontext.errors import CodeContextError
+
+    store = tmp_path / "store"
+    lock_path = store / "tmp" / "writer.lock"
+    lock_path.parent.mkdir(parents=True)
+    # Mid team join: the store directory is briefly absent between two renames.
+    os.rename(store, tmp_path / "staging")
+    with pytest.raises(CodeContextError) as exc_info:
+        with _acquire_file_lock(lock_path, timeout_seconds=0.2):
+            pass
+    assert exc_info.value.code == "STORE_BUSY"
+    assert not store.exists()
+
+    timer = threading.Timer(0.2, os.rename, (tmp_path / "staging", store))
+    timer.start()
+    try:
+        with _acquire_file_lock(lock_path, timeout_seconds=5) as fd:
+            assert os.fstat(fd).st_ino == os.stat(lock_path).st_ino
+    finally:
+        timer.join()
+
+
 def test_read_connections_do_not_trust_schema(tmp_path: Path) -> None:
     fixture = build_f01_fixture(tmp_path)
     store = Store.initialize(tmp_path / "store", InitRequest(repo_path=fixture.repo_dir))
