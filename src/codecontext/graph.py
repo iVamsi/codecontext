@@ -259,6 +259,9 @@ MAX_AMBIGUOUS_CONSTRUCTS = 2
 # ~0.75 s on 1024), and a Python regex inside a SQLite UDF cannot be interrupted, so cap the text.
 MAX_REGEX_SUBJECT_CHARS = 512
 REGEX_BRACE_QUANTIFIER_RE = re.compile(r"\{(\d*)(,?)(\d*)\}")
+# Comments and verbose mode hide text from the scanner below, which would then misread what it
+# skips (a `[` in a comment swallows everything up to a later `]`).
+REGEX_INLINE_FLAGS_RE = re.compile(r"[aiLmsux]*(?:-[aiLmsux]*)?[:)]")
 
 
 def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
@@ -286,7 +289,8 @@ def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
 
 
 def _regex_can_backtrack(pattern: str) -> bool:
-    """Reject a quantified group holding `|` or a quantifier, and too many ambiguous constructs.
+    """Reject comments, verbose mode, a quantified group holding `|` or a quantifier, and too
+    many ambiguous constructs.
 
     Ambiguous constructs are variable quantifiers and alternations: each group with its own
     top-level `|` counts once, as does a top-level `|` in the pattern itself.
@@ -321,6 +325,9 @@ def _regex_can_backtrack(pattern: str) -> bool:
             # `(?:`, `(?P<name>` and inline flags start with `?`, which is not a quantifier here.
             if i < n and pattern[i] == "?":
                 i += 1
+                flags = REGEX_INLINE_FLAGS_RE.match(pattern, i)
+                if pattern.startswith("#", i) or (flags is not None and "x" in flags.group()):
+                    return True
             continue
         if char == "|":
             if stack:
@@ -367,7 +374,7 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
         raise CodeContextError(
             code="INVALID_REQUEST",
             message=(
-                "Unsafe regex pattern rejected (nested quantifiers, more than "
+                "Unsafe regex pattern rejected (comments, verbose mode, nested quantifiers, more than "
                 f"{MAX_AMBIGUOUS_CONSTRUCTS} variable quantifiers or alternations, lookarounds, "
                 "or backreferences are forbidden)."
             ),

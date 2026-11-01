@@ -179,6 +179,18 @@ def _many_inits_memory(tmp_path: Path) -> Memory:
         "(a|a)" * 22 + "!",
         "(?:a|a)" * 20 + r"\w*\w+!",
         "a|b|(c|d)|(e|f)",
+        "(?#[)" + "a*" * 12 + "!(?#])",
+        "(?#[)(a*)*b(?#])",
+        "(?#[)" + "(?:a|aa)" * 26 + "!(?#])",
+        "(?x)#[\n" + "a*" * 12 + "!\n#]",
+        "(?x:#[\n a*a*a* \n#])",
+        "(?x-i:#[\n a*a*a* \n#])",
+        "(?ax)a",
+        "(?i-x:a)",
+        "(?#comment)",
+        "[]a]a*b*c*",
+        "[^]a]a*b*c*",
+        r"[\]a]a*b*c*",
     ],
 )
 def test_compile_safe_regex_rejects_backtracking(pattern: str) -> None:
@@ -202,6 +214,11 @@ def test_compile_safe_regex_rejects_backtracking(pattern: str) -> None:
         "^(get|set)_.*",
         "(foo|bar)Handler",
         "^get_|^set_",
+        "(?i)handler",
+        "(?:x)y*",
+        "[]a](?:b|c)",
+        r"[\]]x*",
+        r"\(?x\)",
     ],
 )
 def test_compile_safe_regex_keeps_ordinary_patterns(pattern: str) -> None:
