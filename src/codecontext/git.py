@@ -19,6 +19,7 @@ from codecontext.errors import CodeContextError
 from codecontext.identity import HEX_OID_RE
 from codecontext.store import Store, inspect_local_git_repository, now_us
 
+PYTHON_DIFF_MAX_LINES = 2000
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Each cached revision holds a full path->blob listing, so switching between a handful of
 # branches stays fast without letting the table grow with every revision ever prepared.
@@ -458,12 +459,26 @@ def _split_git_lines(raw_bytes: bytes | None) -> list[bytes]:
 def compute_unified_zero_hunks(
     old_bytes: bytes | None,
     new_bytes: bytes | None,
-) -> list[ParsedHunk]:
-    """Compute unified=0 hunks between two in-memory blobs without spawning `git diff`."""
+    *,
+    mirror: "GitMirror | None" = None,
+    old_oid: str | None = None,
+    new_oid: str | None = None,
+) -> list[ParsedHunk] | None:
+    """Compute unified=0 hunks between two blobs.
+
+    Small blobs are diffed in-process. Above `PYTHON_DIFF_MAX_LINES` lines SequenceMatcher can go
+    cubic, so the diff goes to git's xdiff when both sides are in the mirror's object store (a side
+    with no OID must be empty), and returns None (hunks unavailable) when they are not.
+    """
+    check_deadline()
     if (old_bytes or b"") == (new_bytes or b""):
         return []
     old_lines = _split_git_lines(old_bytes)
     new_lines = _split_git_lines(new_bytes)
+    if max(len(old_lines), len(new_lines)) > PYTHON_DIFF_MAX_LINES:
+        if mirror is None or (old_oid is None and old_lines) or (new_oid is None and new_lines):
+            return None
+        return mirror.diff_blobs_unified_zero(old_oid, new_oid)
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     hunks: list[ParsedHunk] = []
     ordinal = 0
@@ -534,7 +549,8 @@ def parse_unified_zero_diff(raw_diff: bytes) -> list[ParsedHunk]:
         new_start = int(m.group(3))
         new_count = int(m.group(4)) if m.group(4) is not None else 1
 
-        hunk_lines = [header_line]
+        # Drop git's function-context suffix so headers match the in-process diff.
+        hunk_lines = [m.group(0).encode("ascii") + b"\n"]
         i += 1
         seen_old = 0
         seen_new = 0
@@ -1223,6 +1239,7 @@ class GitMirror:
                 "--no-textconv",
                 "--no-color",
                 "--no-renames",
+                "--text",
                 "--diff-algorithm=myers",
                 "--unified=0",
                 lhs,

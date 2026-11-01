@@ -1561,11 +1561,15 @@ def _hunk_side_touches(start: int, count: int, line_start: int, line_end: int) -
 def _classify_symbol_changes(
     old_syms: list[ExtractedSymbol],
     new_syms: list[ExtractedSymbol],
-    hunks: list[ParsedHunk],
+    hunks: list[ParsedHunk] | None,
+    *,
+    old_bytes: bytes = b"",
+    new_bytes: bytes = b"",
 ) -> list[tuple[str, str]]:
     """Classify symbols by qualified name as added, deleted, signature_modified, or body_modified.
 
-    Symbols present on both sides that no hunk touches are left out.
+    Symbols present on both sides that no hunk touches are left out. With `hunks=None` (the diff
+    was too large to run) a symbol counts as touched when its own text differs between the blobs.
     """
     # ponytail: overloads sharing a qualified name collapse to the first occurrence.
     old_by_qn: dict[str, ExtractedSymbol] = {}
@@ -1585,18 +1589,26 @@ def _classify_symbol_changes(
         if new_sym is None:
             out.append((qn, "deleted"))
             continue
-        touched = any(
-            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_end)
-            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_end)
-            for h in hunks
-        )
-        if not touched:
-            continue
-        header_touched = old_sym.signature != new_sym.signature or any(
-            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_start)
-            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_start)
-            for h in hunks
-        )
+        if hunks is None:
+            old_text = old_bytes[old_sym.byte_start : old_sym.byte_end]
+            if old_text == new_bytes[new_sym.byte_start : new_sym.byte_end]:
+                continue
+            header_touched = old_sym.signature != new_sym.signature
+        else:
+            touched = any(
+                _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_end)
+                or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_end)
+                for h in hunks
+            )
+            if not touched:
+                continue
+            header_touched = old_sym.signature != new_sym.signature or any(
+                _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_start)
+                or _hunk_side_touches(
+                    h.new_start, h.new_count, new_sym.line_start, new_sym.line_start
+                )
+                for h in hunks
+            )
         out.append((qn, "signature_modified" if header_touched else "body_modified"))
     return out
 
@@ -1668,10 +1680,19 @@ def execute_detect_changes(
             new_bytes, new_syms = _blob_symbols(batch, new_p, new_oid, new_bytes_ws)
             if not old_syms and not new_syms:
                 continue
-            hunks = compute_unified_zero_hunks(old_bytes, new_bytes)
+            hunks = compute_unified_zero_hunks(
+                old_bytes,
+                new_bytes,
+                mirror=mirror,
+                old_oid=old_oid if old_bytes is not None else None,
+                new_oid=new_oid if new_bytes is not None else None,
+            )
             old_disp = path_bytes_to_display(old_p)[0] if old_p is not None else None
             new_disp = path_bytes_to_display(new_p)[0] if new_p is not None else None
-            for qn, kind in _classify_symbol_changes(old_syms, new_syms, hunks):
+            changes = _classify_symbol_changes(
+                old_syms, new_syms, hunks, old_bytes=old_bytes or b"", new_bytes=new_bytes or b""
+            )
+            for qn, kind in changes:
                 for disp in (new_disp, old_disp):
                     if disp is not None:
                         classifications[(disp, qn[:MAX_NODE_QUALIFIED_NAME_CHARS])] = kind

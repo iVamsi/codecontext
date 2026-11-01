@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 from codecontext import workspace
 from codecontext.docs_ingest import classify_doc_path
 from codecontext.errors import CodeContextError
-from codecontext.git import GitMirror
+from codecontext.git import PYTHON_DIFF_MAX_LINES, GitMirror, compute_unified_zero_hunks
 from codecontext.github import GitHubClient, collect_full_and_incremental_github
 from codecontext.gitlab import GitLabClient, collect_gitlab_merge_requests_and_issues
 from codecontext.lineage import index_commit_changes_and_hunks
@@ -429,3 +430,123 @@ def test_graphql_request_body_is_plain_query(tmp_path: Path) -> None:
         res = client.graphql_query("query { viewer { login } }")
     assert res.data["data"]["viewer"]["login"] == "a"
     assert bodies == [{"query": "query { viewer { login } }", "variables": {}}]
+
+
+# --- Bounded hunk diffing ---------------------------------------------------------------------
+
+
+def _git_plumbing(repo: Path, args: list[str], stdin: bytes | None = None) -> bytes:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "LC_ALL": "C",
+    }
+    return subprocess.run(
+        ["git", *args], cwd=repo, env=env, input=stdin, capture_output=True, check=True
+    ).stdout
+
+
+def _commit_bytes_tree(repo: Path, files: dict[bytes, bytes], parent: str | None) -> str:
+    """Commit through plumbing so paths that the filesystem rejects (non-UTF-8 on APFS) still work."""
+    entries = b""
+    for path, content in sorted(files.items()):
+        oid = _git_plumbing(repo, ["hash-object", "-w", "--stdin"], content).strip()
+        entries += b"100644 blob " + oid + b"\t" + path + b"\x00"
+    tree = _git_plumbing(repo, ["mktree", "-z"], entries).decode().strip()
+    parent_args = ["-p", parent] if parent else []
+    commit = _git_plumbing(repo, ["commit-tree", tree, *parent_args, "-m", "c"]).decode().strip()
+    _git_plumbing(repo, ["update-ref", "refs/heads/main", commit])
+    return commit
+
+
+def _repetitive_lockfile(lines: int, *, bump_every: int | None = None) -> bytes:
+    out = []
+    for i in range(lines):
+        version = 2 if bump_every and i % bump_every == 0 else 1
+        out.append(f'  "dep-{i % 7}": "^{version}.0.0",\n')
+    return "".join(out).encode()
+
+
+def _two_blob_mirror(tmp_path: Path, path: bytes, old: bytes, new: bytes):
+    repo = init_fixture_repo(tmp_path / "repo")
+    c0 = _commit_bytes_tree(repo, {path: old}, None)
+    c1 = _commit_bytes_tree(repo, {path: new}, c0)
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    mirror.prepare_snapshot("HEAD")
+    (change,) = mirror.diff_tree_parent(c0, c1, parent_index=0)
+    return store, mirror, c1, change
+
+
+def test_large_repetitive_diff_is_fast(tmp_path: Path) -> None:
+    old = _repetitive_lockfile(20_000)
+    new = _repetitive_lockfile(20_000, bump_every=97)
+    store, mirror, _, change = _two_blob_mirror(tmp_path, b"package-lock.json", old, new)
+    try:
+        start = time.monotonic()
+        hunks = compute_unified_zero_hunks(
+            old, new, mirror=mirror, old_oid=change.old_blob_oid, new_oid=change.new_blob_oid
+        )
+        assert time.monotonic() - start < 2.0
+    finally:
+        mirror.close()
+        store.close()
+    assert hunks is not None
+    assert sum(h.new_count for h in hunks) == len(range(0, 20_000, 97))
+
+
+def test_large_diff_without_mirror_is_unavailable() -> None:
+    old = _repetitive_lockfile(PYTHON_DIFF_MAX_LINES + 1)
+    new = _repetitive_lockfile(PYTHON_DIFF_MAX_LINES + 1, bump_every=97)
+    start = time.monotonic()
+    assert compute_unified_zero_hunks(old, new) is None
+    assert time.monotonic() - start < 1.0
+
+
+def test_large_and_small_paths_agree(tmp_path: Path) -> None:
+    # Unique lines leave only one minimal diff, so SequenceMatcher and git's Myers must agree;
+    # on repetitive input both are valid but may place hunks differently.
+    old_lines = [f"line {i}\n".encode() for i in range(60)]
+    new_lines = list(old_lines)
+    new_lines[3] = b"changed 3\n"
+    del new_lines[10:13]
+    new_lines.insert(20, b"inserted\n")
+    new_lines[30:32] = [b"a\n", b"b\n", b"c\n"]
+    old = b"".join(old_lines)
+    new = b"".join(new_lines)[:-1]  # drop the final newline to cover the marker line
+    store, mirror, _, change = _two_blob_mirror(tmp_path, b"f.txt", old, new)
+    try:
+        via_git = mirror.diff_blobs_unified_zero(change.old_blob_oid, change.new_blob_oid)
+    finally:
+        mirror.close()
+        store.close()
+    via_python = compute_unified_zero_hunks(old, new)
+    assert via_python == via_git
+    assert len(via_git) == 5
+
+
+def test_non_utf8_path_diff_round_trips(tmp_path: Path) -> None:
+    path = b"caf\xe9.py"
+    old = _repetitive_lockfile(PYTHON_DIFF_MAX_LINES * 2)
+    new = _repetitive_lockfile(PYTHON_DIFF_MAX_LINES * 2, bump_every=500)
+    store, mirror, c1, _ = _two_blob_mirror(tmp_path, path, old, new)
+    try:
+        index_commit_changes_and_hunks(store, mirror, c1)
+        with store.connect_read() as conn:
+            changes = conn.execute(
+                "SELECT id, new_path, hunks_state FROM changes WHERE commit_oid = ?", (c1,)
+            ).fetchall()
+            hunk_count = conn.execute(
+                "SELECT COUNT(*) FROM hunks WHERE change_id = ?", (changes[0]["id"],)
+            ).fetchone()[0]
+    finally:
+        mirror.close()
+        store.close()
+    assert {bytes(r["new_path"]) for r in changes} == {path}
+    assert changes[0]["hunks_state"] == "complete"
+    assert hunk_count == len(range(0, PYTHON_DIFF_MAX_LINES * 2, 500))

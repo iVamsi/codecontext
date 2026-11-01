@@ -376,9 +376,17 @@ def map_original_anchor_to_target(
             t_blob_obj = batch.read_object_bounded(t_same_path.oid, max_bytes=MAX_PARSE_BYTES)
             if t_blob_obj is not None and t_blob_obj[2] is not None:
                 t_bytes = t_blob_obj[2]
-                hunks = compute_unified_zero_hunks(orig_bytes, t_bytes)
-                transported = transport_line_range_across_hunks(
-                    original_line_start, original_line_end, hunks
+                hunks = compute_unified_zero_hunks(
+                    orig_bytes,
+                    t_bytes,
+                    mirror=mirror,
+                    old_oid=orig_entry.oid,
+                    new_oid=t_same_path.oid,
+                )
+                transported = (
+                    transport_line_range_across_hunks(original_line_start, original_line_end, hunks)
+                    if hunks is not None
+                    else None
                 )
                 if transported is not None:
                     new_l_start, new_l_end = transported
@@ -1028,9 +1036,19 @@ def index_commit_changes_and_hunks(
                     old_bytes = None
                     new_bytes = None
 
-                hunks: list[ParsedHunk] = (
-                    compute_unified_zero_hunks(old_bytes, new_bytes) if can_diff else []
+                diffed = (
+                    compute_unified_zero_hunks(
+                        old_bytes,
+                        new_bytes,
+                        mirror=mirror,
+                        old_oid=rch.old_blob_oid,
+                        new_oid=rch.new_blob_oid,
+                    )
+                    if can_diff
+                    else []
                 )
+                can_diff = can_diff and diffed is not None
+                hunks: list[ParsedHunk] = diffed or []
 
                 old_b64 = encode_path_b64(rch.old_path) if rch.old_path is not None else None
                 new_b64 = encode_path_b64(rch.new_path) if rch.new_path is not None else None

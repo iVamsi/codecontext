@@ -6,6 +6,7 @@ import pytest
 
 from codecontext import InitRequest, Memory, SyncRequest, graph
 from codecontext.errors import CodeContextError
+from codecontext.git import PYTHON_DIFF_MAX_LINES
 from codecontext.graph import (
     DetectChangesRequest,
     GetArchitectureRequest,
@@ -96,6 +97,24 @@ def test_detect_changes_worktree_deletion(tmp_path: Path) -> None:
     assert res.classifications == {"fresh": "deleted"}
     assert res.deleted_symbols == ["fresh"]
     assert res.directly_modified_symbols == []
+
+
+def test_detect_changes_worktree_file_too_large_to_diff(tmp_path: Path) -> None:
+    padding = b"".join(b"PAD_%d = %d\n" % (i, i) for i in range(PYTHON_DIFF_MAX_LINES))
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="C0", files={"src/mod.py": MOD_V0 + padding}))
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        (repo / "src" / "mod.py").write_bytes(MOD_V1 + padding)
+        mem.configure_workspace(repo)
+        res = mem.detect_changes(DetectChangesRequest())
+
+    assert res.classifications == {
+        "sig": "signature_modified",
+        "body": "body_modified",
+        "fresh": "added",
+        "gone": "deleted",
+    }
 
 
 def test_get_architecture_uses_louvain_communities_deterministically(tmp_path: Path) -> None:
