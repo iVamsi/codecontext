@@ -157,6 +157,20 @@ def test_oversized_model_response_rejected(monkeypatch: pytest.MonkeyPatch) -> N
     assert sent < 64
 
 
+def test_model_request_asks_for_an_uncompressed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Accept-Encoding"))
+        return httpx.Response(401)
+
+    adapter = create_builtin_adapter("openai", "gpt-test", transport=httpx.MockTransport(handler))
+    with pytest.raises(CodeContextError):
+        adapter.complete(_model_request())
+    assert seen and set(seen) == {"identity"}
+
+
 def test_retry_honours_retry_after_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
     statuses = iter([429, 503, 200])

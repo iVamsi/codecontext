@@ -183,7 +183,9 @@ def _post_json_with_retry(
                 with client.stream(
                     "POST",
                     url,
-                    headers=headers,
+                    # The response cap counts decoded bytes, so a compressed body could expand
+                    # far past it in one chunk before the cap is checked.
+                    headers={**headers, "Accept-Encoding": "identity"},
                     json=json_body,
                     timeout=httpx.Timeout(max(0.05, remaining)),
                 ) as streamed:
