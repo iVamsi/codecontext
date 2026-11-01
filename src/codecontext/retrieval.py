@@ -3104,6 +3104,16 @@ def execute_context(
                 ):
                     if ref.id not in still_cited and admitted_ev_map.pop(ref.id, None) is not None:
                         omitted_ev_count += 1
+                rationale_status = _compute_rationale_status(
+                    conn,
+                    target_info=target_info,
+                    admitted_decisions=admitted_decisions,
+                    episode_rows=episode_rows,
+                    all_gaps=all_gaps,
+                    had_unavailable_source=had_unavailable_source,
+                    had_stale_claim=had_stale_claim,
+                    exclude_enriched=exclude_enriched,
+                )
                 continue
             raise CodeContextError(
                 code="INVALID_REQUEST",
