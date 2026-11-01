@@ -1,11 +1,13 @@
 import hashlib
 import json
+import shutil
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from codecontext import team
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.memory import Memory
@@ -320,7 +322,8 @@ def test_join_rejects_share_with_newer_schema(tmp_path) -> None:
     assert not store_b.exists()
 
 
-def test_join_while_writer_lock_held_is_store_busy(tmp_path) -> None:
+def test_join_while_writer_lock_held_is_store_busy(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(team, "SWAP_LOCK_TIMEOUT_SECONDS", 0.1)
     share, store_b, repo_b = _join_setup(tmp_path)
     execute_join(store_b, share, repo_b)
     # Without a local team.json the store has not seen this publish, so join swaps it.
@@ -346,6 +349,7 @@ def test_join_refuses_when_replaced_backup_exists(tmp_path) -> None:
     with pytest.raises(CodeContextError) as exc:
         execute_join(store_b, share, repo_b)
     assert exc.value.code == "INVALID_REQUEST"
+    assert str(backup) in exc.value.message
     assert (backup / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
@@ -461,3 +465,65 @@ def test_merge_rejects_dangling_foreign_key_and_rolls_back(tmp_path) -> None:
     assert exc.value.code == "INVALID_REQUEST"
     with sqlite3.connect(store_b / "memory.sqlite3") as conn:
         assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
+
+
+def _corrupt_db_copies_from(share, monkeypatch) -> None:
+    """Simulate the share db changing after it was opened: the copy gets different bytes."""
+    real_copyfile = shutil.copyfile
+
+    def copyfile(src, dst, *args, **kwargs):
+        result = real_copyfile(src, dst, *args, **kwargs)
+        if str(src) == str((share / "memory.sqlite3").resolve()):
+            with open(dst, "ab") as f:
+                f.write(b"swapped")
+        return result
+
+    monkeypatch.setattr(shutil, "copyfile", copyfile)
+
+
+def test_join_rejects_share_db_that_changes_during_copy(tmp_path, monkeypatch) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    _corrupt_db_copies_from(share, monkeypatch)
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert not store_b.exists()
+    assert not any(p.name.startswith(".codecontext.joining-") for p in store_b.parent.iterdir())
+
+
+def test_merge_rejects_share_db_that_changes_during_copy(tmp_path, monkeypatch) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "4" * 64, "swapped after signing")
+    _resign(share)
+    db_before = _sha256(store_b / "memory.sqlite3")
+    objs = store_b / "repository.git" / "objects"
+    objs_before = sorted(str(p) for p in objs.rglob("*"))
+    _corrupt_db_copies_from(share, monkeypatch)
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert _sha256(store_b / "memory.sqlite3") == db_before
+    assert sorted(str(p) for p in objs.rglob("*")) == objs_before
+    assert list((store_b / "tmp").glob(".share-merge-*")) == []
+
+
+def test_merge_rejects_object_that_changes_during_copy(tmp_path, monkeypatch) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    share_objs = share / "repository.git" / "objects"
+    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    local_obj = store_b / "repository.git" / "objects" / rel
+    local_obj.write_bytes(b"x")
+    real_copyfile = shutil.copyfile
+
+    def copyfile(src, dst, *args, **kwargs):
+        result = real_copyfile(src, dst, *args, **kwargs)
+        if str(src) == str((share_objs / rel).resolve()):
+            with open(dst, "ab") as f:
+                f.write(b"swapped")
+        return result
+
+    monkeypatch.setattr(shutil, "copyfile", copyfile)
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert local_obj.read_bytes() == b"x"
