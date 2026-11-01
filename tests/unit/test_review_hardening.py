@@ -1,5 +1,6 @@
 import gzip
 import random
+import sqlite3
 import struct
 import time
 from pathlib import Path
@@ -234,6 +235,27 @@ def test_doc_restored_unchanged_after_delete_is_searchable_again(tmp_path: Path)
         commit_fixture_spec(repo, GitCommitSpec(message="restore adr", files={"docs/adr/0001.md": doc}))
         mem.sync(SyncRequest(offline=True, ingest_docs=True))
         assert history_rows(mem) > 0
+
+
+def test_unchanged_docs_skip_symbol_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    doc = b"# Use SQLite\n\nSee `x` for details.\n"
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="adr", files={"docs/adr/0001.md": doc, "a.py": b"x = 1\n"}))
+    traced: list[str] = []
+    real_connect = sqlite3.connect
+
+    def tracing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)  # type: ignore[call-overload]
+        conn.set_trace_callback(traced.append)
+        return conn
+
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True, ingest_docs=True))
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlite3, "connect", tracing_connect)
+            mem.sync(SyncRequest(offline=True, ingest_docs=True))
+    assert traced
+    assert not any("FROM symbols" in sql or "JOIN symbols" in sql for sql in traced)
 
 
 # --- Git index v4 ------------------------------------------------------------------------------

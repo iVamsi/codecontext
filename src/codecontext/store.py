@@ -3,6 +3,7 @@ import fcntl
 import functools
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -47,7 +48,7 @@ from codecontext.models import (
     Status,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIN_READ_ONLY_SCHEMA_VERSION = 1
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 MIGRATION_FILE = MIGRATIONS_DIR / "001_initial.sql"
@@ -70,6 +71,67 @@ def get_all_migrations() -> tuple[tuple[int, str, str], ...]:
         items.append((ver, raw.decode("utf-8"), sha256_bytes(raw)))
     items.sort(key=lambda t: t[0])
     return tuple(items)
+
+
+_TRIGGER_HEAD = re.compile(r"\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b", re.IGNORECASE)
+_WORD = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def split_sql_statements(sql: str) -> list[str]:
+    """Split a script on `;` outside quotes, comments and CREATE TRIGGER bodies.
+
+    Comments are dropped. A trigger body is the BEGIN ... END block, where CASE ... END
+    pairs nest inside it.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i, n = 0, len(sql)
+
+    def flush() -> None:
+        stmt = "".join(buf).strip()
+        if stmt:
+            statements.append(stmt)
+        buf.clear()
+
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end == -1 else end
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            buf.append(" ")
+        elif ch in "'\"`":
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i : j + 1])
+            i = j + 1
+        elif ch == ";" and depth == 0:
+            flush()
+            i += 1
+        elif ch.isascii() and (ch.isalpha() or ch == "_"):
+            word = _WORD.match(sql, i).group()  # type: ignore[union-attr]
+            upper = word.upper()
+            if _TRIGGER_HEAD.match("".join(buf)):
+                if upper in ("BEGIN", "CASE"):
+                    depth += 1
+                elif upper == "END" and depth > 0:
+                    depth -= 1
+            buf.append(word)
+            i += len(word)
+        else:
+            buf.append(ch)
+            i += 1
+    flush()
+    return statements
 
 
 def now_us() -> int:
@@ -347,33 +409,57 @@ def decode_and_validate_cursor(
     return offset, extra
 
 
-@contextmanager
-def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[None]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    deadline = time.monotonic() + timeout_seconds
-    acquired = False
+def _try_file_lock(lock_path: Path) -> int | None:
+    """An fd holding the lock on the file now at lock_path, or None if that is not possible yet."""
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise CodeContextError(
-                        code="STORE_BUSY",
-                        message="Another process holds the store lock.",
-                        retryable=True,
-                    ) from exc
-                time.sleep(0.02)
-        yield
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except FileNotFoundError:
+        # A team join is swapping the store directory; do not recreate it here.
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    # A join can swap the directory between open and flock; a lock on the old file guards nothing.
+    try:
+        held = os.fstat(fd)
+        current = os.stat(lock_path)
+        if (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino):
+            return fd
+    except FileNotFoundError:
+        pass
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    return None
+
+
+@contextmanager
+def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[int]:
+    try:
+        # No parents: recreating a store directory that a team join has just renamed away would
+        # make the join's second rename, and its rollback, fail.
+        lock_path.parent.mkdir(exist_ok=True)
+    except FileNotFoundError:
+        pass
+    deadline = time.monotonic() + timeout_seconds
+    fd = _try_file_lock(lock_path)
+    while fd is None:
+        if time.monotonic() >= deadline:
+            raise CodeContextError(
+                code="STORE_BUSY",
+                message="Another process holds the store lock.",
+                retryable=True,
+            )
+        time.sleep(0.02)
+        fd = _try_file_lock(lock_path)
+    try:
+        yield fd
     finally:
-        if acquired:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
         os.close(fd)
 
 
@@ -712,6 +798,8 @@ class Store:
             if for_write:
                 conn = sqlite3.connect(str(self.db_path), timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                # trusted_schema stays on here: the search_documents triggers write to an FTS5
+                # table, which SQLite refuses from a trigger when it is off.
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA temp_store=MEMORY")
@@ -724,6 +812,7 @@ class Store:
                 uri = f"file:{quoted}?mode=ro"
                 conn = sqlite3.connect(uri, uri=True, timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA trusted_schema=OFF")
                 conn.execute("PRAGMA temp_store=MEMORY")
                 conn.execute("PRAGMA cache_size=-32000")
                 conn.set_progress_handler(lambda: int(expired()), 1000)
@@ -823,7 +912,7 @@ class Store:
                     applied_us = now_us()
                     conn.execute("BEGIN IMMEDIATE")
                     try:
-                        for stmt in (s.strip() for s in mig_sql.split(";")):
+                        for stmt in split_sql_statements(mig_sql):
                             if not stmt or stmt.upper().startswith("PRAGMA "):
                                 continue
                             conn.execute(stmt)
@@ -1056,10 +1145,9 @@ class Store:
     ) -> set[tuple[str, str]]:
         """Iteratively traverse reverse dependencies and mark dependent claims/summaries stale,
         removing their ready search documents.
-        Guards against derivation cycles.
+        Each dependent is visited once, so diamonds and cycles both terminate.
         """
         queue: deque[tuple[str, str]] = deque(initial_inputs)
-        visited_inputs: set[tuple[str, str]] = set(initial_inputs)
         invalidated_dependents: set[tuple[str, str]] = set()
 
         while queue:
@@ -1070,12 +1158,6 @@ class Store:
             ).fetchall()
             for row in rows:
                 dep = (str(row["dependent_kind"]), str(row["dependent_id"]))
-                if dep in visited_inputs:
-                    raise CodeContextError(
-                        code="IO_ERROR",
-                        message=f"Derivation cycle detected involving {dep[0]}:{dep[1]}",
-                        retryable=False,
-                    )
                 if dep not in invalidated_dependents:
                     invalidated_dependents.add(dep)
                     dep_kind, dep_id = dep
@@ -1101,7 +1183,6 @@ class Store:
                             "DELETE FROM search_documents WHERE record_kind = 'summary' AND record_id = ?",
                             (dep_id,),
                         )
-                    visited_inputs.add(dep)
                     queue.append(dep)
         return invalidated_dependents
 
@@ -1201,6 +1282,46 @@ class Store:
                 (job_id, kind, owner_id, priority, canonical_json(cursor or {}), ts, ts),
             )
         return job_id
+
+    @staticmethod
+    def enqueue_pending_diff_jobs(conn: sqlite3.Connection) -> int:
+        """Queue a `git_commit_diff` job for every commit whose diff is not complete.
+
+        A commit with an active MISSING_PARENT gap is left out until its first parent is imported,
+        so a shallow boundary is not re-diffed every sync. Only the first parent counts because
+        lineage diffs a merge against that parent alone. Jobs parked in `retryable_error` stay
+        parked: they already used their attempts.
+        """
+        conn.create_function(
+            "cc_diff_job_id",
+            1,
+            lambda oid: make_job_id(kind="git_commit_diff", owner_id=oid),
+            deterministic=True,
+        )
+        ts = now_us()
+        return conn.execute(
+            """
+            INSERT INTO jobs (id, kind, owner_id, priority, state, cursor_json, attempts,
+                              last_error_code, created_at_us, updated_at_us)
+            SELECT cc_diff_job_id(c.oid), 'git_commit_diff', c.oid, 50, 'pending', '{}', 0,
+                   NULL, ?, ?
+            FROM commits c
+            WHERE c.diff_state != 'complete'
+              AND NOT EXISTS (
+                SELECT 1 FROM coverage_gaps g
+                JOIN commit_parents p ON p.commit_oid = c.oid
+                WHERE g.scope = 'git:commit:' || c.oid AND g.active = 1
+                  AND g.code = 'MISSING_PARENT' AND p.parent_index = 0
+                  AND NOT EXISTS (SELECT 1 FROM commits pc WHERE pc.oid = p.parent_oid)
+              )
+            ORDER BY c.first_seen_at_us ASC, c.oid ASC
+            ON CONFLICT(kind, owner_id) DO UPDATE SET
+              priority = MIN(jobs.priority, excluded.priority),
+              state = CASE WHEN jobs.state = 'complete' THEN 'pending' ELSE jobs.state END,
+              updated_at_us = excluded.updated_at_us
+            """,
+            (ts, ts),
+        ).rowcount
 
     @staticmethod
     def get_queue_counts(conn: sqlite3.Connection) -> QueueCounts:
@@ -1529,11 +1650,14 @@ class Store:
                 semantic_embeddings_available=emb_cnt > 0,
             )
 
+            base_cov, base_gaps, base_omitted = self.build_coverage_and_gaps(
+                conn, max_detailed_gaps=10
+            )
             max_gaps = 10
             while max_gaps >= 0:
-                cov, gaps, omitted_gaps = self.build_coverage_and_gaps(
-                    conn, max_detailed_gaps=max_gaps
-                )
+                cov = base_cov
+                gaps = base_gaps[:max_gaps]
+                omitted_gaps = base_omitted + len(base_gaps) - len(gaps)
                 expand_list: list[Expand] = []
                 if cov.first_gap_id is not None:
                     expand_list.append(

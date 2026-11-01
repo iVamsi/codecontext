@@ -1,13 +1,25 @@
-import os
+import functools
+import itertools
+import json
 import posixpath
 import re
-import stat
-from collections import deque
+import sqlite3
+import threading
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, NamedTuple
 
 from pydantic import Field
 
+from codecontext.deadline import (
+    SyncDeadlineExceeded,
+    check_deadline,
+    expired,
+    remaining_timeout,
+    sync_deadline,
+)
 from codecontext.enrichment import compute_snapshot_groups
 from codecontext.errors import CodeContextError
 from codecontext.git import (
@@ -28,6 +40,7 @@ from codecontext.syntax import (
     is_lfs_pointer,
     parse_blob,
 )
+from codecontext.workspace import _read_root_confined_regular_file
 
 
 class GraphNode(PublicModel):
@@ -200,12 +213,94 @@ def _kind_to_label(sym_kind: str) -> str:
     return "Variable"
 
 
+GRAPH_TOOL_MAX_SECONDS = 10.0
+# Diffs up to a thousand files through git, which needs more room than an in-memory graph walk.
+DETECT_CHANGES_MAX_SECONDS = 60.0
+DEADLINE_CHECK_EVERY = 256
+
+
+def _time_limited[**P, R](limit_seconds: Callable[[], float]) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Run a graph tool under `limit_seconds()`, keeping any tighter outer deadline."""
+
+    def decorate(fn: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                with sync_deadline(remaining_timeout(limit_seconds())):
+                    try:
+                        return fn(*args, **kwargs)
+                    except sqlite3.OperationalError as exc:
+                        # Store connections abort statements through a progress handler once
+                        # the deadline passes; that surfaces here as "interrupted".
+                        if expired():
+                            raise SyncDeadlineExceeded from exc
+                        raise
+            except SyncDeadlineExceeded as exc:
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Graph query exceeded its time limit",
+                    retryable=False,
+                ) from exc
+
+        return wrapper
+
+    return decorate
+
+
+_bounded_by_graph_time_limit = _time_limited(lambda: GRAPH_TOOL_MAX_SECONDS)
+
+
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
 
 
-def _quantified_group_can_backtrack(pattern: str) -> bool:
-    """Reject a group that is itself quantified and contains `|` or another quantifier."""
+# Each variable quantifier or alternation is a point where the matcher can choose, and
+# chained choice points multiply backtracking: `(?:a|aa)` repeated 24 times takes seconds on
+# 48 chars, and two quantifiers already backtrack cubically. Two in total keeps it polynomial.
+MAX_AMBIGUOUS_CONSTRUCTS = 2
+# Even two variable quantifiers backtrack cubically (`\w*\w+!` takes ~0.1 s on 512 chars and
+# ~0.75 s on 1024), and a Python regex inside a SQLite UDF cannot be interrupted, so cap the text.
+MAX_REGEX_SUBJECT_CHARS = 512
+REGEX_BRACE_QUANTIFIER_RE = re.compile(r"\{(\d*)(,?)(\d*)\}")
+# Comments and verbose mode hide text from the scanner below, which would then misread what it
+# skips (a `[` in a comment swallows everything up to a later `]`).
+REGEX_INLINE_FLAGS_RE = re.compile(r"[aiLmsux]*(?:-[aiLmsux]*)?[:)]")
+
+
+def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
+    """Return `(next_index, is_quantifier, is_variable)` for a quantifier starting at `i`.
+
+    A quantifier is variable when it can match more than one repeat count: `*`, `+`, `?`,
+    `{n,}`, and `{n,m}` with m > n. Fixed `{n}` and `{n,n}` cannot backtrack.
+    """
+    n = len(pattern)
+    if i >= n:
+        return i, False, False
+    if pattern[i] in "*+?":
+        variable = True
+        i += 1
+    else:
+        brace = REGEX_BRACE_QUANTIFIER_RE.match(pattern, i)
+        if brace is None:
+            return i, False, False
+        low = int(brace.group(1) or 0)
+        variable = bool(brace.group(2)) and (not brace.group(3) or int(brace.group(3)) > low)
+        i = brace.end()
+    if i < n and pattern[i] in "?+":
+        i += 1
+    return i, True, variable
+
+
+def _regex_can_backtrack(pattern: str) -> bool:
+    """Reject comments, verbose mode, a quantified group holding `|` or a quantifier, and too
+    many ambiguous constructs.
+
+    Ambiguous constructs are variable quantifiers and alternations: each group with its own
+    top-level `|` counts once, as does a top-level `|` in the pattern itself.
+    """
+    # Each entry is [has_alt (own or nested), has_quant, has_own_alt].
     stack: list[list[bool]] = []
+    ambiguous_count = 0
+    top_level_alt = False
     i = 0
     n = len(pattern)
     while i < n:
@@ -227,27 +322,30 @@ def _quantified_group_can_backtrack(pattern: str) -> bool:
             i += 1
             continue
         if char == "(":
-            stack.append([False, False])
+            stack.append([False, False, False])
             i += 1
+            # `(?:`, `(?P<name>` and inline flags start with `?`, which is not a quantifier here.
+            if i < n and pattern[i] == "?":
+                i += 1
+                flags = REGEX_INLINE_FLAGS_RE.match(pattern, i)
+                if pattern.startswith("#", i) or (flags is not None and "x" in flags.group()):
+                    return True
             continue
-        if char == "|" and stack:
-            stack[-1][0] = True
+        if char == "|":
+            if stack:
+                stack[-1][0] = True
+                if not stack[-1][2]:
+                    stack[-1][2] = True
+                    ambiguous_count += 1
+            elif not top_level_alt:
+                top_level_alt = True
+                ambiguous_count += 1
             i += 1
             continue
         if char == ")" and stack:
-            has_alt, has_quant = stack.pop()
-            i += 1
-            quantified = False
-            if i < n and pattern[i] in "*+?":
-                quantified = True
-                i += 1
-                if i < n and pattern[i] in "?+":
-                    i += 1
-            elif i < n and pattern[i] == "{":
-                quantified = True
-                while i < n and pattern[i] != "}":
-                    i += 1
-                i += 1
+            has_alt, has_quant, _ = stack.pop()
+            i, quantified, variable = _read_quantifier(pattern, i + 1)
+            ambiguous_count += variable
             if quantified and (has_alt or has_quant):
                 return True
             if stack and has_alt:
@@ -255,27 +353,33 @@ def _quantified_group_can_backtrack(pattern: str) -> bool:
             if stack and (quantified or has_quant):
                 stack[-1][1] = True
             continue
-        if char in "*+?" or char == "{":
+        next_i, quantified, variable = _read_quantifier(pattern, i)
+        if quantified:
+            ambiguous_count += variable
             if stack:
                 stack[-1][1] = True
-            i += 1
+            i = next_i
             continue
         i += 1
-    return False
+    return ambiguous_count > MAX_AMBIGUOUS_CONSTRUCTS
 
 
 def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
-    """Compile a user regex, rejecting backreferences, lookaround, and quantified groups that can backtrack."""
+    """Compile a user regex, rejecting backreferences, lookaround, and shapes that can backtrack."""
     if len(pattern) > max_length:
         raise CodeContextError(
             code="INVALID_REQUEST",
             message=f"Regex pattern exceeds maximum allowed length ({max_length}).",
             retryable=False,
         )
-    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or _quantified_group_can_backtrack(pattern):
+    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or _regex_can_backtrack(pattern):
         raise CodeContextError(
             code="INVALID_REQUEST",
-            message="Unsafe regex pattern rejected (nested quantifiers, lookarounds, or backreferences are forbidden).",
+            message=(
+                "Unsafe regex pattern rejected (comments, verbose mode, nested quantifiers, more than "
+                f"{MAX_AMBIGUOUS_CONSTRUCTS} variable quantifiers or alternations, lookarounds, "
+                "or backreferences are forbidden)."
+            ),
             retryable=False,
         )
     try:
@@ -288,32 +392,70 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
         ) from exc
 
 
-def _load_active_graph(
-    store: Store,
-) -> tuple[dict[str, GraphNode], list[tuple[str, str, str, str]], int]:
-    """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`."""
-    with store.read_snapshot() as snap:
-        conn = snap.conn
-        expected_epoch = snap.access_epoch
-        sym_rows = conn.execute(
-            """
-            SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
-                   sf.path, e.language
-            FROM symbols s
-            JOIN extractions e ON e.id = s.extraction_id
-            JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
-            ORDER BY sf.path ASC, s.byte_start ASC, s.id ASC
-            """
-        ).fetchall()
+MAX_NODE_NAME_CHARS = 1000
+MAX_NODE_QUALIFIED_NAME_CHARS = 2000
+MAX_NODE_SIGNATURE_CHARS = 4000
 
-        rel_rows = conn.execute(
-            """
-            SELECT from_id, to_id, relation_kind, method
-            FROM relations
-            WHERE from_kind = 'symbol' AND to_kind = 'symbol' AND state = 'active'
-            ORDER BY id ASC
-            """
-        ).fetchall()
+
+def _graph_node(**fields: Any) -> GraphNode:
+    """Build a node with display text cut to the public model's limits; ids stay exact."""
+    fields["name"] = fields["name"][:MAX_NODE_NAME_CHARS]
+    fields["qualified_name"] = fields["qualified_name"][:MAX_NODE_QUALIFIED_NAME_CHARS]
+    fields["signature"] = fields["signature"][:MAX_NODE_SIGNATURE_CHARS]
+    return GraphNode(**fields)
+
+
+type GraphEdgeRow = tuple[str, str, str, str]
+type ActiveGraph = tuple[Mapping[str, GraphNode], tuple[GraphEdgeRow, ...]]
+
+GRAPH_CACHE_MAX_ENTRIES = 2
+_graph_cache: OrderedDict[tuple[str, str | None, int, int], ActiveGraph] = OrderedDict()
+_graph_cache_lock = threading.Lock()
+
+
+def _load_active_graph(store: Store) -> tuple[Mapping[str, GraphNode], tuple[GraphEdgeRow, ...], int]:
+    """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`.
+
+    Results are shared between calls, so the node map is read-only and edges are a tuple.
+    Every write that changes symbols or relations bumps `generation`, which changes the cache key.
+    """
+    with store.read_snapshot() as snap:
+        expected_epoch = snap.access_epoch
+        key = (str(store.db_path), snap.revision, snap.generation, snap.access_epoch)
+        with _graph_cache_lock:
+            cached = _graph_cache.get(key)
+            if cached is not None:
+                _graph_cache.move_to_end(key)
+        if cached is None:
+            cached = _read_active_graph(snap.conn)
+            with _graph_cache_lock:
+                _graph_cache[key] = cached
+                while len(_graph_cache) > GRAPH_CACHE_MAX_ENTRIES:
+                    _graph_cache.popitem(last=False)
+    nodes, edges = cached
+    return nodes, edges, expected_epoch
+
+
+def _read_active_graph(conn: sqlite3.Connection) -> ActiveGraph:
+    sym_rows = conn.execute(
+        """
+        SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
+               sf.path, e.language
+        FROM symbols s
+        JOIN extractions e ON e.id = s.extraction_id
+        JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+        ORDER BY sf.path ASC, s.byte_start ASC, s.id ASC
+        """
+    ).fetchall()
+
+    rel_rows = conn.execute(
+        """
+        SELECT from_id, to_id, relation_kind, method
+        FROM relations
+        WHERE from_kind = 'symbol' AND to_kind = 'symbol' AND state = 'active'
+        ORDER BY id ASC
+        """
+    ).fetchall()
 
     raw_nodes: dict[str, dict[str, Any]] = {}
     for r in sym_rows:
@@ -327,7 +469,6 @@ def _load_active_graph(
             "file_path": disp_p,
             "id": sid,
             "inbound": 0,
-            "kind": str(r["kind"]),
             "label": _kind_to_label(str(r["kind"])),
             "language": str(r["language"]),
             "line_count": max(1, l_end - l_start + 1),
@@ -339,7 +480,7 @@ def _load_active_graph(
             "signature": str(r["signature"]),
         }
 
-    edges: list[tuple[str, str, str, str]] = []
+    edges: list[GraphEdgeRow] = []
     seen_pairs: set[tuple[str, str, str]] = set()
     for rr in rel_rows:
         f_id = str(rr["from_id"])
@@ -357,8 +498,8 @@ def _load_active_graph(
             raw_nodes[f_id]["outbound"] += 1
             raw_nodes[t_id]["inbound"] += 1
 
-    nodes: dict[str, GraphNode] = {
-        sid: GraphNode(
+    nodes = {
+        sid: _graph_node(
             id=d["id"],
             label=d["label"],
             name=d["name"],
@@ -374,9 +515,39 @@ def _load_active_graph(
         )
         for sid, d in raw_nodes.items()
     }
-    return nodes, edges, expected_epoch
+    return MappingProxyType(nodes), tuple(edges)
 
 
+def _degree_columns(owner_id: str, relation_filter: str) -> str:
+    """SQL columns counting distinct active symbol neighbours inside the snapshot, per direction."""
+    columns = []
+    for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
+        columns.append(f"""(SELECT COUNT(*) FROM (
+            SELECT DISTINCT r.{other}, r.relation_kind
+            FROM relations r INDEXED BY relations_{own.removesuffix("_id")}
+            WHERE r.{own} = {owner_id} AND r.from_kind = 'symbol'
+              AND r.to_kind = 'symbol' AND r.state = 'active' {relation_filter}
+              AND EXISTS (
+                SELECT 1 FROM symbols endpoint
+                JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
+                WHERE endpoint.id = r.{other}
+              )
+        )) AS {alias}""")
+    return ", ".join(columns)
+
+
+def _regex_matcher(regex: re.Pattern[str]) -> Callable[[str], bool]:
+    def matches(value: str) -> bool:
+        # The store's progress handler only runs between VM steps, which can be hundreds of
+        # slow regex calls apart, so each call checks the deadline itself.
+        if expired():
+            raise SyncDeadlineExceeded
+        return bool(regex.search(value[:MAX_REGEX_SUBJECT_CHARS]))
+
+    return matches
+
+
+@_bounded_by_graph_time_limit
 def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGraphResult:
     """Search symbols in the active code knowledge graph by regex pattern, label, and degree."""
     name_re = compile_safe_regex(request.name_pattern) if request.name_pattern else None
@@ -392,7 +563,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
         for field, pattern in [("name", name_re), ("qualified_name", qn_re), ("file_path", file_re)]:
             if pattern is not None:
                 fn = f"matches_{field}"
-                conn.create_function(fn, 1, lambda value, regex=pattern: bool(regex.search(value)), deterministic=True)
+                conn.create_function(fn, 1, _regex_matcher(pattern), deterministic=True)
                 conditions.append(f"{fn}({field})")
         if request.label:
             if request.label.lower() == "function":
@@ -414,19 +585,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
                 else request.relationship.lower()
             )
             relation_filter = f"AND r.relation_kind = '{relation_kind}'"
-        degrees = []
-        for own, other, alias in [("to_id", "from_id", "inbound_degree"), ("from_id", "to_id", "outbound_degree")]:
-            degrees.append(f"""(SELECT COUNT(*) FROM (
-                SELECT DISTINCT r.{other}, r.relation_kind
-                FROM relations r INDEXED BY relations_{own.removesuffix("_id")}
-                WHERE r.{own} = filtered.id AND r.from_kind = 'symbol'
-                  AND r.to_kind = 'symbol' AND r.state = 'active' {relation_filter}
-                  AND EXISTS (
-                    SELECT 1 FROM symbols endpoint
-                    JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
-                    WHERE endpoint.id = r.{other}
-                  )
-            )) AS {alias}""")
+        degrees = _degree_columns("filtered.id", relation_filter)
         degree_expr = {"inbound": "inbound_degree", "outbound": "outbound_degree", "both": "inbound_degree + outbound_degree"}[request.direction]
         degree_conditions = []
         for op, bound in [(">=", request.min_degree), ("<=", request.max_degree)]:
@@ -448,17 +607,25 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
             ), filtered AS (
                 SELECT * FROM nodes WHERE {where}
             ), degrees AS (
-                SELECT filtered.*, {', '.join(degrees)} FROM filtered
-            ), matched AS (
+                SELECT filtered.*, {degrees} FROM filtered
+            ), matched AS MATERIALIZED (
                 SELECT * FROM degrees WHERE {degree_where}
             )
+            SELECT page.*, total.matched_count
+            FROM (SELECT COUNT(*) AS matched_count FROM matched) AS total
+            LEFT JOIN (
+                SELECT * FROM matched ORDER BY file_path, line_start, id LIMIT ? OFFSET ?
+            ) AS page ON 1
+            ORDER BY page.file_path, page.line_start, page.id
         """
-        total = int(conn.execute(sql + "SELECT COUNT(*) FROM matched", params).fetchone()[0])
-        rows = conn.execute(
-            sql + "SELECT * FROM matched ORDER BY file_path, line_start, id LIMIT ? OFFSET ?",
-            [*params, request.limit, request.offset],
-        ).fetchall()
-        nodes = [GraphNode(**dict(row)) for row in rows]
+        # The LEFT JOIN keeps one row carrying the total even when the page is empty.
+        rows = conn.execute(sql, [*params, request.limit, request.offset]).fetchall()
+        total = int(rows[0]["matched_count"])
+        nodes = [
+            _graph_node(**{k: row[k] for k in row.keys() if k != "matched_count"})
+            for row in rows
+            if row["id"] is not None
+        ]
         expected_epoch = snap.access_epoch
     store.verify_access_epoch_and_authorize(expected_epoch)
     return SearchGraphResult(
@@ -467,6 +634,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
     )
 
 
+@_bounded_by_graph_time_limit
 def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResult:
     """Perform multi-hop BFS call-graph traversal (`inbound`, `outbound`, or `both`) up to `request.depth`."""
     nodes, edges, expected_epoch = _load_active_graph(store)
@@ -479,6 +647,7 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
     ]
     if not roots:
         roots = [n for n in nodes.values() if q_name.lower() in n.qualified_name.lower()][:5]
+    roots = roots[: request.limit]
 
     outbound_adj: dict[str, list[tuple[str, str, str]]] = {}
     inbound_adj: dict[str, list[tuple[str, str, str]]] = {}
@@ -492,7 +661,11 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
     seen_edges: set[tuple[str, str, str]] = set()
 
     queue: deque[tuple[str, int]] = deque((r.id, 0) for r in roots)
+    steps = 0
     while queue and len(collected_edges) < request.limit:
+        if steps % DEADLINE_CHECK_EVERY == 0:
+            check_deadline()
+        steps += 1
         cur_id, cur_depth = queue.popleft()
         if cur_depth >= request.depth:
             continue
@@ -732,7 +905,7 @@ def _eval_where_atom(bindings: dict[str, Any], atom_str: str) -> bool:
             res = lhs_s.endswith(rhs_s)
         elif op == "=~":
             compiled_re = compile_safe_regex(rhs_s)
-            res = bool(compiled_re.search(lhs_s))
+            res = bool(compiled_re.search(lhs_s[:MAX_REGEX_SUBJECT_CHARS]))
         else:
             raise CodeContextError(
                 code="INVALID_REQUEST",
@@ -743,15 +916,26 @@ def _eval_where_atom(bindings: dict[str, Any], atom_str: str) -> bool:
     return (not res) if negate else res
 
 
+def _split_outside_quotes(clause: str, keyword: str) -> list[str]:
+    """Split on a whitespace-delimited keyword that is not inside a quoted literal."""
+    parts: list[str] = []
+    start = 0
+    for m in re.finditer(rf"'[^']*'|\"[^\"]*\"|\s+{keyword}\s+", clause, flags=re.IGNORECASE):
+        if m.group()[0] not in "'\"":
+            parts.append(clause[start : m.start()])
+            start = m.end()
+    parts.append(clause[start:])
+    return parts
+
+
 def _matches_where(bindings: dict[str, Any], where_clause: str | None) -> bool:
     """Evaluate Cypher WHERE clause with `OR`, `AND`, and `NOT` precedence.
     Strictly validates every condition atom and raises `INVALID_REQUEST` on unknown syntax or properties.
     """
     if not where_clause or not where_clause.strip():
         return True
-    or_groups = re.split(r"\s+OR\s+", where_clause.strip(), flags=re.IGNORECASE)
-    for or_grp in or_groups:
-        and_atoms = re.split(r"\s+AND\s+", or_grp.strip(), flags=re.IGNORECASE)
+    for or_grp in _split_outside_quotes(where_clause.strip(), "OR"):
+        and_atoms = _split_outside_quotes(or_grp.strip(), "AND")
         if all(_eval_where_atom(bindings, atom) for atom in and_atoms):
             return True
     return False
@@ -802,21 +986,42 @@ def _project_return_row(bindings: dict[str, Any], return_exprs: list[str]) -> di
     return row
 
 
+def _is_count_return(ret_cols: list[str]) -> bool:
+    return len(ret_cols) == 1 and bool(
+        re.match(r"^count\s*\(.+\)(?:\s+AS\s+\w+)?$", ret_cols[0], flags=re.IGNORECASE)
+    )
+
+
+def _return_column_name(expr: str) -> str:
+    as_parts = re.split(r"\s+AS\s+", expr.strip(), flags=re.IGNORECASE)
+    return as_parts[1].strip() if len(as_parts) > 1 else as_parts[0].strip()
+
+
 def _apply_order_by_and_count(
-    matched_bindings: list[dict[str, Any]],
+    matches: Iterator[dict[str, Any]],
     ret_cols: list[str],
     order_by_clause: str | None,
     cap: int,
 ) -> tuple[list[str], list[dict[str, Any]], bool]:
-    if len(ret_cols) == 1 and re.match(r"^count\s*\(.+\)(?:\s+AS\s+\w+)?$", ret_cols[0], flags=re.IGNORECASE):
-        as_parts = re.split(r"\s+AS\s+", ret_cols[0].strip(), flags=re.IGNORECASE)
-        col_name = as_parts[1].strip() if len(as_parts) > 1 else ret_cols[0].strip()
-        return ([col_name], [{col_name: len(matched_bindings)}], False)
+    if _is_count_return(ret_cols):
+        col_name = _return_column_name(ret_cols[0])
+        return ([col_name], [{col_name: sum(1 for _ in matches)}], False)
 
-    projected = [_project_return_row(b, ret_cols) for b in matched_bindings]
+    order_parts = [p.strip() for p in (order_by_clause or "").split(",") if p.strip()]
+    returned = {_return_column_name(c) for c in ret_cols}
+    for opart in order_parts:
+        if opart.split()[0] not in returned:
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message=f"ORDER BY {opart.split()[0]!r} must name a RETURN column.",
+                retryable=False,
+            )
+    if not order_parts:
+        # Rows past `cap + 1` can never be returned or change `truncated`.
+        matches = itertools.islice(matches, cap + 1)
+    projected = [_project_return_row(b, ret_cols) for b in matches]
 
-    if order_by_clause:
-        order_parts = [p.strip() for p in order_by_clause.split(",") if p.strip()]
+    if order_parts:
         for opart in reversed(order_parts):
             tokens = opart.split()
             expr_key = tokens[0]
@@ -833,6 +1038,7 @@ def _apply_order_by_and_count(
     return (ret_cols, projected[:cap], truncated)
 
 
+@_bounded_by_graph_time_limit
 def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphResult:
     """Execute a validated read-only Cypher query over the active snapshot symbol/relation graph."""
     nodes, edges, expected_epoch = _load_active_graph(store)
@@ -877,9 +1083,10 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                 if pm.group(1) == "type" and pm.group(2):
                     req_edge_type = pm.group(2).upper()
 
-        matched_bindings: list[dict[str, Any]] = []
-        if max_hop == 1:
-            for f_id, t_id, etype, method in edges:
+        def single_hop_matches() -> Iterator[dict[str, Any]]:
+            for index, (f_id, t_id, etype, method) in enumerate(edges):
+                if index % DEADLINE_CHECK_EVERY == 0:
+                    check_deadline()
                 if req_edge_type and etype != req_edge_type:
                     continue
                 n1 = nodes[f_id]
@@ -894,24 +1101,29 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                     relvar: {"confidence": 1.0, "depth": 1, "method": method, "type": etype},
                 }
                 if _matches_where(bindings, where_c):
-                    matched_bindings.append(bindings)
-        else:
+                    yield bindings
+
+        def variable_length_matches() -> Iterator[dict[str, Any]]:
             adj: dict[str, list[tuple[str, str, str]]] = {}
             for f_id, t_id, etype, method in edges:
                 if req_edge_type and etype != req_edge_type:
                     continue
                 adj.setdefault(f_id, []).append((t_id, etype, method))
 
+            steps = 0
             for start_id, n1 in nodes.items():
                 if not _matches_label(n1, l1) or not _matches_inline_props(n1, p1):
                     continue
-                bfs_q: deque[tuple[str, int, str, str]] = deque([(start_id, 0, "CALLS", "bfs")])
+                bfs_q: deque[tuple[str, int]] = deque([(start_id, 0)])
                 seen_at_start: set[str] = {start_id}
                 while bfs_q:
-                    cur_id, d, last_et, last_m = bfs_q.popleft()
+                    cur_id, d = bfs_q.popleft()
                     if d >= max_hop:
                         continue
                     for nxt_id, et, m in adj.get(cur_id, []):
+                        if steps % DEADLINE_CHECK_EVERY == 0:
+                            check_deadline()
+                        steps += 1
                         nd = d + 1
                         if nd >= min_hop:
                             n2 = nodes[nxt_id]
@@ -922,13 +1134,16 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                                     relvar: {"confidence": 1.0, "depth": nd, "method": m, "type": et},
                                 }
                                 if _matches_where(bindings, where_c):
-                                    matched_bindings.append(bindings)
+                                    yield bindings
                         if nxt_id not in seen_at_start:
                             seen_at_start.add(nxt_id)
-                            bfs_q.append((nxt_id, nd, et, m))
+                            bfs_q.append((nxt_id, nd))
 
         cols_out, rows_out, truncated = _apply_order_by_and_count(
-            matched_bindings, ret_cols, order_c, cap
+            single_hop_matches() if max_hop == 1 else variable_length_matches(),
+            ret_cols,
+            order_c,
+            cap,
         )
         store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
@@ -951,16 +1166,18 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
         cap = min(request.limit, int(lim_s) if lim_s else request.limit, 200)
         ret_cols = [c.strip() for c in ret_c.split(",") if c.strip()]
 
-        matched_bindings = []
-        for node in nodes.values():
-            if not _matches_label(node, label) or not _matches_inline_props(node, props):
-                continue
-            bindings = {var: node}
-            if _matches_where(bindings, where_c):
-                matched_bindings.append(bindings)
+        def node_matches() -> Iterator[dict[str, Any]]:
+            for index, node in enumerate(nodes.values()):
+                if index % DEADLINE_CHECK_EVERY == 0:
+                    check_deadline()
+                if not _matches_label(node, label) or not _matches_inline_props(node, props):
+                    continue
+                bindings = {var: node}
+                if _matches_where(bindings, where_c):
+                    yield bindings
 
         cols_out, rows_out, truncated = _apply_order_by_and_count(
-            matched_bindings, ret_cols, order_c, cap
+            node_matches(), ret_cols, order_c, cap
         )
         store.verify_access_epoch_and_authorize(expected_epoch)
         return QueryGraphResult(
@@ -978,7 +1195,10 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
 
 
 def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
-    """Find all cyclic Strongly Connected Components using Tarjan's algorithm."""
+    """Find all cyclic Strongly Connected Components using Tarjan's algorithm.
+
+    Uses an explicit work stack so long call chains cannot hit Python's recursion limit.
+    """
     index = 0
     indices: dict[str, int] = {}
     lowlinks: dict[str, int] = {}
@@ -986,35 +1206,45 @@ def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
     stack: list[str] = []
     cycles: list[list[str]] = []
 
-    def strongconnect(v: str) -> None:
-        nonlocal index
-        indices[v] = index
-        lowlinks[v] = index
+    for root in sorted(adj.keys()):
+        if root in indices:
+            continue
+        work: list[tuple[str, Iterator[str]]] = []
+        indices[root] = lowlinks[root] = index
         index += 1
-        stack.append(v)
-        on_stack.add(v)
-
-        for w in sorted(adj.get(v, set())):
-            if w not in indices:
-                strongconnect(w)
-                lowlinks[v] = min(lowlinks[v], lowlinks[w])
-            elif w in on_stack:
-                lowlinks[v] = min(lowlinks[v], indices[w])
-
-        if lowlinks[v] == indices[v]:
-            scc: list[str] = []
-            while True:
-                w = stack.pop()
-                on_stack.remove(w)
-                scc.append(w)
-                if w == v:
+        stack.append(root)
+        on_stack.add(root)
+        work.append((root, iter(sorted(adj.get(root, set())))))
+        while work:
+            v, successors = work[-1]
+            descended = False
+            for w in successors:
+                if w not in indices:
+                    indices[w] = lowlinks[w] = index
+                    index += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(sorted(adj.get(w, set())))))
+                    descended = True
                     break
-            if len(scc) > 1 or (len(scc) == 1 and v in adj.get(v, set())):
-                cycles.append(sorted(scc))
-
-    for node in sorted(adj.keys()):
-        if node not in indices:
-            strongconnect(node)
+                if w in on_stack:
+                    lowlinks[v] = min(lowlinks[v], indices[w])
+            if descended:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlinks[parent] = min(lowlinks[parent], lowlinks[v])
+            if lowlinks[v] == indices[v]:
+                scc: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack.remove(w)
+                    scc.append(w)
+                    if w == v:
+                        break
+                if len(scc) > 1 or v in adj.get(v, set()):
+                    cycles.append(sorted(scc))
     return sorted(cycles, key=lambda c: (len(c), c))
 
 
@@ -1088,8 +1318,8 @@ def detect_louvain_communities(
 
 def _cluster_files(
     groups: list[Any],
-    nodes: dict[str, GraphNode],
-    edges: list[tuple[str, str, str, str]],
+    nodes: Mapping[str, GraphNode],
+    edges: tuple[GraphEdgeRow, ...],
 ) -> tuple[dict[str, str], dict[str, list[str]], dict[str, tuple[str, str]]]:
     """Cluster files by Louvain over the cross-file call graph; files without calls stay in their snapshot group.
 
@@ -1143,6 +1373,7 @@ def _cluster_files(
     return file_to_cluster, cluster_files, cluster_meta
 
 
+@_bounded_by_graph_time_limit
 def execute_get_architecture(
     store: Store,
     request: GetArchitectureRequest,
@@ -1297,16 +1528,8 @@ def _workspace_changes(
 
 def _read_worktree_file(root: Path, rel: bytes) -> bytes | None:
     """Read a regular file inside `root`; symlinks and oversized files yield None."""
-    full = root / os.fsdecode(rel)
-    try:
-        st = full.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_PARSE_BYTES:
-            return None
-        if not full.resolve().is_relative_to(root):
-            return None
-        return full.read_bytes()
-    except OSError:
-        return None
+    status, data, _mode = _read_root_confined_regular_file(root, rel)
+    return data if status == "ok" else None
 
 
 def _blob_symbols(
@@ -1340,11 +1563,15 @@ def _hunk_side_touches(start: int, count: int, line_start: int, line_end: int) -
 def _classify_symbol_changes(
     old_syms: list[ExtractedSymbol],
     new_syms: list[ExtractedSymbol],
-    hunks: list[ParsedHunk],
+    hunks: list[ParsedHunk] | None,
+    *,
+    old_bytes: bytes = b"",
+    new_bytes: bytes = b"",
 ) -> list[tuple[str, str]]:
     """Classify symbols by qualified name as added, deleted, signature_modified, or body_modified.
 
-    Symbols present on both sides that no hunk touches are left out.
+    Symbols present on both sides that no hunk touches are left out. With `hunks=None` (the diff
+    was too large to run) a symbol counts as touched when its own text differs between the blobs.
     """
     # ponytail: overloads sharing a qualified name collapse to the first occurrence.
     old_by_qn: dict[str, ExtractedSymbol] = {}
@@ -1364,22 +1591,31 @@ def _classify_symbol_changes(
         if new_sym is None:
             out.append((qn, "deleted"))
             continue
-        touched = any(
-            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_end)
-            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_end)
-            for h in hunks
-        )
-        if not touched:
-            continue
-        header_touched = old_sym.signature != new_sym.signature or any(
-            _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_start)
-            or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_start)
-            for h in hunks
-        )
+        if hunks is None:
+            old_text = old_bytes[old_sym.byte_start : old_sym.byte_end]
+            if old_text == new_bytes[new_sym.byte_start : new_sym.byte_end]:
+                continue
+            header_touched = old_sym.signature != new_sym.signature
+        else:
+            touched = any(
+                _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_end)
+                or _hunk_side_touches(h.new_start, h.new_count, new_sym.line_start, new_sym.line_end)
+                for h in hunks
+            )
+            if not touched:
+                continue
+            header_touched = old_sym.signature != new_sym.signature or any(
+                _hunk_side_touches(h.old_start, h.old_count, old_sym.line_start, old_sym.line_start)
+                or _hunk_side_touches(
+                    h.new_start, h.new_count, new_sym.line_start, new_sym.line_start
+                )
+                for h in hunks
+            )
         out.append((qn, "signature_modified" if header_touched else "body_modified"))
     return out
 
 
+@_time_limited(lambda: DETECT_CHANGES_MAX_SECONDS)
 def execute_detect_changes(
     store: Store,
     mirror: GitMirror,
@@ -1437,9 +1673,8 @@ def execute_detect_changes(
             if p is not None:
                 changed_paths.add(path_bytes_to_display(p)[0])
 
-    classifications: dict[str, str] = {}
-    seed_keys: set[tuple[str, str]] = set()
-    deleted_symbols: list[str] = []
+    # Keyed by (display path, qualified name) so the same name in two files stays separate.
+    classifications: dict[tuple[str, str], str] = {}
     with mirror.open_batch_session() as batch:
         # ponytail: only the first MAX_CLASSIFIED_FILES changes are parsed; huge diffs list files but not every symbol.
         for old_p, new_p, old_oid, new_oid, new_bytes_ws in file_changes[:MAX_CLASSIFIED_FILES]:
@@ -1447,24 +1682,30 @@ def execute_detect_changes(
             new_bytes, new_syms = _blob_symbols(batch, new_p, new_oid, new_bytes_ws)
             if not old_syms and not new_syms:
                 continue
-            hunks = compute_unified_zero_hunks(old_bytes, new_bytes)
+            hunks = compute_unified_zero_hunks(
+                old_bytes,
+                new_bytes,
+                mirror=mirror,
+                old_oid=old_oid if old_bytes is not None else None,
+                new_oid=new_oid if new_bytes is not None else None,
+            )
             old_disp = path_bytes_to_display(old_p)[0] if old_p is not None else None
             new_disp = path_bytes_to_display(new_p)[0] if new_p is not None else None
-            for qn, kind in _classify_symbol_changes(old_syms, new_syms, hunks):
-                classifications[qn] = kind
-                if kind == "deleted":
-                    deleted_symbols.append(qn)
+            changes = _classify_symbol_changes(
+                old_syms, new_syms, hunks, old_bytes=old_bytes or b"", new_bytes=new_bytes or b""
+            )
+            for qn, kind in changes:
                 for disp in (new_disp, old_disp):
                     if disp is not None:
-                        seed_keys.add((disp, qn))
+                        classifications[(disp, qn[:MAX_NODE_QUALIFIED_NAME_CHARS])] = kind
 
-    deleted_set = set(deleted_symbols)
     seed_ids: set[str] = set()
     modified_syms: list[GraphNode] = []
     for n in nodes.values():
-        if (n.file_path, n.qualified_name) in seed_keys:
+        kind = classifications.get((n.file_path, n.qualified_name))
+        if kind is not None:
             seed_ids.add(n.id)
-            if n.qualified_name not in deleted_set:
+            if kind != "deleted":
                 modified_syms.append(n)
     modified_ids = {n.id for n in modified_syms}
 
@@ -1523,12 +1764,57 @@ def execute_detect_changes(
         affected_callers=list(affected_callers.values())[: request.limit],
         impact_edges=impact_edges,
         affected_symbols=affected_syms_list[: request.limit],
-        deleted_symbols=sorted(deleted_set),
-        classifications=classifications,
+        deleted_symbols=sorted({qn for (_, qn), kind in classifications.items() if kind == "deleted"}),
+        classifications={qn: kind for (_, qn), kind in sorted(classifications.items())},
         affected_tests=sorted(affected_tests_set),
     )
 
 
+_SNAPSHOT_SYMBOL_SQL = """
+    SELECT s.id, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature,
+           s.byte_start, s.byte_end, e.blob_oid, e.language, MIN(sf.path) AS path {extra_columns}
+    FROM symbols s
+    JOIN extractions e ON e.id = s.extraction_id
+    JOIN snapshot_files sf ON sf.extraction_id = s.extraction_id
+    WHERE {where}
+    GROUP BY s.id
+    ORDER BY path, s.byte_start, s.id
+"""
+
+_CALL_NEIGHBOUR_SQL = """
+    SELECT r.{other} FROM relations r INDEXED BY relations_{own_index}
+    WHERE r.{own} = ? AND r.from_kind = 'symbol' AND r.to_kind = 'symbol'
+      AND r.state = 'active' AND r.relation_kind = 'calls_candidate' {extra}
+      AND EXISTS (
+        SELECT 1 FROM symbols endpoint
+        JOIN snapshot_files sf ON sf.extraction_id = endpoint.extraction_id
+        WHERE endpoint.id = r.{other}
+      )
+    GROUP BY r.{other} ORDER BY MIN(r.id) LIMIT ?
+"""
+MAX_SNIPPET_NEIGHBOURS = 25
+
+
+def _row_to_graph_node(row: sqlite3.Row) -> GraphNode:
+    l_start = int(row["line_start"])
+    l_end = int(row["line_end"])
+    return _graph_node(
+        id=str(row["id"]),
+        label=_kind_to_label(str(row["kind"])),
+        name=str(row["name"]),
+        qualified_name=str(row["qualified_name"]),
+        file_path=path_bytes_to_display(bytes(row["path"]))[0],
+        language=str(row["language"]),
+        line_start=l_start,
+        line_end=l_end,
+        signature=str(row["signature"]),
+        inbound_degree=int(row["inbound_degree"]),
+        outbound_degree=int(row["outbound_degree"]),
+        line_count=max(1, l_end - l_start + 1),
+    )
+
+
+@_bounded_by_graph_time_limit
 def execute_get_code_snippet(
     store: Store,
     mirror: GitMirror,
@@ -1537,73 +1823,90 @@ def execute_get_code_snippet(
     """Retrieve exact symbol source code by `qualified_name` (or short `name`) and optional `file_path`,
     along with direct callers and callees when `include_neighbors=True`.
     """
-    nodes, edges, expected_epoch = _load_active_graph(store)
     q = request.qualified_name.strip()
 
-    candidates = [
-        n
-        for n in nodes.values()
-        if (n.id == q or n.qualified_name == q or n.name == q)
-        and (request.file_path is None or n.file_path == request.file_path)
-    ]
-    if not candidates:
+    def in_requested_file(row: sqlite3.Row) -> bool:
+        return request.file_path is None or path_bytes_to_display(bytes(row["path"]))[0] == request.file_path
+
+    with store.read_snapshot() as snap:
+        conn = snap.conn
         candidates = [
-            n
-            for n in nodes.values()
-            if q.lower() in n.qualified_name.lower()
-            and (request.file_path is None or n.file_path == request.file_path)
+            row
+            for row in conn.execute(
+                _SNAPSHOT_SYMBOL_SQL.format(
+                    extra_columns="", where="(s.id = ? OR s.qualified_name = ? OR s.name = ?)"
+                ),
+                (q, q, q),
+            )
+            if in_requested_file(row)
         ]
-    if not candidates:
-        raise CodeContextError(
-            code="RECORD_NOT_FOUND",
-            message=f"Symbol {q!r} not found in active snapshot.",
-            retryable=False,
-        )
+        if not candidates:
+            needle = q.lower()
+            conn.create_function(
+                "contains_needle", 1, lambda value: needle in str(value).lower(), deterministic=True
+            )
+            candidates = [
+                row
+                for row in conn.execute(
+                    _SNAPSHOT_SYMBOL_SQL.format(extra_columns="", where="contains_needle(s.qualified_name)")
+                )
+                if in_requested_file(row)
+            ]
+        if not candidates:
+            raise CodeContextError(
+                code="RECORD_NOT_FOUND",
+                message=f"Symbol {q!r} not found in active snapshot.",
+                retryable=False,
+            )
+        exact_q = [row for row in candidates if row["qualified_name"] == q]
+        target = exact_q[0] if exact_q else candidates[0]
+        target_id = str(target["id"])
 
-    exact_q = [n for n in candidates if n.qualified_name == q]
-    target_node = exact_q[0] if exact_q else candidates[0]
-
-    with store.connect_read() as conn:
-        srow = conn.execute(
-            """
-            SELECT s.byte_start, s.byte_end, e.blob_oid
-            FROM symbols s
-            JOIN extractions e ON e.id = s.extraction_id
-            WHERE s.id = ?
-            """,
-            (target_node.id,),
-        ).fetchone()
-    if not srow:
-        raise CodeContextError(
-            code="RECORD_NOT_FOUND",
-            message=f"Symbol {target_node.id} not found.",
-            retryable=False,
-        )
+        caller_ids: list[str] = []
+        callee_ids: list[str] = []
+        if request.include_neighbors:
+            caller_ids = [
+                str(r[0])
+                for r in conn.execute(
+                    _CALL_NEIGHBOUR_SQL.format(own="to_id", other="from_id", own_index="to", extra=""),
+                    (target_id, MAX_SNIPPET_NEIGHBOURS),
+                )
+            ]
+            callee_ids = [
+                str(r[0])
+                for r in conn.execute(
+                    _CALL_NEIGHBOUR_SQL.format(
+                        own="from_id", other="to_id", own_index="from", extra="AND r.to_id != r.from_id"
+                    ),
+                    (target_id, MAX_SNIPPET_NEIGHBOURS),
+                )
+            ]
+        wanted = [target_id, *caller_ids, *callee_ids]
+        by_id = {
+            str(row["id"]): _row_to_graph_node(row)
+            for row in conn.execute(
+                _SNAPSHOT_SYMBOL_SQL.format(
+                    extra_columns=", " + _degree_columns("s.id", "AND r.relation_kind = 'calls_candidate'"),
+                    where="s.id IN (SELECT value FROM json_each(?))",
+                ),
+                (json.dumps(wanted),),
+            )
+        }
+        expected_epoch = snap.access_epoch
 
     with mirror.open_batch_session() as batch:
-        b_obj = batch.read_object(str(srow["blob_oid"]))
+        b_obj = batch.read_object(str(target["blob_oid"]))
     code_text = ""
     if b_obj is not None:
         raw_b = b_obj[2]
-        code_text = raw_b[int(srow["byte_start"]) : int(srow["byte_end"])].decode(
+        code_text = raw_b[int(target["byte_start"]) : int(target["byte_end"])].decode(
             "utf-8", errors="replace"
         )[:16384]
 
-    callers: list[GraphNode] = []
-    callees: list[GraphNode] = []
-    if request.include_neighbors:
-        for f_id, t_id, etype, _ in edges:
-            if etype != "CALLS":
-                continue
-            if t_id == target_node.id and f_id in nodes:
-                callers.append(nodes[f_id])
-            elif f_id == target_node.id and t_id in nodes:
-                callees.append(nodes[t_id])
-
     store.verify_access_epoch_and_authorize(expected_epoch)
     return GetCodeSnippetResult(
-        node=target_node,
+        node=by_id[target_id],
         code=code_text,
-        callers=callers[:25],
-        callees=callees[:25],
+        callers=[by_id[i] for i in caller_ids if i in by_id],
+        callees=[by_id[i] for i in callee_ids if i in by_id],
     )

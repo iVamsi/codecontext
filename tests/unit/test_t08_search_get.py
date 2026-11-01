@@ -1,26 +1,41 @@
+import sqlite3
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import codecontext.retrieval as retrieval
+from codecontext.enrichment import execute_enrich
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.github import GitHubClient, collect_focused_github_evidence
 from codecontext.lineage import index_focused_path_history
 from codecontext.models import (
+    ContextRequest,
+    EnrichRequest,
     GapRecord,
     GetRequest,
     InitRequest,
+    PathTarget,
     SearchRequest,
     SourceRecord,
     SourceVersionRecord,
     SymbolRecord,
 )
-from codecontext.retrieval import execute_get, execute_search
+from codecontext.retrieval import execute_context, execute_get, execute_search
 from codecontext.store import Store
 from codecontext.syntax import index_active_snapshot_files
-from tests.fixtures.builders import build_f01_fixture
+from examples.fixture_adapter import DeterministicFixtureAdapter
+from tests.fixtures.builders import (
+    GitCommitSpec,
+    build_f01_fixture,
+    commit_fixture_spec,
+    run_git_fixture,
+)
 from tests.unit.test_t07_github import make_mock_github_transport
+from tests.unit.test_t10_enrichment import _prepare_f01_store
 
 
 def test_u13_search_ranking_fts_safety_and_get_expansion(tmp_path: Path) -> None:
@@ -189,4 +204,114 @@ def test_u13_search_ranking_fts_safety_and_get_expansion(tmp_path: Path) -> None
     assert exc_info.value.code == "INVALID_REQUEST"
     assert exc_info.value.details["minimum_required_tokens"] > 512
 
+    store.close()
+
+
+CLAIM_QUERY = "bound send retries"
+
+
+def _enriched_f01(tmp_path: Path) -> tuple[Store, GitMirror, Any, str]:
+    store, mirror, f01 = _prepare_f01_store(tmp_path)
+    execute_enrich(
+        store,
+        mirror,
+        EnrichRequest(max_input_tokens=100_000, max_output_tokens=20_000, max_calls=10),
+        model=DeterministicFixtureAdapter(),
+    )
+    with store.read_snapshot() as snap:
+        claim_id = str(snap.conn.execute("SELECT id FROM claims").fetchone()["id"])
+    return store, mirror, f01, claim_id
+
+
+def _claim_hits(store: Store, mirror: GitMirror, **kwargs: Any) -> list[str]:
+    res = execute_search(store, mirror, SearchRequest(query=CLAIM_QUERY, kind="decision", **kwargs))
+    return [h.id for h in res.hits]
+
+
+def test_claim_from_commit_after_cutoff_is_hidden(tmp_path: Path) -> None:
+    store, mirror, f01, claim_id = _enriched_f01(tmp_path)
+    cutoff = datetime(2026, 1, 4, tzinfo=UTC)
+    assert claim_id in _claim_hits(store, mirror, knowledge_cutoff=cutoff)
+
+    # Every PR source version predates the cutoff, so only the commit time can exclude the claim.
+    late_us = int(datetime(2026, 1, 5, tzinfo=UTC).timestamp() * 1_000_000)
+    with store.write_transaction() as conn:
+        conn.execute(
+            "UPDATE commits SET committed_at_us = ?, authored_at_us = ? WHERE oid = ?",
+            (late_us, late_us, f01.c1_oid),
+        )
+    assert claim_id not in _claim_hits(store, mirror, knowledge_cutoff=cutoff)
+    assert claim_id in _claim_hits(store, mirror)
+    store.close()
+
+
+def test_claim_from_non_ancestor_commit_is_hidden_after_force_push(tmp_path: Path) -> None:
+    store, mirror, f01, claim_id = _enriched_f01(tmp_path)
+    assert claim_id in _claim_hits(store, mirror)
+
+    run_git_fixture(f01.repo_dir, ["reset", "--hard", f01.c0_oid])
+    commit_fixture_spec(
+        f01.repo_dir,
+        GitCommitSpec(
+            message="Rewrite transport docs",
+            files={"README.md": b"# Transport rewritten\n"},
+            authored_at="2026-01-04T10:00:00Z",
+            committed_at="2026-01-04T10:00:00Z",
+        ),
+    )
+    mirror.prepare_snapshot("HEAD")
+
+    assert claim_id not in _claim_hits(store, mirror)
+    with pytest.raises(CodeContextError) as exc_info:
+        execute_get(store, mirror, GetRequest(id=claim_id))
+    assert exc_info.value.code == "RECORD_NOT_ELIGIBLE"
+    store.close()
+
+
+def _count_statements(
+    store: Store, monkeypatch: pytest.MonkeyPatch, needle: str
+) -> Counter[str]:
+    seen: Counter[str] = Counter()
+    original = store._open_raw_connection
+
+    def traced(*, for_write: bool) -> sqlite3.Connection:
+        conn = original(for_write=for_write)
+        conn.set_trace_callback(
+            lambda sql: seen.update([needle]) if needle in " ".join(sql.split()) else None
+        )
+        return conn
+
+    monkeypatch.setattr(store, "_open_raw_connection", traced)
+    return seen
+
+
+def test_context_scans_snapshot_commits_once_per_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, mirror, _f01, _claim_id = _enriched_f01(tmp_path)
+    seen = _count_statements(store, monkeypatch, "SELECT commit_oid FROM snapshot_commits")
+    req = ContextRequest(
+        query="Why is send limited to 3 retries?",
+        target=PathTarget(kind="path", path="src/transport.py", line=5),
+    )
+    execute_context(store, mirror, req)
+    execute_context(store, mirror, req)
+    assert seen["SELECT commit_oid FROM snapshot_commits"] == 1
+    store.close()
+
+
+def test_search_validates_each_record_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, mirror, _f01, claim_id = _enriched_f01(tmp_path)
+    calls: Counter[str] = Counter()
+    original = retrieval._validate_and_project_lexical_candidate
+
+    def counting(conn: sqlite3.Connection, **kwargs: Any) -> Any:
+        calls[kwargs["rec_id"]] += 1
+        return original(conn, **kwargs)
+
+    monkeypatch.setattr(retrieval, "_validate_and_project_lexical_candidate", counting)
+    assert claim_id in _claim_hits(store, mirror)
+    assert max(calls.values()) == 1
     store.close()

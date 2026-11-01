@@ -1,11 +1,13 @@
 import contextlib
+import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from codecontext.deadline import check_deadline
+from codecontext.errors import CodeContextError
 from codecontext.git import (
     CatFileBatchSession,
     GitMirror,
@@ -151,10 +153,13 @@ def detect_commit_renames_and_moves(
     parent_oid: str | None,
     commit_oid: str,
     raw_changes: list[RawChange],
+    *,
+    sim_changes: list[RawChange] | None = None,
 ) -> tuple[dict[bytes, tuple[bytes, str, int]], bool]:
     """Identify moves/renames between `parent_oid` and `commit_oid`:
     1. Unique deleted path and unique added path with identical blob_oid -> ('exact', 100)
     2. Bounded Git similarity pass (`-M50% -l200`) for edited renames -> ('candidate', score)
+    `sim_changes` is that pass's output when the caller already has it from `diff_tree_batch`.
     Returns `(new_path -> (old_path, mapping_kind, score), rename_limit_exceeded)`.
     """
     deleted_by_blob: dict[str, list[bytes]] = {}
@@ -188,27 +193,28 @@ def detect_commit_renames_and_moves(
     if deleted_count + added_count > 400:
         return moves, True
 
-    proc = run_safe_git(
-        [
-            "diff-tree",
-            "--no-commit-id",
-            "--raw",
-            "-r",
-            "-z",
-            "--no-abbrev",
-            "-M50%",
-            "-l200",
-            parent_oid,
-            commit_oid,
-        ],
-        git_dir=mirror.git_dir,
-        empty_hooks_dir=mirror.empty_hooks_dir,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return moves, False
+    if sim_changes is None:
+        proc = run_safe_git(
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--raw",
+                "-r",
+                "-z",
+                "--no-abbrev",
+                "-M50%",
+                "-l200",
+                parent_oid,
+                commit_oid,
+            ],
+            git_dir=mirror.git_dir,
+            empty_hooks_dir=mirror.empty_hooks_dir,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return moves, False
+        sim_changes = parse_diff_tree_raw_z(proc.stdout, parent_index=0, parent_oid=parent_oid)
 
-    sim_changes = parse_diff_tree_raw_z(proc.stdout, parent_index=0, parent_oid=parent_oid)
     for sch in sim_changes:
         if sch.change_kind == "renamed" and sch.old_path is not None and sch.new_path is not None:
             if sch.new_path not in moves and sch.old_path not in claimed_old_paths:
@@ -226,6 +232,75 @@ def detect_commit_renames_and_moves(
                 claimed_old_paths.add(sch.old_path)
 
     return moves, False
+
+
+def _split_renames(changes: list[RawChange]) -> list[RawChange]:
+    """Turn `-M` output into the `--no-renames` form: each rename becomes a delete and an add,
+    in Git's tree order (byte order of the full path)."""
+    split: list[RawChange] = []
+    for ch in changes:
+        if ch.change_kind != "renamed":
+            split.append(ch)
+            continue
+        split.append(
+            replace(
+                ch, new_mode=None, new_blob_oid=None, change_kind="deleted", rename_score=None, new_path=None
+            )
+        )
+        split.append(
+            replace(
+                ch, old_mode=None, old_blob_oid=None, change_kind="added", rename_score=None, old_path=None
+            )
+        )
+    split.sort(key=lambda ch: ch.new_path if ch.new_path is not None else ch.old_path or b"")
+    return split
+
+
+def _changes_and_moves(
+    mirror: GitMirror,
+    parent_oid: str | None,
+    commit_oid: str,
+    parent_index: int,
+    p0_changes: list[RawChange] | None,
+) -> tuple[list[RawChange], dict[bytes, tuple[bytes, str, int]]]:
+    """Return `(raw_changes, moves)` for one parent, from `diff_tree_batch` output when given."""
+    if p0_changes is None:
+        raw_changes = mirror.diff_tree_parent(parent_oid, commit_oid, parent_index=parent_index)
+        moves, _ = detect_commit_renames_and_moves(mirror, parent_oid, commit_oid, raw_changes)
+        return raw_changes, moves
+    raw_changes = _split_renames(p0_changes)
+    moves, _ = detect_commit_renames_and_moves(
+        mirror, parent_oid, commit_oid, raw_changes, sim_changes=p0_changes
+    )
+    return raw_changes, moves
+
+
+def diff_first_parents(
+    conn: sqlite3.Connection,
+    mirror: GitMirror,
+    batch: CatFileBatchSession,
+    commit_oids: list[str],
+) -> dict[str, list[RawChange]]:
+    """Diff each commit against its first parent with one `diff-tree` process. Commits whose
+    parent object is missing are left out, so they take the MISSING_PARENT path when indexed.
+    A failed batch returns `{}` and every commit falls back to its own diff."""
+    rows = conn.execute(
+        """
+        SELECT commit_oid, parent_oid FROM commit_parents
+        WHERE parent_index = 0 AND commit_oid IN (SELECT value FROM json_each(?))
+        """,
+        (json.dumps(commit_oids),),
+    ).fetchall()
+    first_parent = {str(r["commit_oid"]): str(r["parent_oid"]) for r in rows}
+    pairs: list[tuple[str, str | None]] = []
+    for oid in commit_oids:
+        parent = first_parent.get(oid)
+        if parent is None or batch.read_object_bounded(parent, max_bytes=0) is not None:
+            pairs.append((oid, parent))
+    try:
+        return mirror.diff_tree_batch(pairs)
+    except CodeContextError:
+        return {}
 
 
 def _coalesce_renamed_raw_changes(
@@ -376,9 +451,22 @@ def map_original_anchor_to_target(
             t_blob_obj = batch.read_object_bounded(t_same_path.oid, max_bytes=MAX_PARSE_BYTES)
             if t_blob_obj is not None and t_blob_obj[2] is not None:
                 t_bytes = t_blob_obj[2]
-                hunks = compute_unified_zero_hunks(orig_bytes, t_bytes)
-                transported = transport_line_range_across_hunks(
-                    original_line_start, original_line_end, hunks
+                try:
+                    hunks = compute_unified_zero_hunks(
+                        orig_bytes,
+                        t_bytes,
+                        mirror=mirror,
+                        old_oid=orig_entry.oid,
+                        new_oid=t_same_path.oid,
+                    )
+                except CodeContextError as exc:
+                    if exc.code != "IO_ERROR":
+                        raise
+                    hunks = None
+                transported = (
+                    transport_line_range_across_hunks(original_line_start, original_line_end, hunks)
+                    if hunks is not None
+                    else None
                 )
                 if transported is not None:
                     new_l_start, new_l_end = transported
@@ -837,48 +925,36 @@ def index_commit_changes_and_hunks(
     filter_paths: set[bytes] | None = None,
     batch: CatFileBatchSession | None = None,
     conn: sqlite3.Connection | None = None,
+    p0_changes: list[RawChange] | None = None,
 ) -> tuple[int, set[bytes]]:
     """Index parent-specific raw changes, bounded text hunks, changed-blob syntax,
     commit/hunk/code evidence handles, and symbol-to-change relations for `commit_oid`.
+    `p0_changes` is this commit's `diff_tree_batch` output; without it the diff runs here.
     Returns `(changes_indexed, discovered_predecessor_paths)`.
     """
     check_deadline()
-    if conn is not None:
-        meta = conn.execute("SELECT repository_id FROM store_meta WHERE singleton = 1").fetchone()
-        if not meta:
-            return (0, set())
-        repo_id = str(meta["repository_id"])
-        parent_rows = conn.execute(
-            "SELECT parent_index, parent_oid FROM commit_parents WHERE commit_oid = ? ORDER BY parent_index ASC",
-            (commit_oid,),
-        ).fetchall()
-    else:
-        with store.connect_read() as r_conn:
-            meta = r_conn.execute(
-                "SELECT repository_id FROM store_meta WHERE singleton = 1"
-            ).fetchone()
-            if not meta:
-                return (0, set())
-            repo_id = str(meta["repository_id"])
-            parent_rows = r_conn.execute(
-                "SELECT parent_index, parent_oid FROM commit_parents WHERE commit_oid = ? ORDER BY parent_index ASC",
-                (commit_oid,),
-            ).fetchall()
-
-    # Merges are diffed against their first parent only (`git log --first-parent -m`): that diff
-    # is what the merge brought into the mainline, and side-branch commits are indexed on their own.
-    parents: list[tuple[int, str | None]] = (
-        [(int(parent_rows[0]["parent_index"]), str(parent_rows[0]["parent_oid"]))]
-        if parent_rows
-        else [(-1, None)]
-    )
-
     predecessor_paths: set[bytes] = set()
     missing_parent = False
 
     with contextlib.ExitStack() as stack:
-        active_batch = batch if batch is not None else stack.enter_context(mirror.open_batch_session())
         w_conn = conn if conn is not None else stack.enter_context(store.write_transaction(bump_generation=True))
+        meta = w_conn.execute("SELECT repository_id FROM store_meta WHERE singleton = 1").fetchone()
+        if not meta:
+            return (0, set())
+        repo_id = str(meta["repository_id"])
+        parent_rows = w_conn.execute(
+            "SELECT parent_index, parent_oid FROM commit_parents WHERE commit_oid = ? ORDER BY parent_index ASC",
+            (commit_oid,),
+        ).fetchall()
+        active_batch = batch if batch is not None else stack.enter_context(mirror.open_batch_session())
+
+        # Merges are diffed against their first parent only (`git log --first-parent -m`): that
+        # diff is what the merge brought into the mainline; side-branch commits are indexed alone.
+        parents: list[tuple[int, str | None]] = (
+            [(int(parent_rows[0]["parent_index"]), str(parent_rows[0]["parent_oid"]))]
+            if parent_rows
+            else [(-1, None)]
+        )
 
         commit_obj = active_batch.read_object(commit_oid)
         parsed_commit = (
@@ -984,9 +1060,7 @@ def index_commit_changes_and_hunks(
                 )
                 continue
 
-            raw_changes = mirror.diff_tree_parent(p_oid, commit_oid, parent_index=p_idx)
-
-            moves, _ = detect_commit_renames_and_moves(mirror, p_oid, commit_oid, raw_changes)
+            raw_changes, moves = _changes_and_moves(mirror, p_oid, commit_oid, p_idx, p0_changes)
             for new_p, (old_p, _, _) in moves.items():
                 if filter_paths is None or new_p in filter_paths:
                     predecessor_paths.add(old_p)
@@ -1028,9 +1102,19 @@ def index_commit_changes_and_hunks(
                     old_bytes = None
                     new_bytes = None
 
-                hunks: list[ParsedHunk] = (
-                    compute_unified_zero_hunks(old_bytes, new_bytes) if can_diff else []
+                diffed = (
+                    compute_unified_zero_hunks(
+                        old_bytes,
+                        new_bytes,
+                        mirror=mirror,
+                        old_oid=rch.old_blob_oid,
+                        new_oid=rch.new_blob_oid,
+                    )
+                    if can_diff
+                    else []
                 )
+                can_diff = can_diff and diffed is not None
+                hunks: list[ParsedHunk] = diffed or []
 
                 old_b64 = encode_path_b64(rch.old_path) if rch.old_path is not None else None
                 new_b64 = encode_path_b64(rch.new_path) if rch.new_path is not None else None
@@ -1366,7 +1450,7 @@ def index_focused_path_history(
     paths_queue: list[bytes] = [focus_path]
     seen_paths: set[bytes] = {focus_path}
 
-    with mirror.open_batch_session() as batch:
+    with mirror.open_batch_session() as batch, store.connect_read() as r_conn:
         while paths_queue and len(visited_commits) < max_changes:
             check_deadline()
             cur_path = paths_queue.pop(0)
@@ -1393,51 +1477,41 @@ def index_focused_path_history(
                 for line in proc.stdout.splitlines()
                 if line.strip()
             ]
-            for c_oid in c_oids:
-                if c_oid in seen_commits:
-                    continue
+            new_oids = list(dict.fromkeys(c for c in c_oids if c not in seen_commits))[:rem]
+            p0_by_commit = diff_first_parents(r_conn, mirror, batch, new_oids)
+            for c_oid in new_oids:
                 seen_commits.add(c_oid)
                 visited_commits.append(c_oid)
+                p0_changes = p0_by_commit.get(c_oid)
                 # Focused history only needs cur_path; indexing every file of a wide commit wastes the budget.
                 use_filter: set[bytes] | None = None
-                with store.connect_read() as r_conn:
-                    p_row = r_conn.execute(
-                        "SELECT parent_oid FROM commit_parents WHERE commit_oid = ? AND parent_index = 0",
-                        (c_oid,),
-                    ).fetchone()
-                p0_oid = str(p_row["parent_oid"]) if p_row else None
-                if p0_oid is None or batch.read_object_bounded(p0_oid, max_bytes=0) is not None:
-                    p0_changes = mirror.diff_tree_parent(p0_oid, c_oid, parent_index=0)
-                    if len(p0_changes) > WIDE_COMMIT_FILE_THRESHOLD:
-                        use_filter = {cur_path}
+                if p0_changes is not None and len(_split_renames(p0_changes)) > WIDE_COMMIT_FILE_THRESHOLD:
+                    use_filter = {cur_path}
                 _, preds = index_commit_changes_and_hunks(
                     store,
                     mirror,
                     c_oid,
                     filter_paths=use_filter,
                     batch=batch,
+                    p0_changes=p0_changes,
                 )
                 for pred in preds:
                     if pred not in seen_paths:
                         seen_paths.add(pred)
                         paths_queue.append(pred)
-                if len(visited_commits) >= max_changes:
-                    break
 
     with store.write_transaction(bump_generation=True) as conn:
-        pending_commits = conn.execute(
-            "SELECT oid FROM commits WHERE diff_state != 'complete' ORDER BY first_seen_at_us ASC, oid ASC"
-        ).fetchall()
-        for r in pending_commits:
-            c_oid = str(r["oid"])
-            Store.enqueue_job(conn, kind="git_commit_diff", owner_id=c_oid, priority=50)
-        if pending_commits:
+        Store.enqueue_pending_diff_jobs(conn)
+        pending_count = int(
+            conn.execute("SELECT COUNT(*) FROM commits WHERE diff_state != 'complete'").fetchone()[0]
+        )
+        if pending_count:
             Store.upsert_gap(
                 conn,
                 repository_id=store.config.repository_id,
                 code="GIT_HISTORY_PENDING",
                 scope="git:history",
-                message=f"{len(pending_commits)} commit(s) remaining in full Git history backfill.",
+                message=f"{pending_count} commit(s) remaining in full Git history backfill.",
                 retryable=True,
             )
         else:

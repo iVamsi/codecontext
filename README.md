@@ -119,7 +119,9 @@ Add the server definition (see [`examples/mcp-config.json`](examples/mcp-config.
 
 Add the guidance snippet in [`examples/agent-instructions.md`](examples/agent-instructions.md) to your project's agent instructions.
 
-Use `list_repositories` to discover configured roots and initialized submodules. Pass a returned absolute path in the optional `repository` argument of any query tool to select that store. With an explicit `--store` or `--workspace`, routing is limited to that repository and its initialized submodules. A globally launched server also accepts verified MCP client roots. Each repository has its own index; selecting a submodule bootstraps its `.codecontext` store if needed. Existing stores refresh with `sync`, and submodule calls stay within their selected repository.
+Use `list_repositories` to discover configured roots and initialized submodules. Pass a returned absolute path in the optional `repository` argument of any query tool to select that store. With an explicit `--store` or `--workspace`, routing is limited to that repository and its initialized submodules. A globally launched server also accepts verified MCP client roots. Each repository has its own index, and submodule calls stay within their selected repository. Existing stores refresh with `sync`.
+
+The server is read-only by default. If a repository or submodule has no `.codecontext` store, its tools return `STORE_NOT_INITIALIZED` and nothing is written. Run `codecontext init` first, or pass `serve --auto-init` to have the server create and sync missing stores. Startup errors go to stderr, because stdout carries the MCP protocol.
 
 `serve --allow-sync` exposes a `sync` tool. `serve --allow-enrich` exposes an `enrich` tool and needs the same `--provider`/`--model` or `--adapter` flags as the `enrich` command.
 

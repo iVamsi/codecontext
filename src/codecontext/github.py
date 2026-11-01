@@ -25,6 +25,7 @@ from codecontext.identity import (
     make_ver_id,
     parse_iso_utc,
     sha256_bytes,
+    us_to_iso_z,
 )
 from codecontext.store import Store, now_us
 from codecontext.syntax import chunk_utf8_bytes, normalize_search_text
@@ -36,6 +37,11 @@ MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024  # 32 MiB
 MAX_SOURCE_TEXT_BYTES = 4 * 1024 * 1024  # 4 MiB
 PR_COMMITS_CAP = 250
 PR_FILES_CAP = 3000
+GITHUB_REFRESH_OVERLAP_SECONDS = 300
+SECONDARY_RATE_LIMIT_PROBE_BYTES = 4 * 1024
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
+# A commit with no PR yet may get one later; re-ask at most daily instead of every sync.
+COMMIT_PULLS_RECHECK_US = 24 * 3600 * 1_000_000
 
 LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 ISSUE_REF_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<num>[1-9]\d*)")
@@ -198,6 +204,8 @@ class GitHubClient:
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
         )
         self.requests_attempted = 0
+        # One client serves one sync, so a store verified once stays verified for its lifetime.
+        self.verified_repositories: dict[str, tuple[str, str]] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -282,7 +290,20 @@ class GitHubClient:
             remaining_requests=remaining_requests,
             deadline_monotonic=deadline_monotonic,
         )
-        if res.body_too_large or not isinstance(res.data, dict) or res.data.get("errors") or not isinstance(res.data.get("data"), dict):
+        errors = res.data.get("errors") if isinstance(res.data, dict) else None
+        if isinstance(errors, list) and any(
+            isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors
+        ):
+            raise CodeContextError(
+                code="RATE_LIMITED",
+                message="GitHub GraphQL rate limit exceeded.",
+                retryable=True,
+                details={
+                    "wait_seconds": int(RATE_LIMIT_DEFAULT_WAIT_SECONDS),
+                    "retry_at_offset": int(RATE_LIMIT_DEFAULT_WAIT_SECONDS),
+                },
+            )
+        if res.body_too_large or not isinstance(res.data, dict) or errors or not isinstance(res.data.get("data"), dict):
             raise CodeContextError(
                 code="IO_ERROR",
                 message="GitHub GraphQL query failed.",
@@ -354,16 +375,12 @@ class GitHubClient:
                         retry_after = resp.headers.get("Retry-After")
                         rl_rem = resp.headers.get("X-RateLimit-Remaining")
                         rl_reset = resp.headers.get("X-RateLimit-Reset")
-                        is_rate_limit = (
-                            status == 429
-                            or retry_after is not None
-                            or rl_rem == "0"
-                        )
-                        if is_rate_limit:
-                            wait_sec = 60.0
+                        is_primary = status == 429 or retry_after is not None or rl_rem == "0"
+                        if is_primary or _is_secondary_rate_limit_body(resp):
+                            wait_sec = RATE_LIMIT_DEFAULT_WAIT_SECONDS
                             if retry_after is not None and retry_after.isdigit():
                                 wait_sec = float(int(retry_after))
-                            elif rl_reset is not None and rl_reset.isdigit():
+                            elif is_primary and rl_reset is not None and rl_reset.isdigit():
                                 wait_sec = max(1.0, float(int(rl_reset)) - time.time())
                             raise CodeContextError(
                                 code="RATE_LIMITED",
@@ -471,6 +488,16 @@ class GitHubClient:
         )
 
 
+def _is_secondary_rate_limit_body(resp: httpx.Response) -> bool:
+    # GitHub only signals a secondary limit in the body. The body is never logged or returned.
+    head = b""
+    for chunk in resp.iter_bytes():
+        head += chunk
+        if len(head) >= SECONDARY_RATE_LIMIT_PROBE_BYTES:
+            break
+    return b"secondary rate limit" in head[:SECONDARY_RATE_LIMIT_PROBE_BYTES].lower()
+
+
 def verify_and_bind_github_repository(
     store: Store,
     client: GitHubClient,
@@ -480,7 +507,7 @@ def verify_and_bind_github_repository(
 ) -> tuple[str, str]:
     """Verify `GET /user` when authenticated and `GET /repos/{owner}/{repo}`.
     Enforces principal binding and immutable numeric repository ID.
-    Returns `(repository_provider_id, repo_full_name)`.
+    Returns `(repository_provider_id, repo_full_name)`. A client verifies each store once.
     """
     if not store.config.github_repository:
         raise CodeContextError(
@@ -488,6 +515,9 @@ def verify_and_bind_github_repository(
             message="Store has no configured github_repository.",
             retryable=False,
         )
+    cached = client.verified_repositories.get(store.config.repository_id)
+    if cached is not None:
+        return cached
 
     with store.connect_read() as conn:
         meta = conn.execute(
@@ -587,6 +617,7 @@ def verify_and_bind_github_repository(
             (gh_num_id, full_name, current_principal),
         )
 
+    client.verified_repositories[store.config.repository_id] = (str(gh_num_id), full_name)
     return str(gh_num_id), full_name
 
 
@@ -668,8 +699,9 @@ def upsert_github_source_and_version(
         )
     else:
         conn.execute(
-            "UPDATE sources SET availability = 'available', last_seen_at_us = ? WHERE id = ?",
-            (ts, src_id),
+            "UPDATE sources SET availability = 'available', last_seen_at_us = ?, "
+            "parent_source_id = COALESCE(?, parent_source_id) WHERE id = ?",
+            (ts, parent_source_id, src_id),
         )
 
     if prev_ver_id == ver_id:
@@ -834,6 +866,35 @@ def upsert_github_source_and_version(
     return (src_id, ver_id, source_added, version_added)
 
 
+def _associate_commits_with_pr(
+    conn: sqlite3.Connection, commit_oids: list[str], pr_src_id: str
+) -> None:
+    for c_sha in commit_oids:
+        if c_sha:
+            # Remove standalone commit-only episode once a PR episode owns this commit
+            conn.execute(
+                "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
+                (c_sha,),
+            )
+            rel_id = make_relation_id(
+                from_kind="commit",
+                from_id=c_sha,
+                to_kind="source",
+                to_id=pr_src_id,
+                relation_kind="associated_pr",
+                method="github_pr_association",
+            )
+            conn.execute(
+                """
+                INSERT INTO relations (
+                    id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'github_pr_association', 'exact', NULL, '{}', 'active')
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (rel_id, c_sha, pr_src_id),
+            )
+
+
 def ingest_pr_detail_and_children(
     store: Store,
     client: GitHubClient,
@@ -866,12 +927,38 @@ def ingest_pr_detail_and_children(
 
     # 1. Fetch `/pulls/{pr_number}` if not yet checkpointed or when refreshing
     pr_stream_key = f"github:{repo_provider_id}:pr:{pr_number}:detail"
+    pr_sid = make_src_id(
+        provider="github",
+        repository_provider_id=repo_provider_id,
+        kind="pull_request",
+        provider_id=str(pr_number),
+    )
+    with store.connect_read() as r_conn:
+        detail_ckpt = r_conn.execute(
+            "SELECT etag, last_modified FROM checkpoints WHERE stream_key = ?", (pr_stream_key,)
+        ).fetchone()
+        children_done = int(r_conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE stream_key LIKE ? AND json_extract(cursor_json, '$.done') = 1",
+            (f"github:{repo_provider_id}:pr:{pr_number}:%",),
+        ).fetchone()[0])
+        pr_stored = r_conn.execute("SELECT 1 FROM sources WHERE id = ?", (pr_sid,)).fetchone()
+    # A 304 has no body to resume unfinished child streams from, so only ask when the detail
+    # checkpoint and all six child streams are done.
+    conditional = detail_ckpt is not None and pr_stored is not None and children_done == 7
     pr_res = client.get_json(
         f"/repos/{repo_full_name}/pulls/{pr_number}",
+        etag=detail_ckpt["etag"] if conditional else None,
+        last_modified=detail_ckpt["last_modified"] if conditional else None,
         remaining_requests=budget_left(),
         deadline_monotonic=deadline_monotonic,
     )
     used_requests += pr_res.requests_used
+
+    if pr_res.status_code == 304:
+        if associated_commit_oids:
+            with store.write_transaction(bump_generation=True) as conn:
+                _associate_commits_with_pr(conn, associated_commit_oids, pr_sid)
+        return (used_requests, 0, 0, True)
 
     if pr_res.status_code == 404:
         with store.write_transaction(bump_generation=True) as conn:
@@ -934,6 +1021,11 @@ def ingest_pr_detail_and_children(
             sources_added += 1
         if v_add:
             versions_added += 1
+            # A changed PR may have new reviews, comments or commits anywhere in its child streams.
+            conn.execute(
+                "DELETE FROM checkpoints WHERE stream_key LIKE ? AND stream_key != ?",
+                (f"github:{repo_provider_id}:pr:{pr_number}:%", pr_stream_key),
+            )
 
         # Associate commits with PR and create/update PR episode
         ep_id = make_episode_id(repository_id=repo_uuid, pr_source_id=pr_src_id)
@@ -962,30 +1054,7 @@ def ingest_pr_detail_and_children(
                 [*(associated_commit_oids or []), *([merge_sha] if merge_sha else []), *([head_sha] if head_sha else [])]
             )
         )
-        for c_sha in all_assoc_shas:
-            if c_sha:
-                # Remove standalone commit-only episode once a PR episode owns this commit
-                conn.execute(
-                    "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
-                    (c_sha,),
-                )
-                rel_id = make_relation_id(
-                    from_kind="commit",
-                    from_id=c_sha,
-                    to_kind="source",
-                    to_id=pr_src_id,
-                    relation_kind="associated_pr",
-                    method="github_pr_association",
-                )
-                conn.execute(
-                    """
-                    INSERT INTO relations (
-                        id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
-                    ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'github_pr_association', 'exact', NULL, '{}', 'active')
-                    ON CONFLICT(id) DO NOTHING
-                    """,
-                    (rel_id, c_sha, pr_src_id),
-                )
+        _associate_commits_with_pr(conn, all_assoc_shas, pr_src_id)
 
         ts = now_us()
         conn.execute(
@@ -1470,9 +1539,11 @@ def collect_focused_github_evidence(
             ).fetchone()
         if ckpt:
             c_state = json.loads(str(ckpt["cursor_json"]))
-            if c_state.get("done") is True:
-                for pnum in c_state.get("pr_numbers", []):
+            if c_state.get("done") is True and c_state.get("pr_numbers"):
+                for pnum in c_state["pr_numbers"]:
                     pr_to_commits.setdefault(int(pnum), []).append(c_oid)
+                continue
+            if now_us() < int(c_state.get("next_check_after_us") or 0):
                 continue
 
         res = client.get_json(
@@ -1496,7 +1567,15 @@ def collect_focused_github_evidence(
                 VALUES (?, ?, ?)
                 ON CONFLICT(stream_key) DO UPDATE SET cursor_json = excluded.cursor_json, last_success_at_us = excluded.last_success_at_us
                 """,
-                (assoc_key, canonical_json({"done": True, "pr_numbers": pr_nums}), now_us()),
+                (
+                    assoc_key,
+                    canonical_json(
+                        {"done": True, "pr_numbers": pr_nums}
+                        if pr_nums
+                        else {"done": False, "next_check_after_us": now_us() + COMMIT_PULLS_RECHECK_US}
+                    ),
+                    now_us(),
+                ),
             )
 
     for pr_num, assoc_commits in list(pr_to_commits.items())[:25]:
@@ -1587,6 +1666,10 @@ def ingest_issue_and_children(
             sources_added += 1
         if v_add:
             versions_added += 1
+            conn.execute(
+                "DELETE FROM checkpoints WHERE stream_key LIKE ?",
+                (f"github:{repo_provider_id}:issue:{issue_num}:%",),
+            )
         if reconcile_pass_id and reconcile_stream_key:
             conn.execute(
                 """
@@ -1835,7 +1918,8 @@ def collect_github_graphql_backfill(
 ) -> tuple[int, int, int, bool]:
     """Backfill pull request metadata with paged GraphQL v4 queries.
 
-    Returns `completed=False` on any GraphQL failure so the caller falls back to REST.
+    Returns `completed=False` on a GraphQL failure so the caller falls back to REST, except that
+    `RATE_LIMITED` and `AUTH_REQUIRED` are raised.
     The last `endCursor` is persisted so a re-sync only fetches PRs created since then.
     REST still has to run afterwards: this pass skips issues, comments, reviews and episodes.
     """
@@ -1876,8 +1960,11 @@ def collect_github_graphql_backfill(
                 remaining_requests=remaining_requests - used_requests,
                 deadline_monotonic=deadline_monotonic,
             )
-        except CodeContextError:
-            # Any GraphQL failure hands over to the REST path, which has its own resume checkpoints.
+        except CodeContextError as exc:
+            # REST would hit the same rate limit or credentials, so those stop the sync.
+            if exc.code in ("RATE_LIMITED", "AUTH_REQUIRED"):
+                raise
+            # Any other GraphQL failure hands over to the REST path, which has its own resume checkpoints.
             return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
         used_requests = client.requests_attempted - start_reqs
         repo_data = res.data["data"].get("repository")
@@ -1941,7 +2028,8 @@ def collect_full_and_incremental_github(
     deadline_monotonic: float | None = None,
     use_graphql: bool = False,
 ) -> tuple[int, int, int, bool]:
-    """Execute full GitHub `/issues?state=all&sort=created&direction=asc` backfill,
+    """Execute full GitHub `/issues?state=all&sort=created&direction=asc` backfill, then an
+    updated-since `/issues` sweep that finds issues and PRs created or changed later,
     incremental comment update streams (`/issues/comments?sort=updated&direction=asc&since=...`
     and `/pulls/comments?sort=updated&direction=asc&since=...`), and `reconcile=True` full
     reconciliation pass with `reconciliation_seen` missing-source detection.
@@ -1981,6 +2069,73 @@ def collect_full_and_incremental_github(
         used_requests += gql_used
         sources_added += gql_sa
         versions_added += gql_va
+
+    def ingest_listed_page(items: list[Any], page_pass_id: str | None) -> bool:
+        """Ingest one `/issues` listing page. False when the budget ran out mid-page."""
+        nonlocal used_requests, sources_added, versions_added
+        for item in items:
+            if not isinstance(item, dict) or "number" not in item:
+                continue
+            num = int(item["number"])
+            if "pull_request" in item:
+                # Normalize PR-shaped issue listing to one `pull_request` source via `/pulls/{number}`
+                if budget_left() <= 0:
+                    return False
+                u, s_a, v_a, pr_done = ingest_pr_detail_and_children(
+                    store,
+                    client,
+                    repo_provider_id=repo_prov_id,
+                    repo_full_name=repo_full_name,
+                    pr_number=num,
+                    remaining_requests=budget_left(),
+                    deadline_monotonic=deadline_monotonic,
+                )
+                used_requests += u
+                sources_added += s_a
+                versions_added += v_a
+                if page_pass_id:
+                    with store.write_transaction(bump_generation=False) as conn:
+                        pr_sid = make_src_id(
+                            provider="github",
+                            repository_provider_id=repo_prov_id,
+                            kind="pull_request",
+                            provider_id=str(num),
+                        )
+                        family = conn.execute(
+                            "SELECT id FROM sources WHERE id = ? OR parent_source_id = ?",
+                            (pr_sid, pr_sid),
+                        ).fetchall()
+                        for fr in family:
+                            conn.execute(
+                                """
+                                INSERT INTO reconciliation_seen (stream_key, pass_id, source_id)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(stream_key, pass_id, source_id) DO NOTHING
+                                """,
+                                (issues_stream_key, page_pass_id, str(fr["id"])),
+                            )
+                if not pr_done:
+                    return False
+            else:
+                if budget_left() <= 0:
+                    return False
+                u, s_a, v_a, iss_done = ingest_issue_and_children(
+                    store,
+                    client,
+                    repo_provider_id=repo_prov_id,
+                    repo_full_name=repo_full_name,
+                    issue_data=item,
+                    remaining_requests=budget_left(),
+                    deadline_monotonic=deadline_monotonic,
+                    reconcile_pass_id=page_pass_id,
+                    reconcile_stream_key=issues_stream_key,
+                )
+                used_requests += u
+                sources_added += s_a
+                versions_added += v_a
+                if not iss_done:
+                    return False
+        return True
 
     issues_stream_key = f"github:{repo_prov_id}:issues_all"
     with store.connect_read() as r_conn:
@@ -2060,76 +2215,10 @@ def collect_full_and_incremental_github(
             next_url = None
             break
 
-        items = page_res.data if isinstance(page_res.data, list) else []
-        pending_items_on_page = list(items)
-
-        all_children_done = True
-        for item in pending_items_on_page:
-            if not isinstance(item, dict) or "number" not in item:
-                continue
-            num = int(item["number"])
-            if "pull_request" in item:
-                # Normalize PR-shaped issue listing to one `pull_request` source via `/pulls/{number}`
-                if budget_left() <= 0:
-                    all_children_done = False
-                    break
-                u, s_a, v_a, pr_done = ingest_pr_detail_and_children(
-                    store,
-                    client,
-                    repo_provider_id=repo_prov_id,
-                    repo_full_name=repo_full_name,
-                    pr_number=num,
-                    remaining_requests=budget_left(),
-                    deadline_monotonic=deadline_monotonic,
-                )
-                used_requests += u
-                sources_added += s_a
-                versions_added += v_a
-                if pass_id:
-                    with store.write_transaction(bump_generation=False) as conn:
-                        pr_sid = make_src_id(
-                            provider="github",
-                            repository_provider_id=repo_prov_id,
-                            kind="pull_request",
-                            provider_id=str(num),
-                        )
-                        family = conn.execute(
-                            "SELECT id FROM sources WHERE id = ? OR parent_source_id = ?",
-                            (pr_sid, pr_sid),
-                        ).fetchall()
-                        for fr in family:
-                            conn.execute(
-                                """
-                                INSERT INTO reconciliation_seen (stream_key, pass_id, source_id)
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(stream_key, pass_id, source_id) DO NOTHING
-                                """,
-                                (issues_stream_key, pass_id, str(fr["id"])),
-                            )
-                if not pr_done:
-                    all_children_done = False
-                    break
-            else:
-                if budget_left() <= 0:
-                    all_children_done = False
-                    break
-                u, s_a, v_a, iss_done = ingest_issue_and_children(
-                    store,
-                    client,
-                    repo_provider_id=repo_prov_id,
-                    repo_full_name=repo_full_name,
-                    issue_data=item,
-                    remaining_requests=budget_left(),
-                    deadline_monotonic=deadline_monotonic,
-                    reconcile_pass_id=pass_id,
-                    reconcile_stream_key=issues_stream_key,
-                )
-                used_requests += u
-                sources_added += s_a
-                versions_added += v_a
-                if not iss_done:
-                    all_children_done = False
-                    break
+        items = _listing_items(store, page_res, issues_stream_key)
+        if items is None:
+            return (used_requests, sources_added, versions_added, False)
+        all_children_done = ingest_listed_page(items, pass_id)
 
         if not all_children_done:
             # Keep `next_url` pointing at the current page so resume finishes remaining items on this page
@@ -2156,6 +2245,7 @@ def collect_full_and_incremental_github(
                 """,
                 (issues_stream_key, canonical_json(ckpt_payload), page_res.etag, page_res.last_modified, sync_start_us, now_us()),
             )
+            _resolve_listing_gaps(conn, issues_stream_key)
             if next_url is None:
                 Store.resolve_gaps_in_scope(
                     conn,
@@ -2206,27 +2296,55 @@ def collect_full_and_incremental_github(
                 (issues_stream_key, pass_id),
             )
 
-    # 3. Run repository-wide incremental comment update streams (`/issues/comments` and `/pulls/comments`)
-    # using watermark minus 5 minutes overlap window
-    five_min_us = 5 * 60 * 1_000_000
-    for inc_kind, inc_endpoint in [
-        ("issue_comments_inc", f"/repos/{repo_full_name}/issues/comments"),
-        ("review_comments_inc", f"/repos/{repo_full_name}/pulls/comments"),
+    # 3. Backfill sorts by creation, so issues and PRs created or changed after their page
+    # was read only show up in an updated-since sweep (02 §5.3).
+    with store.connect_read() as r_conn:
+        all_row = r_conn.execute(
+            "SELECT cursor_json, high_watermark_us FROM checkpoints WHERE stream_key = ?",
+            (issues_stream_key,),
+        ).fetchone()
+    if all_row is not None and json.loads(str(all_row["cursor_json"])).get("done") is True:
+        refresh_key = f"github:{repo_prov_id}:issues_refresh"
+        refresh_url: str | None
+        refresh_url, refresh_since, refresh_seen = _sweep_start(
+            store,
+            refresh_key,
+            f"/repos/{repo_full_name}/issues?state=all&sort=updated&direction=asc&per_page=100",
+            fallback_watermark_us=all_row["high_watermark_us"],
+        )
+        while refresh_url is not None:
+            if budget_left() <= 0:
+                return (used_requests, sources_added, versions_added, False)
+            page_res = client.get_json(
+                refresh_url,
+                remaining_requests=budget_left(),
+                deadline_monotonic=deadline_monotonic,
+            )
+            used_requests += page_res.requests_used
+            if page_res.status_code == 404:
+                break
+            items = _listing_items(store, page_res, refresh_key)
+            if items is None:
+                return (used_requests, sources_added, versions_added, False)
+            items, refresh_since, refresh_seen = _sweep_advance(items, refresh_since, refresh_seen)
+            if not ingest_listed_page(items, None):
+                return (used_requests, sources_added, versions_added, False)
+            refresh_url = page_res.next_url
+            with store.write_transaction(bump_generation=False) as conn:
+                _save_sweep_page(
+                    conn, refresh_key, refresh_url, refresh_since, refresh_seen, sync_start_us
+                )
+
+    # 4. Repository-wide comment streams catch edits that do not change the parent's timestamp.
+    for inc_kind, inc_endpoint, target_kind in [
+        ("issue_comments_inc", f"/repos/{repo_full_name}/issues/comments", "issue_comment"),
+        ("review_comments_inc", f"/repos/{repo_full_name}/pulls/comments", "review_comment"),
     ]:
         inc_key = f"github:{repo_prov_id}:{inc_kind}"
-        with store.connect_read() as r_conn:
-            inc_ckpt = r_conn.execute(
-                "SELECT high_watermark_us FROM checkpoints WHERE stream_key = ?",
-                (inc_key,),
-            ).fetchone()
-        wm_us = int(inc_ckpt["high_watermark_us"]) if inc_ckpt and inc_ckpt["high_watermark_us"] else None
-        if wm_us is not None:
-            from codecontext.identity import us_to_iso_z
-
-            since_iso = us_to_iso_z(max(0, wm_us - five_min_us))
-            inc_url: str | None = f"{inc_endpoint}?sort=updated&direction=asc&since={since_iso}&per_page=100"
-        else:
-            inc_url = f"{inc_endpoint}?sort=updated&direction=asc&per_page=100"
+        inc_url: str | None
+        inc_url, inc_since, inc_seen = _sweep_start(
+            store, inc_key, f"{inc_endpoint}?sort=updated&direction=asc&per_page=100"
+        )
 
         while inc_url is not None:
             if budget_left() <= 0:
@@ -2239,7 +2357,10 @@ def collect_full_and_incremental_github(
             used_requests += inc_res.requests_used
             if inc_res.status_code == 404:
                 break
-            inc_items = inc_res.data if isinstance(inc_res.data, list) else []
+            listed = _listing_items(store, inc_res, inc_key)
+            if listed is None:
+                return (used_requests, sources_added, versions_added, False)
+            inc_items, inc_since, inc_seen = _sweep_advance(listed, inc_since, inc_seen)
             inc_url = inc_res.next_url
 
             with store.write_transaction(bump_generation=True) as conn:
@@ -2247,12 +2368,7 @@ def collect_full_and_incremental_github(
                     if not isinstance(item, dict) or "id" not in item:
                         continue
                     c_id_str = str(item["id"])
-                    target_kind = "issue_comment" if inc_kind == "issue_comments_inc" else "review_comment"
-                    existing_s = conn.execute(
-                        "SELECT id, parent_source_id FROM sources WHERE provider = 'github' AND repository_provider_id = ? AND kind = ? AND provider_id = ?",
-                        (repo_prov_id, target_kind, c_id_str),
-                    ).fetchone()
-                    parent_sid = str(existing_s["parent_source_id"]) if existing_s and existing_s["parent_source_id"] else None
+                    parent_sid = _comment_parent_source_id(conn, repo_prov_id, item)
                     rc_anchors = (
                         {
                             "commit_id": item.get("commit_id"),
@@ -2273,7 +2389,7 @@ def collect_full_and_incremental_github(
                         if target_kind == "review_comment"
                         else {}
                     )
-                    _, new_vid, s_a, v_a = upsert_github_source_and_version(
+                    _, _new_vid, s_a, v_a = upsert_github_source_and_version(
                         conn,
                         repository_id=repo_uuid,
                         repository_provider_id=repo_prov_id,
@@ -2299,19 +2415,138 @@ def collect_full_and_incremental_github(
                                 "UPDATE episodes SET state = 'pending' WHERE primary_source_id = ?",
                                 (parent_sid,),
                             )
-
-                if inc_url is None:
-                    conn.execute(
-                        """
-                        INSERT INTO checkpoints (stream_key, cursor_json, high_watermark_us, last_success_at_us)
-                        VALUES (?, '{"done":true}', ?, ?)
-                        ON CONFLICT(stream_key) DO UPDATE SET
-                            cursor_json = '{"done":true}',
-                            high_watermark_us = excluded.high_watermark_us,
-                            last_success_at_us = excluded.last_success_at_us
-                        """,
-                        (inc_key, sync_start_us, now_us()),
-                    )
+                _save_sweep_page(conn, inc_key, inc_url, inc_since, inc_seen, sync_start_us)
 
     return (used_requests, sources_added, versions_added, True)
 
+
+_PARENT_URL_RE = re.compile(r"/(issues|pulls)/(\d+)$")
+
+
+def _comment_parent_source_id(
+    conn: sqlite3.Connection, repo_prov_id: str, item: dict[str, Any]
+) -> str | None:
+    """Parent source from a comment's `pull_request_url` or `issue_url`, if that parent is stored.
+
+    `parent_source_id` is a foreign key, so an unstored parent stays unset here; the parent's own
+    child stream sets it once the parent is ingested. `issue_url` also points at PRs.
+    """
+    m = _PARENT_URL_RE.search(str(item.get("pull_request_url") or item.get("issue_url") or ""))
+    if m is None:
+        return None
+    kinds = ("pull_request",) if m.group(1) == "pulls" else ("pull_request", "issue")
+    for kind in kinds:
+        sid = make_src_id(
+            provider="github", repository_provider_id=repo_prov_id, kind=kind, provider_id=m.group(2)
+        )
+        if conn.execute("SELECT 1 FROM sources WHERE id = ?", (sid,)).fetchone():
+            return sid
+    return None
+
+
+def _listing_items(store: Store, res: HttpFetchResult, stream_key: str) -> list[Any] | None:
+    """The page's items, or None after recording a gap when the page is too large or not a list.
+    The caller stops without moving the stream's cursor, so the page is read again next sync.
+    """
+    if not res.body_too_large and isinstance(res.data, list):
+        return res.data
+    code = "HTTP_BODY_TOO_LARGE" if res.body_too_large else "SOURCE_UNAVAILABLE"
+    reason = "exceeded the 32 MiB limit" if res.body_too_large else "was not a list"
+    with store.write_transaction(bump_generation=True) as conn:
+        Store.upsert_gap(
+            conn,
+            repository_id=store.config.repository_id,
+            code=code,
+            scope=stream_key,
+            message=f"A GitHub listing page for {stream_key} {reason}.",
+            retryable=True,
+        )
+    return None
+
+
+def _resolve_listing_gaps(conn: sqlite3.Connection, stream_key: str) -> None:
+    for code in ("HTTP_BODY_TOO_LARGE", "SOURCE_UNAVAILABLE"):
+        Store.resolve_gaps_in_scope(conn, scope=stream_key, code=code)
+
+
+def _sweep_start(
+    store: Store,
+    stream_key: str,
+    first_page_url: str,
+    *,
+    fallback_watermark_us: int | None = None,
+) -> tuple[str, str | None, set[str]]:
+    """Return `(url, since, seen_ids)` for an `updated_at`-sorted sweep.
+
+    An unfinished sweep restarts one second before the last processed item's `updated_at`, so an
+    unprocessed item at exactly that time is listed even if `since` turns out to be exclusive,
+    and skips `seen_ids`, the items already processed at that time. Re-reading the items from
+    that extra second is harmless because processing is idempotent. A saved
+    page URL would not do: an item updated while the sweep is paused moves to the end of the
+    list, every later page shifts back by one, and the item that slides onto an already-read
+    page is never seen. A new sweep overlaps the last finished one by
+    `GITHUB_REFRESH_OVERLAP_SECONDS`.
+    """
+    with store.connect_read() as r_conn:
+        row = r_conn.execute(
+            "SELECT cursor_json, high_watermark_us FROM checkpoints WHERE stream_key = ?",
+            (stream_key,),
+        ).fetchone()
+    state = json.loads(str(row["cursor_json"])) if row else {}
+    if state.get("resume_since"):
+        resume = str(state["resume_since"])
+        query_since = us_to_iso_z(max(0, datetime_to_us(parse_iso_utc(resume)) - 1_000_000))
+        return f"{first_page_url}&since={query_since}", resume, {str(i) for i in state.get("seen_ids") or []}
+    wm = row["high_watermark_us"] if row and row["high_watermark_us"] is not None else fallback_watermark_us
+    if wm is None:
+        return first_page_url, None, set()
+    since = us_to_iso_z(max(0, int(wm) - GITHUB_REFRESH_OVERLAP_SECONDS * 1_000_000))
+    return f"{first_page_url}&since={since}", since, set()
+
+
+def _sweep_advance(
+    items: list[Any], since: str | None, seen: set[str]
+) -> tuple[list[dict[str, Any]], str | None, set[str]]:
+    """Drop items already processed at `since` and move the position past this page.
+    Returns `(items_to_process, since, seen_ids)`.
+    """
+    fresh: list[dict[str, Any]] = []
+    seen = set(seen)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or item.get("number"))
+        ts = item.get("updated_at")
+        if ts == since and key in seen:
+            continue
+        fresh.append(item)
+        if isinstance(ts, str):
+            if ts != since:
+                since, seen = ts, set()
+            seen.add(key)
+    return fresh, since, seen
+
+
+def _save_sweep_page(
+    conn: sqlite3.Connection,
+    stream_key: str,
+    next_url: str | None,
+    since: str | None,
+    seen: set[str],
+    sync_start_us: int,
+) -> None:
+    # The watermark moves only when a sweep finishes, so an interrupted sweep never skips records.
+    done = next_url is None
+    cursor = {"resume_since": None if done else since, "seen_ids": [] if done else sorted(seen)}
+    conn.execute(
+        """
+        INSERT INTO checkpoints (stream_key, cursor_json, high_watermark_us, last_success_at_us)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(stream_key) DO UPDATE SET
+            cursor_json = excluded.cursor_json,
+            high_watermark_us = COALESCE(excluded.high_watermark_us, checkpoints.high_watermark_us),
+            last_success_at_us = excluded.last_success_at_us
+        """,
+        (stream_key, canonical_json(cursor), sync_start_us if done else None, now_us()),
+    )
+    _resolve_listing_gaps(conn, stream_key)

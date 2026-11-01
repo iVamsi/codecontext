@@ -124,7 +124,7 @@ async def test_mcp_routes_to_initialized_nested_submodule(tmp_path: Path) -> Non
     commit_fixture_spec(app, GitCommitSpec(message="App", files={"App.kt": b"fun appOnly() {}\n"}))
     run_git_fixture(app, ["-c", "protocol.file.allow=always", "submodule", "add", str(library), "nested/submodulelib"])
     run_git_fixture(app, ["commit", "-am", "Add library"])
-    server, holder = create_mcp_server(workspace_path=app)
+    server, holder = create_mcp_server(workspace_path=app, auto_init=True)
     try:
         async with Client(server) as client:
             listed = await client.call_tool("list_repositories", {})
@@ -157,7 +157,7 @@ async def test_mcp_routes_multiple_client_roots(tmp_path: Path, monkeypatch: pyt
             "main.py": f"def root_{i}(): pass\n".encode(),
         }))
     monkeypatch.chdir(tmp_path)
-    holder = _DynamicMemoryHolder(None)
+    holder = _DynamicMemoryHolder(None, auto_init=True)
 
     async def list_roots():
         return SimpleNamespace(roots=[SimpleNamespace(uri=p.as_uri()) for p in roots])

@@ -13,7 +13,7 @@ from tests.fixtures.builders import build_f01_fixture
 def test_migration_v1_to_v2_sequential_upgrade() -> None:
     """Verify that applying 001 and then 002 upgrades the database schema correctly."""
     migrations = get_all_migrations()
-    assert len(migrations) == 2
+    assert len(migrations) == 3
     assert migrations[0][0] == 1
     assert migrations[1][0] == 2
 
@@ -95,18 +95,18 @@ def test_store_initialize_creates_v2_store(tmp_path: Path) -> None:
     )
     store = Store.initialize(store_dir, req)
     assert store.schema_version == SCHEMA_VERSION
-    assert store.schema_version == 2
+    assert store.schema_version == 3
 
     with store.connect_read() as conn:
         mig_rows = conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [r[0] for r in mig_rows] == [1, 2]
+        assert [r[0] for r in mig_rows] == [1, 2, 3]
 
         meta_row = conn.execute(
             "SELECT schema_version, gitlab_name, gitlab_base_url FROM store_meta WHERE singleton = 1"
         ).fetchone()
-        assert meta_row[0] == 2
+        assert meta_row[0] == 3
         assert meta_row[1] == "group/project"
         assert meta_row[2] == "https://gitlab.example.com"
 
@@ -115,5 +115,5 @@ def test_store_initialize_creates_v2_store(tmp_path: Path) -> None:
     # Re-open in read-only mode
     ro_store = Store.open(store_dir, read_only=True)
     assert ro_store.read_only is True
-    assert ro_store.schema_version == 2
+    assert ro_store.schema_version == 3
     ro_store.close()

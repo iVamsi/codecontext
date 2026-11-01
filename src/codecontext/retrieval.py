@@ -2,7 +2,9 @@ import json
 import math
 import sqlite3
 import struct
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,7 @@ from codecontext.models import (
     SummaryStatement,
     SymbolRecord,
     SymbolTarget,
+    WorkspaceState,
 )
 from codecontext.store import (
     Store,
@@ -197,12 +200,60 @@ def _select_eligible_version_for_source(
     return (None, had_unknown)
 
 
+_ANCESTOR_CACHE_MAX = 4
+_ancestor_cache: OrderedDict[tuple[str, str | None, int], frozenset[str]] = OrderedDict()
+_ancestor_cache_lock = threading.Lock()
+
+
+def load_ancestor_commits(conn: sqlite3.Connection, store: Store) -> frozenset[str]:
+    """Return the commits reachable from the active snapshot, cached per store generation."""
+    meta = conn.execute(
+        "SELECT active_revision, generation FROM store_meta WHERE singleton = 1"
+    ).fetchone()
+    # A team import swaps in another database file that can carry the same generation number,
+    # so the active revision is part of the key too.
+    key = (str(store.store_path), meta["active_revision"], int(meta["generation"]))
+    with _ancestor_cache_lock:
+        cached = _ancestor_cache.get(key)
+        if cached is not None:
+            _ancestor_cache.move_to_end(key)
+            return cached
+    commits = frozenset(
+        str(r["commit_oid"]) for r in conn.execute("SELECT commit_oid FROM snapshot_commits")
+    )
+    with _ancestor_cache_lock:
+        _ancestor_cache[key] = commits
+        _ancestor_cache.move_to_end(key)
+        while len(_ancestor_cache) > _ANCESTOR_CACHE_MAX:
+            _ancestor_cache.popitem(last=False)
+    return commits
+
+
+def _commit_eligible(
+    conn: sqlite3.Connection,
+    oid: str,
+    cutoff_us: int | None,
+    ancestor_commits: set[str] | frozenset[str] | None,
+) -> bool:
+    if ancestor_commits is not None and oid not in ancestor_commits:
+        return False
+    if cutoff_us is None:
+        return True
+    row = conn.execute(
+        "SELECT committed_at_us, authored_at_us FROM commits WHERE oid = ?", (oid,)
+    ).fetchone()
+    if row is None:
+        return False
+    c_time = row["committed_at_us"] if row["committed_at_us"] is not None else row["authored_at_us"]
+    return c_time is not None and int(c_time) <= cutoff_us
+
+
 def check_derivation_cutoff_eligible(
     conn: sqlite3.Connection,
     dependent_kind: str,
     dependent_id: str,
     cutoff_us: int | None,
-    ancestor_commits: set[str] | None = None,
+    ancestor_commits: set[str] | frozenset[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Check whether all dependencies of a claim or summary satisfy `cutoff_us` and ancestry."""
     if cutoff_us is None and ancestor_commits is None:
@@ -213,6 +264,7 @@ def check_derivation_cutoff_eligible(
         (dependent_kind, dependent_id),
     ).fetchall()
 
+    commit_oids: list[str] = []
     for dr in dep_rows:
         in_kind = str(dr["input_kind"])
         in_id = str(dr["input_id"])
@@ -233,6 +285,11 @@ def check_derivation_cutoff_eligible(
                 )
                 if not ok:
                     return (False, reason)
+            if ev_row["kind"] == "commit" and ev_row["git_oid"]:
+                oid = str(ev_row["git_oid"])
+                if not _commit_eligible(conn, oid, cutoff_us, None):
+                    return (False, "commit_after_cutoff")
+                commit_oids.append(oid)
         elif in_kind == "claim":
             cl_row = conn.execute("SELECT state FROM claims WHERE id = ?", (in_id,)).fetchone()
             if not cl_row or cl_row["state"] != "ready":
@@ -243,6 +300,14 @@ def check_derivation_cutoff_eligible(
             if not ok:
                 return (False, reason)
 
+    # Squash and rebase merges leave the reviewed branch commits outside the active history, so
+    # one landed commit is enough. A claim with none left (after a force-push) is hidden.
+    if (
+        commit_oids
+        and ancestor_commits is not None
+        and not any(_commit_eligible(conn, oid, None, ancestor_commits) for oid in commit_oids)
+    ):
+        return (False, "commit_not_ancestor")
     return (True, None)
 
 
@@ -303,10 +368,7 @@ def execute_search(
                 current_access_epoch=snap.access_epoch,
             )
 
-        ancestor_commits = {
-            str(r["commit_oid"])
-            for r in conn.execute("SELECT commit_oid FROM snapshot_commits").fetchall()
-        }
+        ancestor_commits = load_ancestor_commits(conn, store)
 
         request_gaps: list[Gap] = []
         terms, query_truncated = normalize_query_terms(request.query)
@@ -429,6 +491,8 @@ def execute_search(
             requested_kinds = [request.kind]
 
         fused_candidates: dict[str, _CandidateHit] = {}
+        # FTS returns one row per chunk and per match tier; each record is validated once.
+        validated: dict[str, _CandidateHit | None] = {}
         had_unknown_time_gap = False
 
         if terms and requested_kinds:
@@ -480,6 +544,9 @@ def execute_search(
 
                 for frow in fts_rows:
                     rec_id = str(frow["record_id"])
+                    if rec_id in seen_in_kind:
+                        continue
+                    seen_in_kind.add(rec_id)
                     meta = json.loads(str(frow["metadata_json"]))
 
                     # Eligibility filtering before ranking!
@@ -491,6 +558,7 @@ def execute_search(
                         cutoff_us=cutoff_us,
                         ancestor_commits=ancestor_commits,
                     )
+                    validated[rec_id] = cand
                     if cand is None:
                         if cutoff_us is not None and meta.get("authored_at_us") is None and meta.get("committed_at_us") is None and lkind == "history":
                             had_unknown_time_gap = True
@@ -503,9 +571,6 @@ def execute_search(
                             continue
                         seen_sources_in_kind.add(src_collapse_key)
 
-                    if cand.id in seen_in_kind:
-                        continue
-                    seen_in_kind.add(cand.id)
                     rank_in_kind += 1
 
                     rrf_contrib = 1.0 / (60.0 + rank_in_kind)
@@ -592,14 +657,17 @@ def execute_search(
                     if s_rec_id in seen_semantic:
                         continue
                     seen_semantic.add(s_rec_id)
-                    cand = _validate_and_project_lexical_candidate(
-                        conn,
-                        lkind=s_kind,
-                        rec_id=s_rec_id,
-                        meta=json.loads(str(s_meta_json)),
-                        cutoff_us=cutoff_us,
-                        ancestor_commits=ancestor_commits,
-                    )
+                    if s_rec_id in validated:
+                        cand = validated[s_rec_id]
+                    else:
+                        cand = _validate_and_project_lexical_candidate(
+                            conn,
+                            lkind=s_kind,
+                            rec_id=s_rec_id,
+                            meta=json.loads(str(s_meta_json)),
+                            cutoff_us=cutoff_us,
+                            ancestor_commits=ancestor_commits,
+                        )
                     if cand is None:
                         continue
                     sem_rank += 1
@@ -720,7 +788,7 @@ def _try_resolve_exact_id_hit(
     rec_id: str,
     rkind: RecordKind,
     cutoff_us: int | None,
-    ancestor_commits: set[str],
+    ancestor_commits: set[str] | frozenset[str],
 ) -> _CandidateHit | None:
     if rkind == "symbol":
         row = conn.execute(
@@ -814,7 +882,7 @@ def _validate_and_project_lexical_candidate(
     rec_id: str,
     meta: dict[str, Any],
     cutoff_us: int | None,
-    ancestor_commits: set[str],
+    ancestor_commits: set[str] | frozenset[str],
 ) -> _CandidateHit | None:
     prefix, _ = parse_public_id(rec_id)
     rkind = PREFIX_TO_RECORD_KIND[prefix]
@@ -929,7 +997,7 @@ def build_evidence_view_from_row(
     mirror: GitMirror,
     ev_row: sqlite3.Row | dict[str, Any],
     *,
-    ancestor_commits: set[str],
+    ancestor_commits: set[str] | frozenset[str],
     cutoff_us: int | None = None,
     check_cutoff: bool = True,
 ) -> EvidenceView:
@@ -1164,7 +1232,7 @@ def build_decision_view_for_claim(
     mirror: GitMirror,
     claim_row: sqlite3.Row | dict[str, Any],
     *,
-    ancestor_commits: set[str],
+    ancestor_commits: set[str] | frozenset[str],
     cutoff_us: int | None,
     target_mapping: str = "exact",
     target_applicability: str = "historical_only",
@@ -1283,10 +1351,7 @@ def execute_get(
 
     with store.read_snapshot() as snap:
         conn = snap.conn
-        ancestor_commits = {
-            str(r["commit_oid"])
-            for r in conn.execute("SELECT commit_oid FROM snapshot_commits").fetchall()
-        }
+        ancestor_commits = load_ancestor_commits(conn, store)
 
         byte_offset = 0
         rel_offset = 0
@@ -1643,7 +1708,7 @@ def execute_get(
                     details={"id": request.id},
                 )
             ok, reason = check_derivation_cutoff_eligible(
-                conn, "claim", request.id, cutoff_us, ancestor_commits=None
+                conn, "claim", request.id, cutoff_us, ancestor_commits
             )
             if not ok:
                 raise CodeContextError(
@@ -1693,7 +1758,7 @@ def execute_get(
                     details={"id": request.id},
                 )
             ok, reason = check_derivation_cutoff_eligible(
-                conn, "summary", request.id, cutoff_us, ancestor_commits=None
+                conn, "summary", request.id, cutoff_us, ancestor_commits
             )
             if not ok:
                 raise CodeContextError(
@@ -1973,6 +2038,8 @@ class _ResolvedTargetInfo:
     extraction_id: str | None
     symbol_row: sqlite3.Row | None
     is_untracked_workspace_target: bool = False
+    # Kept so execute_context does not inspect (and run git check-ignore) a second time.
+    workspace_inspection: tuple[WorkspaceState, list[Gap]] | None = None
 
 
 def _resolve_context_target(
@@ -2056,7 +2123,7 @@ def _resolve_context_target(
     if sf_row is None:
         # Check if workspace is configured and this path is a verified untracked file
         if workspace_path is not None:
-            ws_state, _ = inspect_workspace(
+            inspection = inspect_workspace(
                 mirror.store,
                 workspace_path,
                 active_revision=active_rev,
@@ -2064,7 +2131,7 @@ def _resolve_context_target(
                 index_blob_oid=None,
                 index_blob_bytes=None,
             )
-            if ws_state.target_state == "untracked":
+            if inspection[0].target_state == "untracked":
                 return _ResolvedTargetInfo(
                     resolved_target=None,
                     path_bytes=p_bytes,
@@ -2073,6 +2140,7 @@ def _resolve_context_target(
                     extraction_id=None,
                     symbol_row=None,
                     is_untracked_workspace_target=True,
+                    workspace_inspection=inspection,
                 )
         raise CodeContextError(
             code="RECORD_NOT_FOUND",
@@ -2162,10 +2230,7 @@ def execute_context(
         repo_id = snap.repository_id
         active_rev = mirror.resolve_prepared_revision(conn, request.revision)
 
-        ancestor_commits = {
-            str(r["commit_oid"])
-            for r in conn.execute("SELECT commit_oid FROM snapshot_commits").fetchall()
-        }
+        ancestor_commits = load_ancestor_commits(conn, store)
 
         target_info = _resolve_context_target(
             conn,
@@ -2177,7 +2242,7 @@ def execute_context(
         expected_epoch = snap.access_epoch
 
     # Inspect workspace outside SQLite snapshot transaction per Storage §4 Read snapshot recipe
-    ws_state, ws_gaps = inspect_workspace(
+    ws_state, ws_gaps = target_info.workspace_inspection or inspect_workspace(
         store,
         workspace_path,
         active_revision=active_rev,
@@ -2997,8 +3062,7 @@ def execute_context(
                 omitted_code_count += 1
                 continue
             if len(admitted_code) == 1 and len(admitted_code[0].text) > 512:
-                c0 = admitted_code[0]
-                admitted_code[0] = c0.model_copy(update={"text": c0.text[: len(c0.text) // 2]})
+                admitted_code[0] = _cut_code_view_on_line(admitted_code[0])
                 continue
             if len(admitted_code) == 1:
                 admitted_code.pop()
@@ -3008,12 +3072,81 @@ def execute_context(
                 omitted_persisted_gaps += len(all_gaps) - 3
                 all_gaps = all_gaps[:3]
                 continue
-            break
+            cited_ids = {
+                ref.id
+                for d in admitted_decisions
+                for ref in (
+                    *d.evidence_refs,
+                    *d.counterevidence_refs,
+                    *d.applicability_evidence_refs,
+                )
+            }
+            uncited_ids = [ev_id for ev_id in admitted_ev_map if ev_id not in cited_ids]
+            if uncited_ids:
+                for ev_id in uncited_ids:
+                    del admitted_ev_map[ev_id]
+                    add_expand(ev_id, "Expand omitted raw evidence")
+                omitted_ev_count += len(uncited_ids)
+                continue
+            if admitted_decisions:
+                dropped = admitted_decisions.pop()
+                add_expand(dropped.id, "Expand omitted decision bundle")
+                omitted_decisions_count += 1
+                still_cited = {
+                    ref.id
+                    for d in admitted_decisions
+                    for ref in (
+                        *d.evidence_refs,
+                        *d.counterevidence_refs,
+                        *d.applicability_evidence_refs,
+                    )
+                }
+                for ref in (
+                    *dropped.evidence_refs,
+                    *dropped.counterevidence_refs,
+                    *dropped.applicability_evidence_refs,
+                ):
+                    if ref.id not in still_cited and admitted_ev_map.pop(ref.id, None) is not None:
+                        omitted_ev_count += 1
+                rationale_status = _compute_rationale_status(
+                    conn,
+                    target_info=target_info,
+                    admitted_decisions=admitted_decisions,
+                    episode_rows=episode_rows,
+                    all_gaps=all_gaps,
+                    had_unavailable_source=had_unavailable_source,
+                    had_stale_claim=had_stale_claim,
+                    exclude_enriched=exclude_enriched,
+                )
+                continue
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message=(
+                    f"max_tokens ({request.max_tokens}) is too small for the context envelope "
+                    f"({used_tokens} tokens)."
+                ),
+                retryable=False,
+                details={"minimum_required_tokens": used_tokens, "requested_tokens": request.max_tokens},
+            )
 
     if pre_authorize_hook is not None:
         pre_authorize_hook()
     store.verify_access_epoch_and_authorize(expected_epoch)
     return pack
+
+
+def _cut_code_view_on_line(view: CodeView) -> CodeView:
+    """Halve the text on a line boundary so the anchor span still describes the bytes shown."""
+    half = view.text[: len(view.text) // 2]
+    cut = half.rfind("\n") + 1
+    text = half[:cut] if cut > 0 else half
+    span = view.anchor.span
+    update: dict[str, int] = {"byte_end": span.byte_start + len(text.encode())}
+    if span.line_start is not None:
+        newlines = text.count("\n")
+        update["line_end"] = span.line_start + max(0, newlines - 1 if text.endswith("\n") else newlines)
+    anchor = view.anchor.model_copy(update={"span": span.model_copy(update=update)})
+    return view.model_copy(update={"text": text, "anchor": anchor})
 
 
 def _compute_rationale_status(
@@ -3111,7 +3244,7 @@ def _build_context_overview(
     included_claims_cnt: int,
     omitted_claims_cnt: int,
     cutoff_us: int | None,
-    ancestor_commits: set[str],
+    ancestor_commits: set[str] | frozenset[str],
     exclude_enriched: bool,
 ) -> tuple[Overview, list[EvidenceView]]:
     if not exclude_enriched:

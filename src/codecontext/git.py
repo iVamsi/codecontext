@@ -10,19 +10,28 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from codecontext.deadline import check_deadline, remaining_timeout
+from codecontext.deadline import SyncDeadlineExceeded, check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import HEX_OID_RE
 from codecontext.store import Store, inspect_local_git_repository, now_us
 
+if TYPE_CHECKING:
+    from codecontext.workspace import RepoDirFds
+
+PYTHON_DIFF_MAX_LINES = 2000
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Each cached revision holds a full path->blob listing, so switching between a handful of
 # branches stays fast without letting the table grow with every revision ever prepared.
 MAX_CACHED_REVISION_SNAPSHOTS = 8
+# A killed fetch keeps none of its objects. An initial import that outlives one sync budget
+# resumes as fetches of this many commits each, so every completed step persists.
+FETCH_DEPTH_STEP = 1000
+FETCH_RESUME_MARKER = "codecontext-fetch-resume"
 
 STATUS_TO_CHANGE_KIND: dict[str, str] = {
     "A": "added",
@@ -362,24 +371,43 @@ def parse_diff_tree_raw_z(
     parent_oid: str | None,
 ) -> list[RawChange]:
     """Parse `git diff-tree --no-commit-id --raw -r -z --no-abbrev ...` output."""
-    if not raw_stdout:
-        return []
-    tokens = raw_stdout.split(b"\x00")
+    tokens = _split_z_tokens(raw_stdout)
+    changes, end = _parse_raw_z_records(tokens, 0, parent_index=parent_index, parent_oid=parent_oid)
+    if end != len(tokens):
+        raise CodeContextError(
+            code="IO_ERROR",
+            message="Malformed diff-tree metadata token.",
+            retryable=False,
+        )
+    return changes
+
+
+def _split_z_tokens(raw_stdout: bytes) -> list[bytes]:
+    tokens = raw_stdout.split(b"\x00") if raw_stdout else []
     if tokens and tokens[-1] == b"":
         tokens.pop()
+    return tokens
 
+
+def _parse_raw_z_records(
+    tokens: list[bytes],
+    start: int,
+    *,
+    parent_index: int,
+    parent_oid: str | None,
+) -> tuple[list[RawChange], int]:
+    """Parse raw records from `tokens[start:]` up to the first token that is not a `:` record.
+    Returns the changes and the index of that token. Path tokens are consumed by position, so a
+    path that looks like an OID is never mistaken for a `--stdin` commit header.
+    """
     changes: list[RawChange] = []
-    i = 0
+    i = start
     n = len(tokens)
     while i < n:
         meta_tok = tokens[i]
-        i += 1
         if not meta_tok.startswith(b":"):
-            raise CodeContextError(
-                code="IO_ERROR",
-                message="Malformed diff-tree metadata token.",
-                retryable=False,
-            )
+            break
+        i += 1
         meta_str = meta_tok[1:].decode("ascii", errors="strict")
         parts = meta_str.split(" ")
         if len(parts) < 5:
@@ -442,7 +470,7 @@ def parse_diff_tree_raw_z(
                 new_path=new_path,
             )
         )
-    return changes
+    return changes, i
 
 
 def _split_git_lines(raw_bytes: bytes | None) -> list[bytes]:
@@ -458,12 +486,26 @@ def _split_git_lines(raw_bytes: bytes | None) -> list[bytes]:
 def compute_unified_zero_hunks(
     old_bytes: bytes | None,
     new_bytes: bytes | None,
-) -> list[ParsedHunk]:
-    """Compute unified=0 hunks between two in-memory blobs without spawning `git diff`."""
+    *,
+    mirror: "GitMirror | None" = None,
+    old_oid: str | None = None,
+    new_oid: str | None = None,
+) -> list[ParsedHunk] | None:
+    """Compute unified=0 hunks between two blobs.
+
+    Small blobs are diffed in-process. Above `PYTHON_DIFF_MAX_LINES` lines SequenceMatcher can go
+    cubic, so the diff goes to git's xdiff when both sides are in the mirror's object store (a side
+    with no OID must be empty), and returns None (hunks unavailable) when they are not.
+    """
+    check_deadline()
     if (old_bytes or b"") == (new_bytes or b""):
         return []
     old_lines = _split_git_lines(old_bytes)
     new_lines = _split_git_lines(new_bytes)
+    if max(len(old_lines), len(new_lines)) > PYTHON_DIFF_MAX_LINES:
+        if mirror is None or (old_oid is None and old_lines) or (new_oid is None and new_lines):
+            return None
+        return mirror.diff_blobs_unified_zero(old_oid, new_oid)
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     hunks: list[ParsedHunk] = []
     ordinal = 0
@@ -534,7 +576,8 @@ def parse_unified_zero_diff(raw_diff: bytes) -> list[ParsedHunk]:
         new_start = int(m.group(3))
         new_count = int(m.group(4)) if m.group(4) is not None else 1
 
-        hunk_lines = [header_line]
+        # Drop git's function-context suffix so headers match the in-process diff.
+        hunk_lines = [m.group(0).encode("ascii") + b"\n"]
         i += 1
         seen_old = 0
         seen_new = 0
@@ -1071,7 +1114,8 @@ class GitMirror:
         source_repo: Path,
         requested_revision: str,
         *,
-        timeout: float = 60.0,
+        # The sync deadline is the real bound; this only caps a fetch made outside any sync.
+        timeout: float = 86_400.0,
     ) -> tuple[str, dict[str, str], bool]:
         """Import declared local refs and the requested revision into owned `refs/codecontext/local/*` namespaces.
         Returns (resolved_commit_oid, ref_map, is_shallow).
@@ -1134,23 +1178,42 @@ class GitMirror:
             head_oid = source_refs["HEAD"]
             refspecs.append(f"+{head_oid}:refs/codecontext/local/HEAD")
 
-        run_safe_git(
-            [
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--no-auto-maintenance",
-                "--update-shallow",
-                *(["--unshallow"] if not is_shallow and self.is_source_shallow(self.git_dir) else []),
-                "--end-of-options",
-                str(source_repo),
-                *refspecs,
-            ],
-            git_dir=self.git_dir,
-            empty_hooks_dir=self.empty_hooks_dir,
-            allow_file_protocol=True,
-            timeout=timeout,
-        )
+        resume_marker = self.git_dir / FETCH_RESUME_MARKER
+        mirror_shallow = not is_shallow and self.is_source_shallow(self.git_dir)
+        stepping = resume_marker.exists() and not is_shallow and (mirror_shallow or not old_oids)
+        if stepping:
+            depth_args = [f"--deepen={FETCH_DEPTH_STEP}" if mirror_shallow else f"--depth={FETCH_DEPTH_STEP}"]
+        else:
+            depth_args = ["--unshallow"] if mirror_shallow else []
+        while True:
+            try:
+                run_safe_git(
+                    [
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--no-auto-maintenance",
+                        "--update-shallow",
+                        *depth_args,
+                        "--end-of-options",
+                        str(source_repo),
+                        *refspecs,
+                    ],
+                    git_dir=self.git_dir,
+                    empty_hooks_dir=self.empty_hooks_dir,
+                    allow_file_protocol=True,
+                    timeout=timeout,
+                )
+            except SyncDeadlineExceeded:
+                # Only an empty mirror may go shallow: a depth fetch into existing history would
+                # hide the commits already imported.
+                if not old_oids and not is_shallow:
+                    resume_marker.touch()
+                raise
+            if not stepping or not self.is_source_shallow(self.git_dir):
+                break
+            depth_args = [f"--deepen={FETCH_DEPTH_STEP}"]
+        resume_marker.unlink(missing_ok=True)
         self.ensure_empty_objects()
         return resolved_oid, source_refs, is_shallow
 
@@ -1210,7 +1273,72 @@ class GitMirror:
         )
         return parse_diff_tree_raw_z(proc.stdout, parent_index=parent_index, parent_oid=parent_oid)
 
+    def diff_tree_batch(self, commits: list[tuple[str, str | None]]) -> dict[str, list[RawChange]]:
+        """Diff each `(commit, first_parent)` pair (`None` parent: against the empty tree) with one
+        `git diff-tree --stdin` process. Renames use the same `-M50% -l200` detection as the
+        per-commit similarity pass, so callers get raw changes and rename candidates together.
+        """
+        if not commits:
+            return {}
+        parents: dict[str, str | None] = {}
+        lines: list[bytes] = []
+        for commit_oid, parent_oid in commits:
+            for oid in (commit_oid, parent_oid):
+                if oid is not None and not HEX_OID_RE.fullmatch(oid):
+                    raise CodeContextError(
+                        code="INVALID_REQUEST",
+                        message=f"Invalid Git object ID for diff-tree: {oid!r}",
+                        retryable=False,
+                    )
+            parents[commit_oid] = parent_oid
+            line = commit_oid if parent_oid is None else f"{commit_oid} {parent_oid}"
+            lines.append(line.encode("ascii") + b"\n")
+        proc = run_safe_git(
+            [
+                "diff-tree",
+                "--stdin",
+                "--root",
+                "--always",
+                "--raw",
+                "-r",
+                "-z",
+                "--no-abbrev",
+                "-M50%",
+                "-l200",
+            ],
+            git_dir=self.git_dir,
+            empty_hooks_dir=self.empty_hooks_dir,
+            stdin_bytes=b"".join(lines),
+            timeout=30.0 * len(lines),
+        )
+        tokens = _split_z_tokens(proc.stdout)
+        result: dict[str, list[RawChange]] = {}
+        i = 0
+        while i < len(tokens):
+            commit_oid = tokens[i].decode("ascii", errors="replace")
+            if commit_oid not in parents:
+                raise CodeContextError(
+                    code="IO_ERROR",
+                    message="Unexpected commit header in diff-tree --stdin output.",
+                    retryable=False,
+                )
+            parent_oid = parents[commit_oid]
+            result[commit_oid], i = _parse_raw_z_records(
+                tokens,
+                i + 1,
+                parent_index=-1 if parent_oid is None else 0,
+                parent_oid=parent_oid,
+            )
+        return result
+
     def diff_blobs_unified_zero(self, old_blob_oid: str | None, new_blob_oid: str | None) -> list[ParsedHunk]:
+        for oid in (old_blob_oid, new_blob_oid):
+            if oid is not None and not HEX_OID_RE.match(oid):
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message=f"Invalid blob OID: {oid!r}",
+                    retryable=False,
+                )
         _, empty_blob = self.ensure_empty_objects()
         lhs = old_blob_oid if old_blob_oid is not None else empty_blob
         rhs = new_blob_oid if new_blob_oid is not None else empty_blob
@@ -1223,6 +1351,7 @@ class GitMirror:
                 "--no-textconv",
                 "--no-color",
                 "--no-renames",
+                "--text",
                 "--diff-algorithm=myers",
                 "--unified=0",
                 lhs,
@@ -1254,6 +1383,21 @@ class GitMirror:
         include_untracked: bool = False,
     ) -> tuple[str, list[bytes]]:
         """Capture tracked (and optionally untracked) working files in the owned mirror without writing the source index."""
+        from codecontext.workspace import RepoDirFds
+
+        with RepoDirFds(source_repo) as dir_fds:
+            return self._capture_workspace_revision(
+                source_repo, head_oid, include_untracked=include_untracked, dir_fds=dir_fds
+            )
+
+    def _capture_workspace_revision(
+        self,
+        source_repo: Path,
+        head_oid: str,
+        *,
+        include_untracked: bool,
+        dir_fds: "RepoDirFds",
+    ) -> tuple[str, list[bytes]]:
         from codecontext.syntax import MAX_PARSE_BYTES
         from codecontext.workspace import (
             _lstat_root_confined,
@@ -1281,7 +1425,6 @@ class GitMirror:
         tracked = {path for _, _, _, path in staged}
         updates: list[bytes] = []
         oversized: list[bytes] = []
-        pending_blobs: dict[str, bytes] = {}
         oid_len = len(head_oid)
         zero_oid = "0" * oid_len
         dir_cache: dict[Path, Path | None] = {}
@@ -1311,26 +1454,26 @@ class GitMirror:
                     updates.append(f"{mode:o} {staged_oid}\t".encode("ascii") + path + b"\0")
                 continue
             if mode == 0o120000:
-                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache)
+                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                 if sym_target is None:
                     if path in original:
                         updates.append(b"0 " + zero_oid.encode("ascii") + b"\t" + path + b"\0")
                     continue
                 sym_oid = git_blob_oid(sym_target, oid_len=oid_len)
                 if previous is None or previous.oid != sym_oid or previous.mode != 0o120000:
-                    pending_blobs[sym_oid] = sym_target
+                    self._write_loose_blob(sym_oid, sym_target)
                     updates.append(f"{0o120000:o} {sym_oid}\t".encode("ascii") + path + b"\0")
                 continue
 
             if stat_cache is not None and previous is not None and previous.oid == staged_oid and previous.mode == mode:
                 cached = stat_cache[0].get(path)
                 if cached is not None and cached.oid == staged_oid:
-                    st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache)
+                    st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                     if st is not None and st.st_size <= MAX_PARSE_BYTES and index_entry_matches_stat(cached, st, stat_cache[1]):
                         continue
 
             state, content, working_mode = _read_root_confined_regular_file(
-                source_repo, path, dir_cache=dir_cache
+                source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
             )
             if state == "deleted":
                 if path in original:
@@ -1342,11 +1485,11 @@ class GitMirror:
                     updates.append(b"0 " + zero_oid.encode("ascii") + b"\t" + path + b"\0")
                 continue
             if state == "symlink":
-                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache)
+                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                 if sym_target is not None:
                     sym_oid = git_blob_oid(sym_target, oid_len=oid_len)
                     if previous is None or previous.oid != sym_oid or previous.mode != 0o120000:
-                        pending_blobs[sym_oid] = sym_target
+                        self._write_loose_blob(sym_oid, sym_target)
                         updates.append(f"{0o120000:o} {sym_oid}\t".encode("ascii") + path + b"\0")
                 else:
                     if path in original:
@@ -1364,10 +1507,10 @@ class GitMirror:
                 )
             oid_str = git_blob_oid(content, oid_len=oid_len)
             if previous is None or previous.oid != oid_str or previous.mode != working_mode:
-                pending_blobs[oid_str] = content
+                self._write_loose_blob(oid_str, content)
                 updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
-                with contextlib.suppress(OSError):
-                    st = os.lstat(source_repo / os.fsdecode(path))
+                st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
+                if st is not None:
                     max_dirty_mtime_sec = max(max_dirty_mtime_sec, int(st.st_mtime))
 
         if include_untracked:
@@ -1381,36 +1524,23 @@ class GitMirror:
                     continue
                 check_deadline()
                 state, content, working_mode = _read_root_confined_regular_file(
-                    source_repo, path, dir_cache=dir_cache
+                    source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
                 )
                 if state == "oversized":
                     oversized.append(path)
                     continue
                 if state == "ok" and content is not None and working_mode is not None:
                     oid_str = git_blob_oid(content, oid_len=oid_len)
-                    pending_blobs[oid_str] = content
+                    self._write_loose_blob(oid_str, content)
                     updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
-                    with contextlib.suppress(OSError):
-                        st = os.lstat(source_repo / os.fsdecode(path))
+                    st = _lstat_root_confined(
+                        source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
+                    )
+                    if st is not None:
                         max_dirty_mtime_sec = max(max_dirty_mtime_sec, int(st.st_mtime))
 
         if not updates:
             return head_oid, oversized
-
-        if pending_blobs:
-            missing_blobs: list[tuple[str, bytes]] = []
-            with self.open_batch_session() as batch:
-                for b_oid, b_bytes in pending_blobs.items():
-                    if batch.read_object_bounded(b_oid, max_bytes=0) is None:
-                        missing_blobs.append((b_oid, b_bytes))
-            for _b_oid, b_bytes in missing_blobs:
-                check_deadline()
-                run_safe_git(
-                    ["hash-object", "-w", "--stdin"],
-                    git_dir=self.git_dir,
-                    empty_hooks_dir=self.empty_hooks_dir,
-                    stdin_bytes=b_bytes,
-                )
 
         with tempfile.TemporaryDirectory(prefix="codecontext-index-") as temp_dir:
             env = {"GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
@@ -1478,6 +1608,25 @@ class GitMirror:
         )
         self.pin_retained_oid(snapshot_oid)
         return snapshot_oid, oversized
+
+    def _write_loose_blob(self, oid: str, content: bytes) -> None:
+        """Store `content` as a loose blob under `oid` straight from the bytes already read, so a
+        file that changes after it was read cannot desync the snapshot and no git process runs."""
+        obj_dir = self.git_dir / "objects" / oid[:2]
+        target = obj_dir / oid[2:]
+        if target.exists():
+            return
+        obj_dir.mkdir(exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=obj_dir, prefix="tmp_obj_")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(zlib.compress(f"blob {len(content)}\0".encode("ascii") + content))
+            os.chmod(tmp_name, 0o444)
+            os.replace(tmp_name, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
 
     def prepare_snapshot(
         self,

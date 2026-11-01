@@ -153,25 +153,29 @@ def ingest_repository_docs(
         if not loaded_docs:
             return (0, 0)
 
-        # Build lookup of active symbol names/qualified_names for linking doc references
-        sym_rows = conn.execute(
-            """
-            SELECT s.id, s.name, s.qualified_name, sf.path
-            FROM snapshot_files sf
-            JOIN symbols s ON s.extraction_id = sf.extraction_id
-            """
-        ).fetchall()
-        by_qname: dict[str, list[str]] = {}
-        by_name: dict[str, list[str]] = {}
-        by_path_syms: dict[str, list[str]] = {}
-        for sr in sym_rows:
-            sid = str(sr["id"])
-            qn = str(sr["qualified_name"])
-            nm = str(sr["name"])
-            sp_disp, _ = path_bytes_to_display(bytes(sr["path"]))
-            by_qname.setdefault(qn, []).append(sid)
-            by_name.setdefault(nm, []).append(sid)
-            by_path_syms.setdefault(sp_disp, []).append(sid)
+        # Symbols are only needed to link changed docs, so load them on first use.
+        symbol_maps: tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]] | None = None
+
+        def load_symbol_maps() -> tuple[
+            dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]
+        ]:
+            sym_rows = conn.execute(
+                """
+                SELECT s.id, s.name, s.qualified_name, sf.path
+                FROM snapshot_files sf
+                JOIN symbols s ON s.extraction_id = sf.extraction_id
+                """
+            ).fetchall()
+            by_qname: dict[str, list[str]] = {}
+            by_name: dict[str, list[str]] = {}
+            by_path_syms: dict[str, list[str]] = {}
+            for sr in sym_rows:
+                sid = str(sr["id"])
+                sp_disp, _ = path_bytes_to_display(bytes(sr["path"]))
+                by_qname.setdefault(str(sr["qualified_name"]), []).append(sid)
+                by_name.setdefault(str(sr["name"]), []).append(sid)
+                by_path_syms.setdefault(sp_disp, []).append(sid)
+            return by_qname, by_name, by_path_syms
 
         # Look up commit timestamp if active_revision is in `commits`
         rev_c = conn.execute(
@@ -375,6 +379,9 @@ def ingest_repository_docs(
                 )
 
             # Link backticked code references in ADR/design doc to active snapshot symbols
+            if symbol_maps is None:
+                symbol_maps = load_symbol_maps()
+            by_qname, by_name, by_path_syms = symbol_maps
             linked_syms: list[str] = []
             seen_sym_ids: set[str] = set()
             for tm in BACKTICK_TOKEN_RE.finditer(body_text):

@@ -2,7 +2,9 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,9 @@ from codecontext.identity import (
     us_to_iso_z,
 )
 from codecontext.store import Store, now_us
+
+GITLAB_REFRESH_OVERLAP_SECONDS = 300
+GITLAB_MAX_RETRY_AFTER_SECONDS = 60
 
 
 def detect_gitlab_repository_from_git(repo_path: Path) -> tuple[str, str] | None:
@@ -197,6 +202,11 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
     return None
 
 
+class _RateLimited(Exception):
+    def __init__(self, delay: float | None) -> None:
+        self.delay = delay
+
+
 class GitLabClient:
     """Synchronous GET client for GitLab REST API v4 (`/api/v4/...`) with streaming 32 MiB limit."""
 
@@ -206,7 +216,9 @@ class GitLabClient:
         base_url: str = "https://gitlab.com",
         token: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
+        self._sleep_fn = sleep_fn
         ident = _gitlab_origin(base_url)
         if ident is None:
             raise CodeContextError(
@@ -247,8 +259,35 @@ class GitLabClient:
                 message="Sync request budget exhausted before GitLab HTTP call.",
                 retryable=True,
             )
-        self.requests_attempted += 1
         target = path if path.startswith("/") else f"/{path}"
+        transport_retried = False
+        rate_limit_retried = False
+        attempts = 0
+        while True:
+            attempts += 1
+            self.requests_attempted += 1
+            can_retry = attempts < remaining_requests
+            try:
+                return self._get_once(target)
+            except httpx.TransportError as exc:
+                if transport_retried or not can_retry:
+                    raise CodeContextError(
+                        code="IO_ERROR",
+                        message=f"GitLab request failed ({type(exc).__name__}).",
+                        retryable=True,
+                    ) from None
+                transport_retried = True
+            except _RateLimited as limited:
+                if rate_limit_retried or not can_retry or limited.delay is None:
+                    raise CodeContextError(
+                        code="RATE_LIMITED",
+                        message="GitLab API rate limit exceeded (429).",
+                        retryable=True,
+                    ) from None
+                rate_limit_retried = True
+                self._sleep_fn(remaining_timeout(limited.delay))
+
+    def _get_once(self, target: str) -> tuple[int, Any, str | None]:
         with self._client.stream("GET", target, timeout=remaining_timeout(30)) as resp:
             status = resp.status_code
             if status == 401:
@@ -258,11 +297,14 @@ class GitLabClient:
                     retryable=False,
                 )
             if status == 429:
-                raise CodeContextError(
-                    code="RATE_LIMITED",
-                    message="GitLab API rate limit exceeded (429).",
-                    retryable=True,
-                )
+                raw = (resp.headers.get("Retry-After") or "").strip()
+                delay: float | None = None
+                if raw.isascii() and raw.isdigit():
+                    try:
+                        delay = float(min(int(raw), GITLAB_MAX_RETRY_AFTER_SECONDS))
+                    except ValueError:  # digit strings beyond the int-conversion limit
+                        delay = float(GITLAB_MAX_RETRY_AFTER_SECONDS)
+                raise _RateLimited(delay)
             if status == 403:
                 raise CodeContextError(
                     code="ACCESS_BLOCKED",
@@ -289,7 +331,14 @@ class GitLabClient:
                         retryable=False,
                     )
                 chunks.append(ch)
-            data = json.loads(b"".join(chunks).decode("utf-8"))
+            try:
+                data = json.loads(b"".join(chunks).decode("utf-8"))
+            except ValueError:
+                raise CodeContextError(
+                    code="IO_ERROR",
+                    message="GitLab returned a response that is not valid JSON.",
+                    retryable=True,
+                ) from None
             raw_next = (resp.headers.get("X-Next-Page") or resp.headers.get("x-next-page") or "").strip()
             if raw_next:
                 if not raw_next.isdigit() or int(raw_next) < 1:
@@ -412,7 +461,8 @@ def _gitlab_updated_after(store: Store, watermark_key: str) -> str | None:
         ).fetchone()
     if row is None or row["high_watermark_us"] is None:
         return None
-    return us_to_iso_z(int(row["high_watermark_us"]))
+    # Items can become visible after the watermark passed them, so each pass starts a little earlier.
+    return us_to_iso_z(max(0, int(row["high_watermark_us"]) - GITLAB_REFRESH_OVERLAP_SECONDS * 1_000_000))
 
 
 def _save_gitlab_cursor(

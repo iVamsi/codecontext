@@ -137,6 +137,40 @@ def test_key_is_not_sent_over_plain_http_to_remote_host(monkeypatch: pytest.Monk
     assert calls == []
 
 
+def test_oversized_model_response_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
+    chunk = b"x" * (1024 * 1024)
+    sent = 0
+
+    def body():  # type: ignore[no-untyped-def]
+        nonlocal sent
+        for _ in range(64):
+            sent += 1
+            yield chunk
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body()))
+    adapter = create_builtin_adapter("openai", "gpt-test", transport=transport)
+    with pytest.raises(CodeContextError) as exc:
+        adapter.complete(_model_request())
+    assert exc.value.code == "MODEL_INVALID_OUTPUT"
+    assert SECRET not in exc.value.to_json(pretty=False)
+    assert sent < 64
+
+
+def test_model_request_asks_for_an_uncompressed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Accept-Encoding"))
+        return httpx.Response(401)
+
+    adapter = create_builtin_adapter("openai", "gpt-test", transport=httpx.MockTransport(handler))
+    with pytest.raises(CodeContextError):
+        adapter.complete(_model_request())
+    assert seen and set(seen) == {"identity"}
+
+
 def test_retry_honours_retry_after_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
     statuses = iter([429, 503, 200])

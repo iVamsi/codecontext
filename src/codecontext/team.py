@@ -5,22 +5,41 @@ their own store and rebinds that store to their checkout. A later publish
 replaces the snapshot only after this store has joined the latest publish.
 """
 
+import functools
+import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import urllib.parse
+import zlib
 from pathlib import Path
 
 from codecontext.archive import execute_export, sanitized_bare_git_config
+from codecontext.deadline import remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.git import run_safe_git
-from codecontext.identity import datetime_to_us, parse_iso_utc, sha256_bytes, us_to_iso_z
+from codecontext.identity import (
+    canonical_json,
+    datetime_to_us,
+    parse_iso_utc,
+    sha256_bytes,
+    us_to_iso_z,
+)
 from codecontext.models import ExportReport, ExportRequest, TeamMergeReport
-from codecontext.store import Store, inspect_local_git_repository, now_us
+from codecontext.store import (
+    SCHEMA_VERSION,
+    Store,
+    get_all_migrations,
+    inspect_local_git_repository,
+    now_us,
+)
+from codecontext.syntax import normalize_search_text
 
 TEAM_FILE = "team.json"
+SWAP_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _published_us(team: dict) -> int:
@@ -147,7 +166,15 @@ def _replace_tree(source: Path, destination: Path) -> None:
         )
     backup = destination.parent / f".{destination.name}.replaced"
     if backup.exists() or backup.is_symlink():
-        shutil.rmtree(backup)
+        # A leftover backup means an earlier swap stopped halfway; it may hold the only good copy.
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=(
+                f"An earlier replace stopped halfway and left {backup}. Inspect it, "
+                f"copy out anything you need, delete {backup}, then retry."
+            ),
+            retryable=False,
+        )
     os.rename(destination, backup)
     try:
         os.rename(source, destination)
@@ -255,7 +282,47 @@ def _refuse_symlink(path: Path, message: str) -> None:
         raise CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
 
 
-def _copy_regular_file(src: Path, dst: Path) -> None:
+_ALTERNATES_FILES = ("alternates", "http-alternates")
+
+
+def _invalid_share(message: str) -> CodeContextError:
+    return CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def _read_share_manifest(share_dir: Path) -> dict[str, str]:
+    """The manifest's rel path to SHA-256 map. Copies are checked against it, not the share."""
+    manifest_path = share_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise _invalid_share("Shared memory is missing manifest.json.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _invalid_share("Shared memory manifest.json could not be read.") from exc
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(files, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in files.items()
+    ):
+        raise _invalid_share("Shared memory manifest.json has an unsupported shape.")
+    return files
+
+
+def _copy_verified(src: Path, dst: Path, expected: str | None, rel: str) -> None:
+    """Copy src to dst and keep it only if the copy matches the manifest."""
+    if expected is None:
+        raise _invalid_share(f"Shared memory file {rel} is not listed in manifest.json.")
+    shutil.copyfile(src, dst)
+    # Hash the copy, not the share: the share can change while it is read.
+    if _file_sha256(dst) != expected:
+        dst.unlink(missing_ok=True)
+        raise _invalid_share(f"Shared memory file {rel} does not match manifest.json.")
+
+
+def _copy_regular_file(src: Path, dst: Path, files: dict[str, str], rel: str) -> None:
     _refuse_symlink(src, "Shared snapshot contains a symlink.")
     if not src.is_file():
         raise CodeContextError(
@@ -264,10 +331,77 @@ def _copy_regular_file(src: Path, dst: Path) -> None:
             retryable=False,
         )
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dst)
+    _copy_verified(src, dst, files.get(rel), rel)
 
 
-def _copy_regular_tree(src: Path, dst: Path) -> None:
+@functools.lru_cache(maxsize=1)
+def _known_triggers() -> frozenset[tuple[str, str]]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        for _, sql, _ in get_all_migrations():
+            conn.executescript(sql)
+        return frozenset(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"))
+    finally:
+        conn.close()
+
+
+def _open_share_db(db_path: Path) -> sqlite3.Connection:
+    """Read-only connection to a share database that passed the schema and trigger checks."""
+    try:
+        conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db_path))}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise _invalid_share("Shared memory database could not be opened.") from exc
+    try:
+        try:
+            conn.execute("PRAGMA trusted_schema=OFF")
+            triggers = set(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"))
+        except sqlite3.Error as exc:
+            raise _invalid_share("Shared memory database could not be read.") from exc
+        if triggers != _known_triggers():
+            raise _invalid_share(
+                "Shared memory database triggers do not match the ones codecontext creates."
+            )
+        _require_supported_share_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+_LOOSE_OBJECT = re.compile(r"[0-9a-f]{2}/[0-9a-f]{38}(?:[0-9a-f]{24})?")
+
+
+def _object_file_is_intact(path: Path, rel: str, obj_fmt: str) -> bool:
+    """Whether a local file under objects/ passes its own checksum. Other kinds count as intact.
+
+    The manifest is written by the share, so it cannot say a local object is wrong.
+    """
+    if _LOOSE_OBJECT.fullmatch(rel):
+        try:
+            data = zlib.decompress(path.read_bytes())
+        except zlib.error:
+            return False
+        return hashlib.new(obj_fmt, data).hexdigest() == rel.replace("/", "")
+    if rel.startswith("pack/") and rel.endswith((".pack", ".idx")):
+        trailer = hashlib.new(obj_fmt).digest_size
+        digest = hashlib.new(obj_fmt)
+        with path.open("rb") as f:
+            remaining = os.fstat(f.fileno()).st_size - trailer
+            if remaining < 0:
+                return False
+            while remaining:
+                chunk = f.read(min(remaining, 1 << 20))
+                if not chunk:
+                    return False
+                digest.update(chunk)
+                remaining -= len(chunk)
+            return digest.digest() == f.read(trailer)
+    return True
+
+
+def _copy_regular_tree(
+    src: Path, dst: Path, files: dict[str, str], rel_prefix: str, obj_fmt: str
+) -> None:
     _refuse_symlink(src, "Shared snapshot contains a symlink.")
     if not src.is_dir():
         return
@@ -286,21 +420,48 @@ def _copy_regular_tree(src: Path, dst: Path) -> None:
             _refuse_symlink(child, "Shared snapshot contains a symlink.")
             if not child.is_file():
                 continue
-            dest_file = current / name
-            if dest_file.exists():
+            if name in _ALTERNATES_FILES and current.name == "info" and current.parent == dst:
                 continue
-            shutil.copyfile(child, dest_file)
+            rel_in_tree = child.relative_to(src).as_posix()
+            rel = rel_prefix + rel_in_tree
+            expected = files.get(rel)
+            if expected is None:
+                raise _invalid_share(f"Shared memory file {rel} is not listed in manifest.json.")
+            dest_file = current / name
+            if (
+                dest_file.is_file()
+                and not dest_file.is_symlink()
+                and _object_file_is_intact(dest_file, rel_in_tree, obj_fmt)
+            ):
+                continue
+            # Readers never see a half-written object: write beside it, then swap it in.
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", dir=current)
+            os.close(fd)
+            try:
+                _copy_verified(child, Path(tmp_name), expected, rel)
+                os.replace(tmp_name, dest_file)
+            except BaseException:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
 
 
-def _import_share(share_dir: Path, store_path: Path) -> None:
+def _import_share(share_dir: Path, store_path: Path, team: dict[str, object]) -> None:
     """Copy only the snapshot database, identity, and git objects. Runtime dirs are created empty."""
+    files = _read_share_manifest(share_dir)
     store_path.mkdir(parents=True, exist_ok=True)
-    _copy_regular_file(share_dir / "store.json", store_path / "store.json")
-    _copy_regular_file(share_dir / "memory.sqlite3", store_path / "memory.sqlite3")
-    _copy_regular_file(share_dir / TEAM_FILE, store_path / TEAM_FILE)
+    _copy_regular_file(share_dir / "memory.sqlite3", store_path / "memory.sqlite3", files, "memory.sqlite3")
+    share_db = _open_share_db(store_path / "memory.sqlite3")
+    try:
+        row = share_db.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
+    finally:
+        share_db.close()
+    obj_fmt = "sha256" if row and row[0] == "sha256" else "sha1"
+    _copy_regular_file(share_dir / "store.json", store_path / "store.json", files, "store.json")
+    # team.json is not in the manifest; write the copy _read_team already validated.
+    _write_team(store_path, team)
     overview = share_dir / "OVERVIEW.md"
     if overview.is_file() and not overview.is_symlink():
-        _copy_regular_file(overview, store_path / "OVERVIEW.md")
+        _copy_regular_file(overview, store_path / "OVERVIEW.md", files, "OVERVIEW.md")
 
     src_git = share_dir / "repository.git"
     if src_git.exists():
@@ -310,17 +471,11 @@ def _import_share(share_dir: Path, store_path: Path) -> None:
         for name in ("HEAD", "packed-refs"):
             src = src_git / name
             if src.exists():
-                _copy_regular_file(src, dest_git / name)
+                _copy_regular_file(src, dest_git / name, files, f"repository.git/{name}")
         for name in ("objects", "refs"):
             src = src_git / name
             if src.exists():
-                _copy_regular_tree(src, dest_git / name)
-        alternates = dest_git / "objects" / "info" / "alternates"
-        if alternates.exists() and not alternates.is_symlink():
-            alternates.unlink()
-        with sqlite3.connect(store_path / "memory.sqlite3") as conn:
-            row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
-        obj_fmt = str(row[0]) if row else "sha1"
+                _copy_regular_tree(src, dest_git / name, files, f"repository.git/{name}/", obj_fmt)
         (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
     (store_path / "tmp").mkdir(parents=True, exist_ok=True)
 
@@ -367,16 +522,37 @@ def _matching_store(dest: Path, repository_id: str) -> bool:
     return True
 
 
-def _rebind(store_path: Path, repo_path: Path) -> None:
+def _db_file_stamps(store_path: Path) -> tuple[tuple[int, int] | None, ...]:
+    """`(size, mtime_ns)` of the database and its WAL. Many writes leave `generation` alone, so
+    join compares these too before replacing a store it read earlier."""
+    stamps: list[tuple[int, int] | None] = []
+    for name in ("memory.sqlite3", "memory.sqlite3-wal"):
+        try:
+            st = os.stat(store_path / name)
+        except FileNotFoundError:
+            stamps.append(None)
+        else:
+            stamps.append((st.st_size, st.st_mtime_ns))
+    return tuple(stamps)
+
+
+def _rebind(store_path: Path, repo_path: Path, *, floor_generation: int = 0) -> None:
+    """Point the store at `repo_path` and move its generation past `floor_generation`.
+
+    Graph and ancestor caches are keyed by path, revision and generation, so a database swapped
+    in at a path must not reuse its predecessor's generation.
+    """
     resolved_repo, common_real, st_dev, st_ino, _obj_fmt = inspect_local_git_repository(repo_path)
     store_json_path = store_path / "store.json"
     raw = json.loads(store_json_path.read_text(encoding="utf-8"))
     raw["read_only_archive"] = False
     raw["repo_path"] = str(resolved_repo)
-    store_json_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_json = store_json_path.with_name(".store.json.tmp")
+    tmp_json.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_json, store_json_path)
     store = Store.open(store_path, read_only=False)
     try:
-        with store.write_transaction(bump_generation=False) as conn:
+        with store.write_transaction(bump_generation=True) as conn:
             conn.execute(
                 """
                 UPDATE store_meta
@@ -384,10 +560,11 @@ def _rebind(store_path: Path, repo_path: Path) -> None:
                     common_dir_realpath = ?,
                     common_dir_device = ?,
                     common_dir_inode = ?,
-                    principal_id = NULL
+                    principal_id = NULL,
+                    generation = MAX(generation, ?)
                 WHERE singleton = 1
                 """,
-                (str(resolved_repo), str(common_real), st_dev, st_ino),
+                (str(resolved_repo), str(common_real), st_dev, st_ino, floor_generation),
             )
     finally:
         store.close()
@@ -433,6 +610,8 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
             retryable=False,
         )
 
+    local_gen: int | None = None
+    local_files: tuple[tuple[int, int] | None, ...] | None = None
     if dest.exists():
         if not _dir_is_empty(dest):
             if not _matching_store(dest, str(team["repository_id"])):
@@ -446,6 +625,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                 local_gen = _store_generation(existing)
             finally:
                 existing.close()
+            local_files = _db_file_stamps(dest)
             local_published = None
             local_team = dest / TEAM_FILE
             if local_team.is_file() and not local_team.is_symlink():
@@ -465,21 +645,156 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}.joining-", dir=dest.parent))
     try:
-        _import_share(share, staging)
-        _rebind(staging, repo_path)
+        _import_share(share, staging, team)
+        _rebind(staging, repo_path, floor_generation=local_gen or 0)
         _ensure_checkout_ignore(staging, dest, resolved_repo)
         if dest.exists():
             if _dir_is_empty(dest):
                 dest.rmdir()
                 os.rename(staging, dest)
             else:
-                _replace_tree(staging, dest)
+                existing = Store.open(dest, read_only=True)
+                try:
+                    with existing.acquire_writer_lock(
+                        timeout_seconds=remaining_timeout(SWAP_LOCK_TIMEOUT_SECONDS), allow_read_only=True
+                    ):
+                        if _store_generation(existing) != local_gen or _db_file_stamps(dest) != local_files:
+                            raise CodeContextError(
+                                code="STORE_BUSY",
+                                message="This store changed while joining, so nothing was replaced. Run join again.",
+                                retryable=True,
+                            )
+                        _replace_tree(staging, dest)
+                finally:
+                    existing.close()
         else:
             os.rename(staging, dest)
     except Exception:
         if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+MERGE_TABLE_ORDER: tuple[str, ...] = (
+    "sources",
+    "source_versions",
+    "evidence",
+    "model_runs",
+    "commits",
+    "changes",
+    "hunks",
+    "extractions",
+    "symbols",
+    "syntax_occurrences",
+    "episodes",
+    "claims",
+    "claim_evidence",
+    "dependencies",
+    "relations",
+    "summaries",
+)
+
+
+def _merge_columns(local: sqlite3.Connection, share: sqlite3.Connection, table: str) -> list[str]:
+    """Columns present in both databases, double-quoted. Column names from the share are untrusted."""
+    local_cols = {row[1] for row in local.execute(f'PRAGMA table_info("{table}")')}
+    return [
+        '"' + row[1].replace('"', '""') + '"'
+        for row in share.execute(f'PRAGMA table_info("{table}")')
+        if row[1] in local_cols
+    ]
+
+
+def _require_supported_share_schema(share: sqlite3.Connection) -> None:
+    try:
+        row = share.execute("SELECT schema_version FROM store_meta WHERE singleton = 1").fetchone()
+    except sqlite3.Error as exc:
+        raise CodeContextError(
+            code="INVALID_REQUEST", message="Shared memory has no readable store_meta.", retryable=False
+        ) from exc
+    if row is None or not isinstance(row[0], int) or row[0] > SCHEMA_VERSION:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Shared memory was written by a newer version of codecontext. Upgrade before merging.",
+            retryable=False,
+        )
+
+
+def _text_list(raw: object, field: str) -> list[str]:
+    try:
+        items = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise _invalid_share(f"Shared memory claim has malformed {field}.") from exc
+    if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+        raise _invalid_share(f"Shared memory claim {field} must be a list of strings.")
+    return items
+
+
+def _index_merged_records(conn: sqlite3.Connection, share: sqlite3.Connection) -> None:
+    """Add search rows for ready claims and summaries that came from the share."""
+    claim_ids = [r[0] for r in share.execute("SELECT id FROM claims WHERE state = 'ready'")]
+    for claim_id in claim_ids:
+        row = conn.execute(
+            "SELECT episode_id, statement, rationale, alternatives_json, constraints_json, support, lifecycle"
+            " FROM claims WHERE id = ? AND state = 'ready'",
+            (claim_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        episode_id, statement, rationale, alts, constraints, support, lifecycle = row
+        meta = canonical_json(
+            {
+                "display_title": statement[:200],
+                "episode_id": episode_id,
+                "lifecycle": lifecycle,
+                "snippet": (rationale or statement)[:320],
+                "support": support,
+            }
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO search_documents"
+            " (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)"
+            " VALUES ('decision', ?, 0, ?, ?, ?, ?)",
+            (
+                claim_id,
+                normalize_search_text(statement),
+                normalize_search_text(" ".join(_text_list(constraints, "constraints_json"))),
+                normalize_search_text(
+                    f"{statement} {rationale or ''} {' '.join(_text_list(alts, 'alternatives_json'))}"
+                ),
+                meta,
+            ),
+        )
+    summary_ids = [r[0] for r in share.execute("SELECT id FROM summaries WHERE state = 'ready'")]
+    for summary_id in summary_ids:
+        row = conn.execute(
+            "SELECT scope_kind, scope_id, revision, text FROM summaries WHERE id = ? AND state = 'ready'",
+            (summary_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        scope_kind, scope_id, revision, text = row
+        meta = canonical_json(
+            {
+                "display_title": f"Summary ({scope_kind}: {scope_id})",
+                "revision": revision,
+                "scope_id": scope_id,
+                "scope_kind": scope_kind,
+                "snippet": text[:320],
+            }
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO search_documents"
+            " (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)"
+            " VALUES ('summary', ?, 0, ?, ?, ?, ?)",
+            (
+                summary_id,
+                normalize_search_text(f"{scope_kind} {scope_id}"),
+                normalize_search_text(scope_id),
+                normalize_search_text(text),
+                meta,
+            ),
+        )
 
 
 def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> TeamMergeReport:
@@ -517,75 +832,71 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
     if not share_db_path.is_file() or share_db_path.is_symlink():
         raise CodeContextError(code="STORE_NOT_INITIALIZED", message="Shared memory is missing memory.sqlite3.", retryable=False)
 
-    share_git_objs = share / "repository.git" / "objects"
-    local_git_objs = dest / "repository.git" / "objects"
-    git_objs_copied = False
-    if share_git_objs.is_dir() and local_git_objs.is_dir():
-        _copy_regular_tree(share_git_objs, local_git_objs)
-        git_objs_copied = True
-
-    local_store = Store.open(dest, read_only=False)
-    sources_merged = 0
-    source_versions_merged = 0
-    claims_merged = 0
-    summaries_merged = 0
-
+    files = _read_share_manifest(share)
+    (dest / "tmp").mkdir(parents=True, exist_ok=True)
+    private = Path(tempfile.mkdtemp(prefix=".share-merge-", dir=dest / "tmp"))
     try:
-        share_uri = f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro"
-        share_conn = sqlite3.connect(share_uri, uri=True)
+        db_copy = private / "memory.sqlite3"
+        _copy_regular_file(share_db_path, db_copy, files, "memory.sqlite3")
+        share_conn = _open_share_db(db_copy)
+    except BaseException:
+        shutil.rmtree(private, ignore_errors=True)
+        raise
+    try:
+        local_store = Store.open(dest, read_only=False)
         try:
-            tables = [
-                "sources",
-                "source_versions",
-                "commits",
-                "changes",
-                "hunks",
-                "extractions",
-                "symbols",
-                "syntax_occurrences",
-                "relations",
-                "claims",
-                "summaries",
-                "episodes",
-            ]
-            with local_store.write_transaction(bump_generation=True) as conn:
-                for tbl in tables:
-                    c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                    col_rows = share_conn.execute(f"PRAGMA table_info({tbl})").fetchall()
-                    cols = [c[1] for c in col_rows]
-                    col_names = ", ".join(cols)
-                    placeholders = ", ".join("?" for _ in cols)
-                    rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
-                    if rows:
-                        conn.executemany(
-                            f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
-                            rows,
-                        )
-                    c_after = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                    diff = c_after - c_before
-                    if tbl == "sources":
-                        sources_merged = diff
-                    elif tbl == "source_versions":
-                        source_versions_merged = diff
-                    elif tbl == "claims":
-                        claims_merged = diff
-                    elif tbl == "summaries":
-                        summaries_merged = diff
+            with local_store.connect_read() as conn:
+                row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
+            obj_fmt = "sha256" if row and row[0] == "sha256" else "sha1"
+            share_git_objs = share / "repository.git" / "objects"
+            local_git_objs = dest / "repository.git" / "objects"
+            git_objs_copied = False
+            if share_git_objs.is_dir() and local_git_objs.is_dir():
+                _copy_regular_tree(
+                    share_git_objs, local_git_objs, files, "repository.git/objects/", obj_fmt
+                )
+                git_objs_copied = True
+
+            try:
+                with local_store.write_transaction(bump_generation=True) as conn:
+                    # symbols reference their parent symbol; rows arrive in arbitrary order.
+                    conn.execute("PRAGMA defer_foreign_keys = ON")
+                    counts: dict[str, int] = {}
+                    for tbl in MERGE_TABLE_ORDER:
+                        cols = _merge_columns(conn, share_conn, tbl)
+                        if not cols:
+                            continue
+                        col_names = ", ".join(cols)
+                        placeholders = ", ".join("?" for _ in cols)
+                        c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                        rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
+                        if rows:
+                            conn.executemany(
+                                f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
+                                rows,
+                            )
+                        counts[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] - c_before
+                    _index_merged_records(conn, share_conn)
+            except sqlite3.IntegrityError as exc:
+                raise _invalid_share(
+                    "Shared memory has records that point at rows it does not contain. Nothing was merged."
+                ) from exc
+
+            local_team_file = dest / TEAM_FILE
+            if local_team_file.is_file():
+                _write_team(dest, team)
+
+            return TeamMergeReport(
+                repository_id=str(team["repository_id"]),
+                generation=_store_generation(local_store),
+                git_objects_fetched=git_objs_copied,
+                sources_merged=counts.get("sources", 0),
+                source_versions_merged=counts.get("source_versions", 0),
+                claims_merged=counts.get("claims", 0),
+                summaries_merged=counts.get("summaries", 0),
+            )
         finally:
-            share_conn.close()
-
-        local_team_file = dest / TEAM_FILE
-        if local_team_file.is_file():
-            _write_team(dest, team)
-
-        return TeamMergeReport(
-            repository_id=str(team["repository_id"]),
-            generation=_store_generation(local_store),
-            git_objects_fetched=git_objs_copied,
-            sources_merged=sources_merged,
-            source_versions_merged=source_versions_merged,
-            claims_merged=claims_merged,
-            summaries_merged=summaries_merged,
-        )
+            local_store.close()
     finally:
-        local_store.close()
+        share_conn.close()
+        shutil.rmtree(private, ignore_errors=True)
