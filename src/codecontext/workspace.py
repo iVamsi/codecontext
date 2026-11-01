@@ -148,8 +148,15 @@ _DIR_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_DIRECTORY
 MAX_CACHED_DIR_FDS = 256
 
 
+def _check_component(name: bytes) -> None:
+    """Reject names that would leave the directory: O_NOFOLLOW does not stop `..`."""
+    if name in (b"", b".", b"..") or b"/" in name or b"\0" in name:
+        raise OSError(errno.EINVAL, "invalid repository path component")
+
+
 def _open_dir_at(dir_fd: int, name: bytes) -> int:
     """Open subdirectory `name` of `dir_fd` without following a symlink (raises ELOOP for one)."""
+    _check_component(name)
     try:
         return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
     except OSError as exc:
@@ -165,6 +172,7 @@ def _open_regular_file_at(dir_fd: int, name: bytes) -> int:
     """Open regular file `name` of `dir_fd` for reading. Symlinks raise ELOOP and other
     non-regular files raise EINVAL before any open, so device nodes and FIFOs are never opened.
     """
+    _check_component(name)
     st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if stat.S_ISLNK(st.st_mode):
         raise OSError(errno.ELOOP, "repository path is a symlink")
@@ -180,9 +188,7 @@ def open_repo_file_no_follow(repo_fd: int, rel_path: bytes) -> int:
     after a path check cannot redirect the read. A symlink anywhere on the path raises
     `OSError(ELOOP)`; the caller owns the returned fd.
     """
-    parts = [p for p in rel_path.split(b"/") if p]
-    if not parts:
-        raise OSError(errno.ENOENT, "empty repository path")
+    parts = rel_path.split(b"/")
     fd = os.dup(repo_fd)
     try:
         for part in parts[:-1]:
@@ -203,6 +209,8 @@ class RepoDirFds:
     """
 
     def __init__(self, root: Path, *, max_open: int = MAX_CACHED_DIR_FDS) -> None:
+        if max_open < 1:
+            raise ValueError("max_open must be at least 1")
         self.root_real = root.resolve()
         self._root_fd = os.open(self.root_real, _DIR_OPEN_FLAGS & ~_O_NOFOLLOW)
         self._fds: OrderedDict[bytes, int] = OrderedDict()

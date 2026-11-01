@@ -63,6 +63,7 @@ from codecontext.models import (
     SummaryStatement,
     SymbolRecord,
     SymbolTarget,
+    WorkspaceState,
 )
 from codecontext.store import (
     Store,
@@ -2037,6 +2038,8 @@ class _ResolvedTargetInfo:
     extraction_id: str | None
     symbol_row: sqlite3.Row | None
     is_untracked_workspace_target: bool = False
+    # Kept so execute_context does not inspect (and run git check-ignore) a second time.
+    workspace_inspection: tuple[WorkspaceState, list[Gap]] | None = None
 
 
 def _resolve_context_target(
@@ -2120,7 +2123,7 @@ def _resolve_context_target(
     if sf_row is None:
         # Check if workspace is configured and this path is a verified untracked file
         if workspace_path is not None:
-            ws_state, _ = inspect_workspace(
+            inspection = inspect_workspace(
                 mirror.store,
                 workspace_path,
                 active_revision=active_rev,
@@ -2128,7 +2131,7 @@ def _resolve_context_target(
                 index_blob_oid=None,
                 index_blob_bytes=None,
             )
-            if ws_state.target_state == "untracked":
+            if inspection[0].target_state == "untracked":
                 return _ResolvedTargetInfo(
                     resolved_target=None,
                     path_bytes=p_bytes,
@@ -2137,6 +2140,7 @@ def _resolve_context_target(
                     extraction_id=None,
                     symbol_row=None,
                     is_untracked_workspace_target=True,
+                    workspace_inspection=inspection,
                 )
         raise CodeContextError(
             code="RECORD_NOT_FOUND",
@@ -2238,7 +2242,7 @@ def execute_context(
         expected_epoch = snap.access_epoch
 
     # Inspect workspace outside SQLite snapshot transaction per Storage §4 Read snapshot recipe
-    ws_state, ws_gaps = inspect_workspace(
+    ws_state, ws_gaps = target_info.workspace_inspection or inspect_workspace(
         store,
         workspace_path,
         active_revision=active_rev,

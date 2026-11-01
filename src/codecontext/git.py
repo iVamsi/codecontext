@@ -1509,8 +1509,8 @@ class GitMirror:
             if previous is None or previous.oid != oid_str or previous.mode != working_mode:
                 self._write_loose_blob(oid_str, content)
                 updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
-                with contextlib.suppress(OSError):
-                    st = os.lstat(source_repo / os.fsdecode(path))
+                st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
+                if st is not None:
                     max_dirty_mtime_sec = max(max_dirty_mtime_sec, int(st.st_mtime))
 
         if include_untracked:
@@ -1533,8 +1533,10 @@ class GitMirror:
                     oid_str = git_blob_oid(content, oid_len=oid_len)
                     self._write_loose_blob(oid_str, content)
                     updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
-                    with contextlib.suppress(OSError):
-                        st = os.lstat(source_repo / os.fsdecode(path))
+                    st = _lstat_root_confined(
+                        source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
+                    )
+                    if st is not None:
                         max_dirty_mtime_sec = max(max_dirty_mtime_sec, int(st.st_mtime))
 
         if not updates:

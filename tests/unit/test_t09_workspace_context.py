@@ -1,6 +1,7 @@
 import errno
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -546,3 +547,77 @@ def test_repo_dir_fds_closes_least_recently_used(tmp_path: Path) -> None:
             )
             assert (state, content) == ("ok", name.encode())
         assert len(dir_fds._fds) == 2
+
+
+@pytest.mark.parametrize("rel", [b"../s", b"a/../../s", b"./x", b"", b"a//x", b"a/"])
+def test_open_repo_file_no_follow_refuses_escaping_components(tmp_path: Path, rel: bytes) -> None:
+    (tmp_path / "s").write_bytes(b"OUTSIDE")
+    repo = tmp_path / "repo"
+    (repo / "a").mkdir(parents=True)
+    (repo / "a" / "x").write_bytes(b"inside")
+    (repo / "x").write_bytes(b"inside")
+    root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError) as exc:
+            os.close(workspace.open_repo_file_no_follow(root_fd, rel))
+        assert exc.value.errno == errno.EINVAL
+    finally:
+        os.close(root_fd)
+
+
+def test_repo_dir_fds_refuses_parent_component(tmp_path: Path) -> None:
+    (tmp_path / "s").write_bytes(b"OUTSIDE")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pytest.raises(ValueError):
+        workspace.RepoDirFds(repo, max_open=0)
+    with workspace.RepoDirFds(repo) as dir_fds:
+        with pytest.raises(OSError) as exc:
+            dir_fds.dir_fd([b".."])
+        assert exc.value.errno == errno.EINVAL
+        state, content, _ = workspace._read_root_confined_regular_file(
+            repo, b"../s", dir_fds=dir_fds
+        )
+    assert (state, content) == ("unavailable", None)
+
+
+def _count_check_ignore(monkeypatch: pytest.MonkeyPatch, *, fail: bool) -> list[list[str]]:
+    calls: list[list[str]] = []
+    real = workspace.run_safe_git
+
+    def wrapped(args: list[str], **kwargs):
+        if args[0] == "check-ignore":
+            calls.append(args)
+            if fail:
+                return subprocess.CompletedProcess(args, 128, b"", b"fatal")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(workspace, "run_safe_git", wrapped)
+    return calls
+
+
+def test_failed_ignore_check_drops_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _mirror, repo_dir, active_rev = _small_workspace(tmp_path)
+    (repo_dir / "notes.txt").write_bytes(b"plain\n")
+    calls = _count_check_ignore(monkeypatch, fail=True)
+    state, _ = _inspect(store, repo_dir, active_rev, b"notes.txt")
+    assert calls
+    assert state.target_state == "untracked"
+    assert state.working_content_hash is None
+    store.close()
+
+
+def test_context_runs_ignore_check_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, mirror, repo_dir, _active_rev = _small_workspace(tmp_path)
+    (repo_dir / ".env").write_bytes(b"TOKEN=secret\n")
+    calls = _count_check_ignore(monkeypatch, fail=False)
+    pack = execute_context(
+        store,
+        mirror,
+        ContextRequest(query="env", target=PathTarget(kind="path", path=".env")),
+        workspace_path=repo_dir,
+    )
+    assert pack.workspace.target_state == "untracked"
+    assert pack.workspace.working_content_hash is None
+    assert len(calls) == 1
+    store.close()
