@@ -2478,8 +2478,10 @@ def _sweep_start(
 ) -> tuple[str, str | None, set[str]]:
     """Return `(url, since, seen_ids)` for an `updated_at`-sorted sweep.
 
-    An unfinished sweep restarts at the last processed item's `updated_at` (GitHub's `since` is
-    inclusive) and skips `seen_ids`, the items already processed at exactly that time. A saved
+    An unfinished sweep restarts one second before the last processed item's `updated_at`, so an
+    unprocessed item at exactly that time is listed even if `since` turns out to be exclusive,
+    and skips `seen_ids`, the items already processed at that time. Re-reading the items from
+    that extra second is harmless because processing is idempotent. A saved
     page URL would not do: an item updated while the sweep is paused moves to the end of the
     list, every later page shifts back by one, and the item that slides onto an already-read
     page is never seen. A new sweep overlaps the last finished one by
@@ -2493,7 +2495,8 @@ def _sweep_start(
     state = json.loads(str(row["cursor_json"])) if row else {}
     if state.get("resume_since"):
         resume = str(state["resume_since"])
-        return f"{first_page_url}&since={resume}", resume, {str(i) for i in state.get("seen_ids") or []}
+        query_since = us_to_iso_z(max(0, datetime_to_us(parse_iso_utc(resume)) - 1_000_000))
+        return f"{first_page_url}&since={query_since}", resume, {str(i) for i in state.get("seen_ids") or []}
     wm = row["high_watermark_us"] if row and row["high_watermark_us"] is not None else fallback_watermark_us
     if wm is None:
         return first_page_url, None, set()

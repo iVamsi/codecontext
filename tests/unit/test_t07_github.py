@@ -526,11 +526,38 @@ def test_comment_stream_resumes_mid_pages(tmp_path: Path) -> None:
     fake.requested.clear()
     assert _sync(store, fake)[3] is True
     comment_urls = [p for p in fake.requested if p.startswith("/repos/owner/repo/issues/comments")]
-    # Restarts at the fourth comment's timestamp, so only one page is read again.
+    # Restarts one second before the fourth comment's timestamp instead of at the first page.
     assert comment_urls == [
         "/repos/owner/repo/issues/comments?sort=updated&direction=asc&per_page=100"
-        "&since=2026-01-01T00:00:03Z"
+        "&since=2026-01-01T00:00:02Z",
+        "/repos/owner/repo/issues/comments?sort=updated&direction=asc&per_page=100"
+        "&since=2026-01-01T00:00:02Z&page=2",
     ]
+    with store.connect_read() as conn:
+        n = int(conn.execute("SELECT COUNT(*) FROM sources WHERE kind = 'issue_comment'").fetchone()[0])
+    store.close()
+    assert n == 5
+
+
+class ExclusiveSinceGitHub(FakeGitHub):
+    @staticmethod
+    def _since(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query = dict(urllib.parse.parse_qsl(request.url.query.decode("ascii")))
+        items = sorted(items, key=lambda i: i["updated_at"])
+        since = query.get("since")
+        return [i for i in items if since is None or i["updated_at"] > since]
+
+
+def test_sweep_resume_does_not_rely_on_inclusive_since(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = ExclusiveSinceGitHub(page_size=2)
+    # The page break falls between the two comments at :01, so the resume point is :01 with
+    # one of them still unprocessed.
+    for ts in ["00", "01", "01", "02", "03"]:
+        fake.add_issue_comment(3, updated_at=f"2026-01-01T00:00:{ts}Z")
+    assert _sync(store, fake, remaining_requests=4)[3] is False
+    assert fake.requested[-1].startswith("/repos/owner/repo/issues/comments")
+    assert _sync(store, fake)[3] is True
     with store.connect_read() as conn:
         n = int(conn.execute("SELECT COUNT(*) FROM sources WHERE kind = 'issue_comment'").fetchone()[0])
     store.close()
