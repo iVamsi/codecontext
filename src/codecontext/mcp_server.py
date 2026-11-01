@@ -220,7 +220,7 @@ class _DynamicMemoryHolder:
         self._memories: dict[Path, Memory] = {}
         self._submodule_cache: dict[Path, tuple[tuple[int, ...], list[Path]]] = {}
         # Client root path -> Git toplevel; cleared on roots/list_changed.
-        self._toplevel_cache: dict[Path, Path | None] = {}
+        self._toplevel_cache: dict[Path, Path] = {}
         self._last_sync_time: dict[Path, float] = {}
         # The event loop keeps only weak references to tasks.
         self._sync_tasks: set[asyncio.Task[object]] = set()
@@ -249,12 +249,20 @@ class _DynamicMemoryHolder:
                         if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
                             continue
                         path = Path(urllib.parse.unquote(uri.path))
-                        if path not in self._toplevel_cache:
-                            self._toplevel_cache[path] = await asyncio.to_thread(
-                                _find_git_toplevel, path
-                            )
-                        git_top = self._toplevel_cache[path]
-                        if git_top is not None and (not hasattr(os, "getuid") or git_top.stat().st_uid == os.getuid()):
+                        # Only hits are cached, so a later `git init` in a root is seen.
+                        git_top = self._toplevel_cache.get(path)
+                        if git_top is None:
+                            git_top = await asyncio.to_thread(_find_git_toplevel, path)
+                            if git_top is None:
+                                continue
+                            self._toplevel_cache[path] = git_top
+                        try:
+                            owner = git_top.stat().st_uid
+                        except OSError:
+                            # Clients send no list_changed when a root is deleted on disk.
+                            self._toplevel_cache.pop(path, None)
+                            continue
+                        if not hasattr(os, "getuid") or owner == os.getuid():
                             roots.append(git_top)
 
         def with_submodules() -> list[Path]:

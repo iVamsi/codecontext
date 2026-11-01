@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -7,6 +8,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp import Client
+from mcp.shared.exceptions import MCPDeprecationWarning
+from mcp.types import ListRootsResult, Root
 
 from codecontext.cli import JSONArgumentParser, main
 from codecontext.errors import CodeContextError
@@ -542,17 +546,71 @@ def test_roots_resolved_once_per_root(tmp_path: Path, monkeypatch: pytest.Monkey
         for _ in range(10):
             await holder.get_memory(ctx)
 
+    async def list_roots(_ctx: object) -> ListRootsResult:
+        return ListRootsResult(roots=[Root(uri=repo_dir.as_uri())])
+
+    async def notify_roots_changed() -> None:
+        async with Client(server, mode="legacy", list_roots_callback=list_roots) as client:
+            # The SDK deprecates roots on both sides, but current clients still use them.
+            with pytest.warns(MCPDeprecationWarning):
+                assert not (await client.call_tool("list_repositories", {})).is_error
+                assert holder._toplevel_cache
+                await client.send_roots_list_changed()
+            for _ in range(200):
+                if not holder._toplevel_cache:
+                    break
+                await asyncio.sleep(0.01)
+        assert not holder._toplevel_cache
+
     try:
         asyncio.run(fetch_ten())
-        assert len(calls) <= 1
+        assert len(calls) == 1
 
-        entry = server._lowlevel_server.get_notification_handler(
-            "notifications/roots/list_changed"
-        )
-        assert entry is not None
-        asyncio.run(entry.handler(None, None))
+        asyncio.run(notify_roots_changed())
         asyncio.run(fetch_ten())
         assert len(calls) == 2
+    finally:
+        holder.close()
+
+
+def test_deleted_root_does_not_break_other_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = tmp_path / "gone"
+    healthy = tmp_path / "healthy"
+    for root in (gone, healthy):
+        _setup_git_repo(root)
+        with Memory.initialize(root / ".codecontext", InitRequest(repo_path=root)) as mem:
+            mem.sync(SyncRequest(revision="HEAD", offline=True))
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+    ctx = _roots_ctx(gone, healthy)
+
+    async def run() -> None:
+        healthy_mem = await holder.get_memory(ctx, str(healthy))
+        shutil.rmtree(gone)
+        assert await holder.repositories(ctx) == [healthy.resolve()]
+        assert await holder.get_memory(ctx, str(healthy)) is healthy_mem
+
+    try:
+        asyncio.run(run())
+        assert gone not in holder._toplevel_cache
+    finally:
+        holder.close()
+
+
+def test_root_becomes_repository_without_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "later"
+    root.mkdir()
+    monkeypatch.chdir(tmp_path)
+    holder = _DynamicMemoryHolder(None)
+    ctx = _roots_ctx(root)
+    try:
+        assert asyncio.run(holder.repositories(ctx)) == []
+        _setup_git_repo(root)
+        assert asyncio.run(holder.repositories(ctx)) == [root.resolve()]
     finally:
         holder.close()
 
@@ -567,8 +625,6 @@ def test_serve_error_goes_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixtur
 
 
 def test_list_repositories_wraps_os_errors(tmp_path: Path) -> None:
-    from mcp import Client
-
     repo_dir, store_dir = _initialized_store(tmp_path)
     server, holder = create_mcp_server(store_path=store_dir, workspace_path=repo_dir)
 
