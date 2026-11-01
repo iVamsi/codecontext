@@ -274,7 +274,11 @@ def test_search_graph_regex_respects_time_limit(tmp_path: Path, monkeypatch: pyt
             mem.search_graph(SearchGraphRequest(name_pattern="load"))
         assert exc_info.value.code == "INVALID_REQUEST"
         assert exc_info.value.message == "Graph query exceeded its time limit"
-        assert "interrupted" in str(exc_info.value.__cause__.__cause__)
+        # Either the progress handler or the regex function's own deadline check aborts it.
+        assert str(exc_info.value.__cause__.__cause__) in {
+            "interrupted",
+            "user-defined function raised exception",
+        }
 
 
 def test_detect_changes_uses_its_own_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -499,3 +503,23 @@ def test_long_symbol_names_do_not_break_graph_tools(tmp_path: Path) -> None:
         found = mem.search_graph(SearchGraphRequest(name_pattern="^fff"))
         assert found.total_matched == 1
         assert len(found.nodes[0].qualified_name) == 2000
+
+
+def test_search_graph_regex_udf_stops_at_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SlowPattern:
+        def search(self, value: str) -> None:
+            time.sleep(0.2)
+            return None
+
+    with _many_inits_memory(tmp_path) as mem:
+        monkeypatch.setattr(graph, "compile_safe_regex", lambda pattern: SlowPattern())
+        monkeypatch.setattr(graph, "GRAPH_TOOL_MAX_SECONDS", 0.3)
+        started = time.monotonic()
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.search_graph(SearchGraphRequest(name_pattern="load"))
+        elapsed = time.monotonic() - started
+    assert exc_info.value.code == "INVALID_REQUEST"
+    assert exc_info.value.message == "Graph query exceeded its time limit"
+    assert elapsed < 1.0

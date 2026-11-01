@@ -537,6 +537,17 @@ def _degree_columns(owner_id: str, relation_filter: str) -> str:
     return ", ".join(columns)
 
 
+def _regex_matcher(regex: re.Pattern[str]) -> Callable[[str], bool]:
+    def matches(value: str) -> bool:
+        # The store's progress handler only runs between VM steps, which can be hundreds of
+        # slow regex calls apart, so each call checks the deadline itself.
+        if expired():
+            raise SyncDeadlineExceeded
+        return bool(regex.search(value[:MAX_REGEX_SUBJECT_CHARS]))
+
+    return matches
+
+
 @_bounded_by_graph_time_limit
 def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGraphResult:
     """Search symbols in the active code knowledge graph by regex pattern, label, and degree."""
@@ -553,7 +564,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
         for field, pattern in [("name", name_re), ("qualified_name", qn_re), ("file_path", file_re)]:
             if pattern is not None:
                 fn = f"matches_{field}"
-                conn.create_function(fn, 1, lambda value, regex=pattern: bool(regex.search(value[:MAX_REGEX_SUBJECT_CHARS])), deterministic=True)
+                conn.create_function(fn, 1, _regex_matcher(pattern), deterministic=True)
                 conditions.append(f"{fn}({field})")
         if request.label:
             if request.label.lower() == "function":
