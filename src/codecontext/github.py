@@ -38,6 +38,8 @@ MAX_SOURCE_TEXT_BYTES = 4 * 1024 * 1024  # 4 MiB
 PR_COMMITS_CAP = 250
 PR_FILES_CAP = 3000
 GITHUB_REFRESH_OVERLAP_SECONDS = 300
+SECONDARY_RATE_LIMIT_PROBE_BYTES = 4 * 1024
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
 # A commit with no PR yet may get one later; re-ask at most daily instead of every sync.
 COMMIT_PULLS_RECHECK_US = 24 * 3600 * 1_000_000
 
@@ -202,6 +204,8 @@ class GitHubClient:
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
         )
         self.requests_attempted = 0
+        # One client serves one sync, so a store verified once stays verified for its lifetime.
+        self.verified_repositories: dict[str, tuple[str, str]] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -286,7 +290,20 @@ class GitHubClient:
             remaining_requests=remaining_requests,
             deadline_monotonic=deadline_monotonic,
         )
-        if res.body_too_large or not isinstance(res.data, dict) or res.data.get("errors") or not isinstance(res.data.get("data"), dict):
+        errors = res.data.get("errors") if isinstance(res.data, dict) else None
+        if isinstance(errors, list) and any(
+            isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors
+        ):
+            raise CodeContextError(
+                code="RATE_LIMITED",
+                message="GitHub GraphQL rate limit exceeded.",
+                retryable=True,
+                details={
+                    "wait_seconds": int(RATE_LIMIT_DEFAULT_WAIT_SECONDS),
+                    "retry_at_offset": int(RATE_LIMIT_DEFAULT_WAIT_SECONDS),
+                },
+            )
+        if res.body_too_large or not isinstance(res.data, dict) or errors or not isinstance(res.data.get("data"), dict):
             raise CodeContextError(
                 code="IO_ERROR",
                 message="GitHub GraphQL query failed.",
@@ -358,16 +375,12 @@ class GitHubClient:
                         retry_after = resp.headers.get("Retry-After")
                         rl_rem = resp.headers.get("X-RateLimit-Remaining")
                         rl_reset = resp.headers.get("X-RateLimit-Reset")
-                        is_rate_limit = (
-                            status == 429
-                            or retry_after is not None
-                            or rl_rem == "0"
-                        )
-                        if is_rate_limit:
-                            wait_sec = 60.0
+                        is_primary = status == 429 or retry_after is not None or rl_rem == "0"
+                        if is_primary or _is_secondary_rate_limit_body(resp):
+                            wait_sec = RATE_LIMIT_DEFAULT_WAIT_SECONDS
                             if retry_after is not None and retry_after.isdigit():
                                 wait_sec = float(int(retry_after))
-                            elif rl_reset is not None and rl_reset.isdigit():
+                            elif is_primary and rl_reset is not None and rl_reset.isdigit():
                                 wait_sec = max(1.0, float(int(rl_reset)) - time.time())
                             raise CodeContextError(
                                 code="RATE_LIMITED",
@@ -475,6 +488,16 @@ class GitHubClient:
         )
 
 
+def _is_secondary_rate_limit_body(resp: httpx.Response) -> bool:
+    # GitHub only signals a secondary limit in the body. The body is never logged or returned.
+    head = b""
+    for chunk in resp.iter_bytes():
+        head += chunk
+        if len(head) >= SECONDARY_RATE_LIMIT_PROBE_BYTES:
+            break
+    return b"secondary rate limit" in head[:SECONDARY_RATE_LIMIT_PROBE_BYTES].lower()
+
+
 def verify_and_bind_github_repository(
     store: Store,
     client: GitHubClient,
@@ -484,7 +507,7 @@ def verify_and_bind_github_repository(
 ) -> tuple[str, str]:
     """Verify `GET /user` when authenticated and `GET /repos/{owner}/{repo}`.
     Enforces principal binding and immutable numeric repository ID.
-    Returns `(repository_provider_id, repo_full_name)`.
+    Returns `(repository_provider_id, repo_full_name)`. A client verifies each store once.
     """
     if not store.config.github_repository:
         raise CodeContextError(
@@ -492,6 +515,9 @@ def verify_and_bind_github_repository(
             message="Store has no configured github_repository.",
             retryable=False,
         )
+    cached = client.verified_repositories.get(store.config.repository_id)
+    if cached is not None:
+        return cached
 
     with store.connect_read() as conn:
         meta = conn.execute(
@@ -591,6 +617,7 @@ def verify_and_bind_github_repository(
             (gh_num_id, full_name, current_principal),
         )
 
+    client.verified_repositories[store.config.repository_id] = (str(gh_num_id), full_name)
     return str(gh_num_id), full_name
 
 
@@ -839,6 +866,35 @@ def upsert_github_source_and_version(
     return (src_id, ver_id, source_added, version_added)
 
 
+def _associate_commits_with_pr(
+    conn: sqlite3.Connection, commit_oids: list[str], pr_src_id: str
+) -> None:
+    for c_sha in commit_oids:
+        if c_sha:
+            # Remove standalone commit-only episode once a PR episode owns this commit
+            conn.execute(
+                "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
+                (c_sha,),
+            )
+            rel_id = make_relation_id(
+                from_kind="commit",
+                from_id=c_sha,
+                to_kind="source",
+                to_id=pr_src_id,
+                relation_kind="associated_pr",
+                method="github_pr_association",
+            )
+            conn.execute(
+                """
+                INSERT INTO relations (
+                    id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
+                ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'github_pr_association', 'exact', NULL, '{}', 'active')
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (rel_id, c_sha, pr_src_id),
+            )
+
+
 def ingest_pr_detail_and_children(
     store: Store,
     client: GitHubClient,
@@ -871,12 +927,38 @@ def ingest_pr_detail_and_children(
 
     # 1. Fetch `/pulls/{pr_number}` if not yet checkpointed or when refreshing
     pr_stream_key = f"github:{repo_provider_id}:pr:{pr_number}:detail"
+    pr_sid = make_src_id(
+        provider="github",
+        repository_provider_id=repo_provider_id,
+        kind="pull_request",
+        provider_id=str(pr_number),
+    )
+    with store.connect_read() as r_conn:
+        detail_ckpt = r_conn.execute(
+            "SELECT etag, last_modified FROM checkpoints WHERE stream_key = ?", (pr_stream_key,)
+        ).fetchone()
+        children_done = int(r_conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE stream_key LIKE ? AND json_extract(cursor_json, '$.done') = 1",
+            (f"github:{repo_provider_id}:pr:{pr_number}:%",),
+        ).fetchone()[0])
+        pr_stored = r_conn.execute("SELECT 1 FROM sources WHERE id = ?", (pr_sid,)).fetchone()
+    # A 304 has no body to resume unfinished child streams from, so only ask when the detail
+    # checkpoint and all six child streams are done.
+    conditional = detail_ckpt is not None and pr_stored is not None and children_done == 7
     pr_res = client.get_json(
         f"/repos/{repo_full_name}/pulls/{pr_number}",
+        etag=detail_ckpt["etag"] if conditional else None,
+        last_modified=detail_ckpt["last_modified"] if conditional else None,
         remaining_requests=budget_left(),
         deadline_monotonic=deadline_monotonic,
     )
     used_requests += pr_res.requests_used
+
+    if pr_res.status_code == 304:
+        if associated_commit_oids:
+            with store.write_transaction(bump_generation=True) as conn:
+                _associate_commits_with_pr(conn, associated_commit_oids, pr_sid)
+        return (used_requests, 0, 0, True)
 
     if pr_res.status_code == 404:
         with store.write_transaction(bump_generation=True) as conn:
@@ -972,30 +1054,7 @@ def ingest_pr_detail_and_children(
                 [*(associated_commit_oids or []), *([merge_sha] if merge_sha else []), *([head_sha] if head_sha else [])]
             )
         )
-        for c_sha in all_assoc_shas:
-            if c_sha:
-                # Remove standalone commit-only episode once a PR episode owns this commit
-                conn.execute(
-                    "DELETE FROM episodes WHERE kind = 'commit' AND commit_oid = ? AND state = 'pending'",
-                    (c_sha,),
-                )
-                rel_id = make_relation_id(
-                    from_kind="commit",
-                    from_id=c_sha,
-                    to_kind="source",
-                    to_id=pr_src_id,
-                    relation_kind="associated_pr",
-                    method="github_pr_association",
-                )
-                conn.execute(
-                    """
-                    INSERT INTO relations (
-                        id, from_kind, from_id, to_kind, to_id, relation_kind, method, mapping, evidence_id, details_json, state
-                    ) VALUES (?, 'commit', ?, 'source', ?, 'associated_pr', 'github_pr_association', 'exact', NULL, '{}', 'active')
-                    ON CONFLICT(id) DO NOTHING
-                    """,
-                    (rel_id, c_sha, pr_src_id),
-                )
+        _associate_commits_with_pr(conn, all_assoc_shas, pr_src_id)
 
         ts = now_us()
         conn.execute(
@@ -1859,7 +1918,8 @@ def collect_github_graphql_backfill(
 ) -> tuple[int, int, int, bool]:
     """Backfill pull request metadata with paged GraphQL v4 queries.
 
-    Returns `completed=False` on any GraphQL failure so the caller falls back to REST.
+    Returns `completed=False` on a GraphQL failure so the caller falls back to REST, except that
+    `RATE_LIMITED` and `AUTH_REQUIRED` are raised.
     The last `endCursor` is persisted so a re-sync only fetches PRs created since then.
     REST still has to run afterwards: this pass skips issues, comments, reviews and episodes.
     """
@@ -1900,8 +1960,11 @@ def collect_github_graphql_backfill(
                 remaining_requests=remaining_requests - used_requests,
                 deadline_monotonic=deadline_monotonic,
             )
-        except CodeContextError:
-            # Any GraphQL failure hands over to the REST path, which has its own resume checkpoints.
+        except CodeContextError as exc:
+            # REST would hit the same rate limit or credentials, so those stop the sync.
+            if exc.code in ("RATE_LIMITED", "AUTH_REQUIRED"):
+                raise
+            # Any other GraphQL failure hands over to the REST path, which has its own resume checkpoints.
             return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
         used_requests = client.requests_attempted - start_reqs
         repo_data = res.data["data"].get("repository")
@@ -2152,7 +2215,9 @@ def collect_full_and_incremental_github(
             next_url = None
             break
 
-        items = page_res.data if isinstance(page_res.data, list) else []
+        items = _listing_items(store, page_res, issues_stream_key)
+        if items is None:
+            return (used_requests, sources_added, versions_added, False)
         all_children_done = ingest_listed_page(items, pass_id)
 
         if not all_children_done:
@@ -2180,6 +2245,7 @@ def collect_full_and_incremental_github(
                 """,
                 (issues_stream_key, canonical_json(ckpt_payload), page_res.etag, page_res.last_modified, sync_start_us, now_us()),
             )
+            _resolve_listing_gaps(conn, issues_stream_key)
             if next_url is None:
                 Store.resolve_gaps_in_scope(
                     conn,
@@ -2240,7 +2306,7 @@ def collect_full_and_incremental_github(
     if all_row is not None and json.loads(str(all_row["cursor_json"])).get("done") is True:
         refresh_key = f"github:{repo_prov_id}:issues_refresh"
         refresh_url: str | None
-        refresh_url, refresh_since = _sweep_start(
+        refresh_url, refresh_since, refresh_seen = _sweep_start(
             store,
             refresh_key,
             f"/repos/{repo_full_name}/issues?state=all&sort=updated&direction=asc&per_page=100",
@@ -2257,12 +2323,17 @@ def collect_full_and_incremental_github(
             used_requests += page_res.requests_used
             if page_res.status_code == 404:
                 break
-            items = page_res.data if isinstance(page_res.data, list) else []
+            items = _listing_items(store, page_res, refresh_key)
+            if items is None:
+                return (used_requests, sources_added, versions_added, False)
+            items, refresh_since, refresh_seen = _sweep_advance(items, refresh_since, refresh_seen)
             if not ingest_listed_page(items, None):
                 return (used_requests, sources_added, versions_added, False)
             refresh_url = page_res.next_url
             with store.write_transaction(bump_generation=False) as conn:
-                _save_sweep_page(conn, refresh_key, refresh_url, refresh_since, sync_start_us)
+                _save_sweep_page(
+                    conn, refresh_key, refresh_url, refresh_since, refresh_seen, sync_start_us
+                )
 
     # 4. Repository-wide comment streams catch edits that do not change the parent's timestamp.
     for inc_kind, inc_endpoint, target_kind in [
@@ -2271,7 +2342,7 @@ def collect_full_and_incremental_github(
     ]:
         inc_key = f"github:{repo_prov_id}:{inc_kind}"
         inc_url: str | None
-        inc_url, inc_since = _sweep_start(
+        inc_url, inc_since, inc_seen = _sweep_start(
             store, inc_key, f"{inc_endpoint}?sort=updated&direction=asc&per_page=100"
         )
 
@@ -2286,7 +2357,10 @@ def collect_full_and_incremental_github(
             used_requests += inc_res.requests_used
             if inc_res.status_code == 404:
                 break
-            inc_items = inc_res.data if isinstance(inc_res.data, list) else []
+            listed = _listing_items(store, inc_res, inc_key)
+            if listed is None:
+                return (used_requests, sources_added, versions_added, False)
+            inc_items, inc_since, inc_seen = _sweep_advance(listed, inc_since, inc_seen)
             inc_url = inc_res.next_url
 
             with store.write_transaction(bump_generation=True) as conn:
@@ -2341,7 +2415,7 @@ def collect_full_and_incremental_github(
                                 "UPDATE episodes SET state = 'pending' WHERE primary_source_id = ?",
                                 (parent_sid,),
                             )
-                _save_sweep_page(conn, inc_key, inc_url, inc_since, sync_start_us)
+                _save_sweep_page(conn, inc_key, inc_url, inc_since, inc_seen, sync_start_us)
 
     return (used_requests, sources_added, versions_added, True)
 
@@ -2370,15 +2444,46 @@ def _comment_parent_source_id(
     return None
 
 
+def _listing_items(store: Store, res: HttpFetchResult, stream_key: str) -> list[Any] | None:
+    """The page's items, or None after recording a gap when the page is too large or not a list.
+    The caller stops without moving the stream's cursor, so the page is read again next sync.
+    """
+    if not res.body_too_large and isinstance(res.data, list):
+        return res.data
+    code = "HTTP_BODY_TOO_LARGE" if res.body_too_large else "SOURCE_UNAVAILABLE"
+    reason = "exceeded the 32 MiB limit" if res.body_too_large else "was not a list"
+    with store.write_transaction(bump_generation=True) as conn:
+        Store.upsert_gap(
+            conn,
+            repository_id=store.config.repository_id,
+            code=code,
+            scope=stream_key,
+            message=f"A GitHub listing page for {stream_key} {reason}.",
+            retryable=True,
+        )
+    return None
+
+
+def _resolve_listing_gaps(conn: sqlite3.Connection, stream_key: str) -> None:
+    for code in ("HTTP_BODY_TOO_LARGE", "SOURCE_UNAVAILABLE"):
+        Store.resolve_gaps_in_scope(conn, scope=stream_key, code=code)
+
+
 def _sweep_start(
     store: Store,
     stream_key: str,
     first_page_url: str,
     *,
     fallback_watermark_us: int | None = None,
-) -> tuple[str, str | None]:
-    """Return `(url, since)`: the saved next page of an unfinished sweep, or the first page of a
-    new sweep that overlaps the last finished one by `GITHUB_REFRESH_OVERLAP_SECONDS`.
+) -> tuple[str, str | None, set[str]]:
+    """Return `(url, since, seen_ids)` for an `updated_at`-sorted sweep.
+
+    An unfinished sweep restarts at the last processed item's `updated_at` (GitHub's `since` is
+    inclusive) and skips `seen_ids`, the items already processed at exactly that time. A saved
+    page URL would not do: an item updated while the sweep is paused moves to the end of the
+    list, every later page shifts back by one, and the item that slides onto an already-read
+    page is never seen. A new sweep overlaps the last finished one by
+    `GITHUB_REFRESH_OVERLAP_SECONDS`.
     """
     with store.connect_read() as r_conn:
         row = r_conn.execute(
@@ -2386,13 +2491,37 @@ def _sweep_start(
             (stream_key,),
         ).fetchone()
     state = json.loads(str(row["cursor_json"])) if row else {}
-    if state.get("next_url"):
-        return str(state["next_url"]), state.get("since")
+    if state.get("resume_since"):
+        resume = str(state["resume_since"])
+        return f"{first_page_url}&since={resume}", resume, {str(i) for i in state.get("seen_ids") or []}
     wm = row["high_watermark_us"] if row and row["high_watermark_us"] is not None else fallback_watermark_us
     if wm is None:
-        return first_page_url, None
+        return first_page_url, None, set()
     since = us_to_iso_z(max(0, int(wm) - GITHUB_REFRESH_OVERLAP_SECONDS * 1_000_000))
-    return f"{first_page_url}&since={since}", since
+    return f"{first_page_url}&since={since}", since, set()
+
+
+def _sweep_advance(
+    items: list[Any], since: str | None, seen: set[str]
+) -> tuple[list[dict[str, Any]], str | None, set[str]]:
+    """Drop items already processed at `since` and move the position past this page.
+    Returns `(items_to_process, since, seen_ids)`.
+    """
+    fresh: list[dict[str, Any]] = []
+    seen = set(seen)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or item.get("number"))
+        ts = item.get("updated_at")
+        if ts == since and key in seen:
+            continue
+        fresh.append(item)
+        if isinstance(ts, str):
+            if ts != since:
+                since, seen = ts, set()
+            seen.add(key)
+    return fresh, since, seen
 
 
 def _save_sweep_page(
@@ -2400,9 +2529,12 @@ def _save_sweep_page(
     stream_key: str,
     next_url: str | None,
     since: str | None,
+    seen: set[str],
     sync_start_us: int,
 ) -> None:
     # The watermark moves only when a sweep finishes, so an interrupted sweep never skips records.
+    done = next_url is None
+    cursor = {"resume_since": None if done else since, "seen_ids": [] if done else sorted(seen)}
     conn.execute(
         """
         INSERT INTO checkpoints (stream_key, cursor_json, high_watermark_us, last_success_at_us)
@@ -2412,10 +2544,6 @@ def _save_sweep_page(
             high_watermark_us = COALESCE(excluded.high_watermark_us, checkpoints.high_watermark_us),
             last_success_at_us = excluded.last_success_at_us
         """,
-        (
-            stream_key,
-            canonical_json({"next_url": next_url, "since": since}),
-            sync_start_us if next_url is None else None,
-            now_us(),
-        ),
+        (stream_key, canonical_json(cursor), sync_start_us if done else None, now_us()),
     )
+    _resolve_listing_gaps(conn, stream_key)

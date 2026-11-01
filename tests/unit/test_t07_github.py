@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import subprocess
@@ -19,7 +20,7 @@ from codecontext.github import (
     verify_and_bind_github_repository,
 )
 from codecontext.gitlab import GitLabClient, parse_gitlab_remote_url, resolve_gitlab_token
-from codecontext.identity import make_src_id
+from codecontext.identity import make_src_id, us_to_iso_z
 from codecontext.models import InitRequest
 from codecontext.store import Store
 from tests.fixtures.builders import (
@@ -341,6 +342,9 @@ class FakeGitHub:
         self.reviews: dict[int, list[dict[str, Any]]] = {}
         self.commit_pulls: dict[str, list[int]] = {}
         self.requested: list[str] = []
+        self.calls: list[httpx.Request] = []
+        # Raw-path substring -> canned response, for pages that come back broken.
+        self.bad: dict[str, httpx.Response] = {}
         self._next_id = 1000
 
     def add_issue(self, number: int, *, pr: bool = False, updated_at: str = OLD_TS) -> None:
@@ -401,8 +405,15 @@ class FakeGitHub:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        self.requested.append(request.url.raw_path.decode("ascii"))
+        raw = request.url.raw_path.decode("ascii")
+        self.requested.append(raw)
+        self.calls.append(request)
+        for needle, broken in self.bad.items():
+            if needle in raw:
+                return broken
         base = "/repos/owner/repo"
+        if path == "/user":
+            return httpx.Response(200, json={"id": 5, "login": "op"})
         if path == base:
             return httpx.Response(200, json={"id": 77, "full_name": "owner/repo", "private": False})
         if path == f"{base}/issues":
@@ -414,7 +425,11 @@ class FakeGitHub:
             return self._page(request, self._since(request, self.review_comments))
         m = re.fullmatch(rf"{base}/pulls/(\d+)", path)
         if m and int(m.group(1)) in self.issues:
-            return httpx.Response(200, json=self.issues[int(m.group(1))])
+            item = self.issues[int(m.group(1))]
+            etag = '"' + hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()[:16] + '"'
+            if request.headers.get("If-None-Match") == etag:
+                return httpx.Response(304, headers={"ETag": etag})
+            return httpx.Response(200, json=item, headers={"ETag": etag})
         m = re.fullmatch(rf"{base}/issues/(\d+)/comments", path)
         if m:
             url = f"{API}{base}/issues/{m.group(1)}"
@@ -464,12 +479,17 @@ def test_new_issue_found_after_backfill(tmp_path: Path) -> None:
             "SELECT cursor_json, high_watermark_us FROM checkpoints WHERE stream_key = ?",
             ("github:77:issues_refresh",),
         ).fetchone()
+        all_wm = conn.execute(
+            "SELECT high_watermark_us FROM checkpoints WHERE stream_key = ?",
+            ("github:77:issues_all",),
+        ).fetchone()["high_watermark_us"]
     store.close()
     assert found is not None
-    assert json.loads(ckpt["cursor_json"])["next_url"] is None
+    assert json.loads(ckpt["cursor_json"])["resume_since"] is None
     assert ckpt["high_watermark_us"] is not None
     refresh = [p for p in fake.requested if "sort=updated" in p and p.startswith("/repos/owner/repo/issues?")]
-    assert refresh and all("&since=" in p for p in refresh)
+    expected_since = us_to_iso_z(all_wm - 300 * 1_000_000)
+    assert refresh and all(p.endswith(f"&since={expected_since}") for p in refresh)
 
 
 def test_changed_pr_reschedules_child_streams(tmp_path: Path) -> None:
@@ -498,15 +518,19 @@ def test_changed_pr_reschedules_child_streams(tmp_path: Path) -> None:
 def test_comment_stream_resumes_mid_pages(tmp_path: Path) -> None:
     store = _fake_store(tmp_path)
     fake = FakeGitHub(page_size=2)
-    for _ in range(5):
-        fake.add_issue_comment(3, updated_at=OLD_TS)
+    for i in range(5):
+        fake.add_issue_comment(3, updated_at=f"2026-01-01T00:00:0{i}Z")
     # repo + issues backfill page + issues refresh page + two comment pages
     assert _sync(store, fake, remaining_requests=5)[3] is False
     assert fake.requested[-1].endswith("page=2")
     fake.requested.clear()
     assert _sync(store, fake)[3] is True
     comment_urls = [p for p in fake.requested if p.startswith("/repos/owner/repo/issues/comments")]
-    assert comment_urls[0].endswith("page=3")
+    # Restarts at the fourth comment's timestamp, so only one page is read again.
+    assert comment_urls == [
+        "/repos/owner/repo/issues/comments?sort=updated&direction=asc&per_page=100"
+        "&since=2026-01-01T00:00:03Z"
+    ]
     with store.connect_read() as conn:
         n = int(conn.execute("SELECT COUNT(*) FROM sources WHERE kind = 'issue_comment'").fetchone()[0])
     store.close()
@@ -601,3 +625,203 @@ def test_commit_pr_lookup_retried_after_404(tmp_path: Path, monkeypatch: pytest.
         ).fetchone()
     store.close()
     assert rel is not None
+
+
+def test_paused_refresh_does_not_skip_item_that_moved(tmp_path: Path) -> None:
+    from codecontext.store import now_us
+
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub(page_size=2)
+    for n in range(1, 5):
+        fake.add_issue(n)
+    assert _sync(store, fake)[3] is True
+    base_us = now_us() - 100 * 1_000_000
+
+    def edit(n: int, seconds: int) -> None:
+        fake.issues[n]["updated_at"] = us_to_iso_z(base_us - base_us % 1_000_000 + seconds * 1_000_000)
+        fake.issues[n]["title"] = f"edited {n} at {seconds}"
+
+    for n in range(1, 5):
+        edit(n, n)
+    # repo + refresh page 1 + comments and timeline for its two issues
+    assert _sync(store, fake, remaining_requests=6)[3] is False
+    edit(1, 10)  # moves issue 1 to the end of the list, shifting the pages
+    assert _sync(store, fake)[3] is True
+    with store.connect_read() as conn:
+        titles = {
+            n: conn.execute(
+                "SELECT v.title FROM sources s JOIN source_versions v ON v.id = s.current_version_id"
+                " WHERE s.id = ?",
+                (_sid("issue", n),),
+            ).fetchone()["title"]
+            for n in range(1, 5)
+        }
+    store.close()
+    assert titles == {n: fake.issues[n]["title"] for n in range(1, 5)}
+
+
+_SWEEPS = {
+    "backfill": ("issues?state=all&sort=created", "github:77:issues_all"),
+    "refresh": ("issues?state=all&sort=updated", "github:77:issues_refresh"),
+    "comments": ("/issues/comments?", "github:77:issue_comments_inc"),
+}
+
+
+@pytest.mark.parametrize("sweep", sorted(_SWEEPS))
+@pytest.mark.parametrize("broken", ["too_large", "not_a_list"])
+def test_broken_listing_page_records_gap_and_keeps_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sweep: str, broken: str
+) -> None:
+    import codecontext.github as gh
+
+    monkeypatch.setattr(gh, "MAX_HTTP_BODY_BYTES", 64 * 1024)
+    needle, stream_key = _SWEEPS[sweep]
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(1)
+    fake.add_issue_comment(1, updated_at=OLD_TS)
+    if sweep == "refresh":
+        assert _sync(store, fake)[3] is True
+        fake.add_issue(2, updated_at=_now_iso())
+
+    def cursor() -> Any:
+        with store.connect_read() as conn:
+            row = conn.execute(
+                "SELECT cursor_json FROM checkpoints WHERE stream_key = ?", (stream_key,)
+            ).fetchone()
+        return None if row is None else row["cursor_json"]
+
+    before = cursor()
+    fake.bad[needle] = (
+        httpx.Response(200, content=b"[" + b" " * (100 * 1024) + b"]")
+        if broken == "too_large"
+        else httpx.Response(200, json={"message": "not a page"})
+    )
+    assert _sync(store, fake)[3] is False
+    code = "HTTP_BODY_TOO_LARGE" if broken == "too_large" else "SOURCE_UNAVAILABLE"
+    with store.connect_read() as conn:
+        active = conn.execute(
+            "SELECT 1 FROM coverage_gaps WHERE code = ? AND scope = ? AND active = 1",
+            (code, stream_key),
+        ).fetchone()
+    assert active is not None
+    assert cursor() == before
+
+    fake.bad.clear()
+    assert _sync(store, fake)[3] is True
+    with store.connect_read() as conn:
+        still_active = conn.execute(
+            "SELECT 1 FROM coverage_gaps WHERE scope = ? AND active = 1", (stream_key,)
+        ).fetchone()
+    store.close()
+    assert still_active is None
+
+
+def test_reconcile_marks_plain_issue_comments_seen(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(3)
+    fake.add_issue_comment(3, updated_at=OLD_TS)
+    comment_sid = _sid("issue_comment", fake.issue_comments[0]["id"])
+    _sync(store, fake)
+    assert _sync(store, fake, reconcile=True)[3] is True
+    with store.connect_read() as conn:
+        row = conn.execute(
+            "SELECT availability, parent_source_id FROM sources WHERE id = ?", (comment_sid,)
+        ).fetchone()
+    store.close()
+    assert row["availability"] == "available"
+    assert row["parent_source_id"] == _sid("issue", 3)
+
+
+def test_secondary_rate_limit_is_retryable() -> None:
+    body = b'{"message": "You have exceeded a secondary rate limit. Please wait."}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, content=body)
+
+    with GitHubClient(token="", transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(CodeContextError) as exc_info:
+            client.get_json("/repos/owner/repo")
+    err = exc_info.value
+    assert err.code == "RATE_LIMITED" and err.retryable
+    assert err.details["wait_seconds"] >= 60
+    assert "secondary" not in err.message and "secondary" not in json.dumps(err.details)
+
+
+def test_plain_403_is_still_access_blocked() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+
+    with GitHubClient(token="", transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(CodeContextError) as exc_info:
+            client.get_json("/repos/owner/repo")
+    assert exc_info.value.code == "ACCESS_BLOCKED"
+
+
+@pytest.mark.parametrize(
+    "graphql_response",
+    [
+        httpx.Response(403, json={"message": "You have exceeded a secondary rate limit."}),
+        httpx.Response(200, json={"errors": [{"type": "RATE_LIMITED", "message": "limit"}]}),
+    ],
+)
+def test_graphql_rate_limit_stops_without_rest_fallback(
+    tmp_path: Path, graphql_response: httpx.Response
+) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(1)
+    fake.bad["/graphql"] = graphql_response
+    with GitHubClient(token="", transport=httpx.MockTransport(fake.handler)) as client:
+        with pytest.raises(CodeContextError) as exc_info:
+            collect_full_and_incremental_github(store, client, use_graphql=True)
+    store.close()
+    assert exc_info.value.code == "RATE_LIMITED" and exc_info.value.retryable
+    gql_at = fake.requested.index("/graphql")
+    assert fake.requested[gql_at + 1 :] == []
+
+
+def test_pr_detail_sends_etag_and_skips_on_304(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(9, pr=True)
+    oid = "c" * 40
+    fake.commit_pulls[oid] = [9]
+
+    def focus() -> None:
+        with GitHubClient(token="", transport=httpx.MockTransport(fake.handler)) as client:
+            assert collect_focused_github_evidence(store, client, commit_oids=[oid])[3] is True
+
+    focus()
+    fake.calls.clear()
+    focus()
+    pr_calls = [r for r in fake.calls if r.url.path == "/repos/owner/repo/pulls/9"]
+    with store.connect_read() as conn:
+        versions = int(conn.execute(
+            "SELECT COUNT(*) FROM source_versions WHERE source_id = ?", (_sid("pull_request", 9),)
+        ).fetchone()[0])
+        rel = conn.execute(
+            "SELECT 1 FROM relations WHERE from_id = ? AND relation_kind = 'associated_pr' AND to_id = ?",
+            (oid, _sid("pull_request", 9)),
+        ).fetchone()
+    store.close()
+    assert len(pr_calls) == 1 and "If-None-Match" in pr_calls[0].headers
+    assert versions == 1
+    assert rel is not None
+    # A 304 leaves the finished child streams alone.
+    assert [r.url.path for r in fake.calls if "/pulls/9/" in r.url.path] == []
+
+
+def test_repository_verified_once_per_sync(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(9, pr=True)
+    oid = "c" * 40
+    fake.commit_pulls[oid] = [9]
+    with GitHubClient(token="ghp_test", transport=httpx.MockTransport(fake.handler)) as client:
+        collect_focused_github_evidence(store, client, commit_oids=[oid])
+        collect_full_and_incremental_github(store, client)
+    store.close()
+    assert fake.requested.count("/user") == 1
+    assert fake.requested.count("/repos/owner/repo") == 1
