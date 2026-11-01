@@ -9,10 +9,12 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import urllib.parse
+import zlib
 from pathlib import Path
 
 from codecontext.archive import execute_export, sanitized_bare_git_config
@@ -355,8 +357,10 @@ def _open_share_db(db_path: Path) -> sqlite3.Connection:
             triggers = set(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"))
         except sqlite3.Error as exc:
             raise _invalid_share("Shared memory database could not be read.") from exc
-        if not triggers <= _known_triggers():
-            raise _invalid_share("Shared memory database contains unknown triggers.")
+        if triggers != _known_triggers():
+            raise _invalid_share(
+                "Shared memory database triggers do not match the ones codecontext creates."
+            )
         _require_supported_share_schema(conn)
     except BaseException:
         conn.close()
@@ -364,7 +368,40 @@ def _open_share_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _copy_regular_tree(src: Path, dst: Path, files: dict[str, str], rel_prefix: str) -> None:
+_LOOSE_OBJECT = re.compile(r"[0-9a-f]{2}/[0-9a-f]{38}(?:[0-9a-f]{24})?")
+
+
+def _object_file_is_intact(path: Path, rel: str, obj_fmt: str) -> bool:
+    """Whether a local file under objects/ passes its own checksum. Other kinds count as intact.
+
+    The manifest is written by the share, so it cannot say a local object is wrong.
+    """
+    if _LOOSE_OBJECT.fullmatch(rel):
+        try:
+            data = zlib.decompress(path.read_bytes())
+        except zlib.error:
+            return False
+        return hashlib.new(obj_fmt, data).hexdigest() == rel.replace("/", "")
+    if rel.startswith("pack/") and rel.endswith((".pack", ".idx")):
+        trailer = hashlib.new(obj_fmt).digest_size
+        digest = hashlib.new(obj_fmt)
+        with path.open("rb") as f:
+            remaining = os.fstat(f.fileno()).st_size - trailer
+            if remaining < 0:
+                return False
+            while remaining:
+                chunk = f.read(min(remaining, 1 << 20))
+                if not chunk:
+                    return False
+                digest.update(chunk)
+                remaining -= len(chunk)
+            return digest.digest() == f.read(trailer)
+    return True
+
+
+def _copy_regular_tree(
+    src: Path, dst: Path, files: dict[str, str], rel_prefix: str, obj_fmt: str
+) -> None:
     _refuse_symlink(src, "Shared snapshot contains a symlink.")
     if not src.is_dir():
         return
@@ -385,14 +422,16 @@ def _copy_regular_tree(src: Path, dst: Path, files: dict[str, str], rel_prefix: 
                 continue
             if name in _ALTERNATES_FILES and current.name == "info" and current.parent == dst:
                 continue
-            rel = rel_prefix + child.relative_to(src).as_posix()
+            rel_in_tree = child.relative_to(src).as_posix()
+            rel = rel_prefix + rel_in_tree
             expected = files.get(rel)
+            if expected is None:
+                raise _invalid_share(f"Shared memory file {rel} is not listed in manifest.json.")
             dest_file = current / name
             if (
-                expected is not None
-                and dest_file.is_file()
+                dest_file.is_file()
                 and not dest_file.is_symlink()
-                and _file_sha256(dest_file) == expected
+                and _object_file_is_intact(dest_file, rel_in_tree, obj_fmt)
             ):
                 continue
             # Readers never see a half-written object: write beside it, then swap it in.
@@ -411,7 +450,12 @@ def _import_share(share_dir: Path, store_path: Path, team: dict[str, object]) ->
     files = _read_share_manifest(share_dir)
     store_path.mkdir(parents=True, exist_ok=True)
     _copy_regular_file(share_dir / "memory.sqlite3", store_path / "memory.sqlite3", files, "memory.sqlite3")
-    _open_share_db(store_path / "memory.sqlite3").close()
+    share_db = _open_share_db(store_path / "memory.sqlite3")
+    try:
+        row = share_db.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
+    finally:
+        share_db.close()
+    obj_fmt = "sha256" if row and row[0] == "sha256" else "sha1"
     _copy_regular_file(share_dir / "store.json", store_path / "store.json", files, "store.json")
     # team.json is not in the manifest; write the copy _read_team already validated.
     _write_team(store_path, team)
@@ -431,10 +475,7 @@ def _import_share(share_dir: Path, store_path: Path, team: dict[str, object]) ->
         for name in ("objects", "refs"):
             src = src_git / name
             if src.exists():
-                _copy_regular_tree(src, dest_git / name, files, f"repository.git/{name}/")
-        with sqlite3.connect(store_path / "memory.sqlite3") as conn:
-            row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
-        obj_fmt = str(row[0]) if row else "sha1"
+                _copy_regular_tree(src, dest_git / name, files, f"repository.git/{name}/", obj_fmt)
         (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
     (store_path / "tmp").mkdir(parents=True, exist_ok=True)
 
@@ -549,6 +590,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
             retryable=False,
         )
 
+    local_gen: int | None = None
     if dest.exists():
         if not _dir_is_empty(dest):
             if not _matching_store(dest, str(team["repository_id"])):
@@ -594,6 +636,12 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                     with existing.acquire_writer_lock(
                         timeout_seconds=remaining_timeout(SWAP_LOCK_TIMEOUT_SECONDS), allow_read_only=True
                     ):
+                        if _store_generation(existing) != local_gen:
+                            raise CodeContextError(
+                                code="STORE_BUSY",
+                                message="This store changed while joining, so nothing was replaced. Run join again.",
+                                retryable=True,
+                            )
                         _replace_tree(staging, dest)
                 finally:
                     existing.close()
@@ -773,15 +821,20 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
         shutil.rmtree(private, ignore_errors=True)
         raise
     try:
-        share_git_objs = share / "repository.git" / "objects"
-        local_git_objs = dest / "repository.git" / "objects"
-        git_objs_copied = False
-        if share_git_objs.is_dir() and local_git_objs.is_dir():
-            _copy_regular_tree(share_git_objs, local_git_objs, files, "repository.git/objects/")
-            git_objs_copied = True
-
         local_store = Store.open(dest, read_only=False)
         try:
+            with local_store.connect_read() as conn:
+                row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
+            obj_fmt = "sha256" if row and row[0] == "sha256" else "sha1"
+            share_git_objs = share / "repository.git" / "objects"
+            local_git_objs = dest / "repository.git" / "objects"
+            git_objs_copied = False
+            if share_git_objs.is_dir() and local_git_objs.is_dir():
+                _copy_regular_tree(
+                    share_git_objs, local_git_objs, files, "repository.git/objects/", obj_fmt
+                )
+                git_objs_copied = True
+
             try:
                 with local_store.write_transaction(bump_generation=True) as conn:
                     # symbols reference their parent symbol; rows arrive in arbitrary order.

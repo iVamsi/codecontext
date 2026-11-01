@@ -409,33 +409,52 @@ def decode_and_validate_cursor(
     return offset, extra
 
 
-@contextmanager
-def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[None]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    deadline = time.monotonic() + timeout_seconds
-    acquired = False
+def _try_file_lock(lock_path: Path) -> int | None:
+    """An fd holding the lock on the file now at lock_path, or None if that is not possible yet."""
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise CodeContextError(
-                        code="STORE_BUSY",
-                        message="Another process holds the store lock.",
-                        retryable=True,
-                    ) from exc
-                time.sleep(0.02)
-        yield
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except FileNotFoundError:
+        # A team join is swapping the store directory; do not recreate it here.
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    # A join can swap the directory between open and flock; a lock on the old file guards nothing.
+    try:
+        held = os.fstat(fd)
+        current = os.stat(lock_path)
+        if (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino):
+            return fd
+    except FileNotFoundError:
+        pass
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    return None
+
+
+@contextmanager
+def _acquire_file_lock(lock_path: Path, timeout_seconds: float = 10.0) -> Iterator[int]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    fd = _try_file_lock(lock_path)
+    while fd is None:
+        if time.monotonic() >= deadline:
+            raise CodeContextError(
+                code="STORE_BUSY",
+                message="Another process holds the store lock.",
+                retryable=True,
+            )
+        time.sleep(0.02)
+        fd = _try_file_lock(lock_path)
+    try:
+        yield fd
     finally:
-        if acquired:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
         os.close(fd)
 
 
@@ -774,6 +793,8 @@ class Store:
             if for_write:
                 conn = sqlite3.connect(str(self.db_path), timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                # trusted_schema stays on here: the search_documents triggers write to an FTS5
+                # table, which SQLite refuses from a trigger when it is off.
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA temp_store=MEMORY")
@@ -786,6 +807,7 @@ class Store:
                 uri = f"file:{quoted}?mode=ro"
                 conn = sqlite3.connect(uri, uri=True, timeout=remaining_timeout(5.0), isolation_level=None)
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA trusted_schema=OFF")
                 conn.execute("PRAGMA temp_store=MEMORY")
                 conn.execute("PRAGMA cache_size=-32000")
                 conn.set_progress_handler(lambda: int(expired()), 1000)

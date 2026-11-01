@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import threading
@@ -12,7 +13,7 @@ from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.memory import Memory
 from codecontext.models import InitRequest, SearchRequest, SyncRequest
-from codecontext.store import Store
+from codecontext.store import Store, _acquire_file_lock
 from codecontext.team import execute_join, execute_team_merge, project_remote_key
 from tests.fixtures.builders import (
     GitCommitSpec,
@@ -165,6 +166,15 @@ def _resign(share) -> None:
     for rel in manifest["files"]:
         manifest["files"][rel] = hashlib.sha256((share / rel).read_bytes()).hexdigest()
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _object_file(objs):
+    """A loose object or pack file, the kinds merge can check on their own."""
+    return next(
+        p.relative_to(objs)
+        for p in sorted(objs.rglob("*"))
+        if p.is_file() and (p.suffix == ".pack" or len(p.parent.name) == 2)
+    )
 
 
 def _sha256(path) -> str:
@@ -353,23 +363,36 @@ def test_join_refuses_when_replaced_backup_exists(tmp_path) -> None:
     assert (backup / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
-def test_sync_during_join_keeps_committed_writes(tmp_path) -> None:
+def test_sync_during_join_keeps_committed_writes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(team, "SWAP_LOCK_TIMEOUT_SECONDS", 30.0)
     share, store_b, repo_b = _join_setup(tmp_path)
     execute_join(store_b, share, repo_b)
     (store_b / "team.json").unlink()
-    with Memory.open(store_b, read_only=True) as mem:
-        rev_before_join = mem.status().revision
     share_rev = json.loads((share / "team.json").read_text(encoding="utf-8"))["active_revision"]
-    commit_fixture_spec(repo_b, GitCommitSpec(message="more", files={"src/b.py": b"x = 1\n"}))
+    new_rev = commit_fixture_spec(
+        repo_b, GitCommitSpec(message="more", files={"src/b.py": b"x = 1\n"})
+    )
 
     sync_holds_lock = threading.Event()
+    join_read_generation = threading.Event()
+    real_store_generation = team._store_generation
+
+    def store_generation(store):
+        result = real_store_generation(store)
+        join_read_generation.set()
+        return result
+
+    monkeypatch.setattr(team, "_store_generation", store_generation)
     errors: list[BaseException] = []
+    join_errors: list[CodeContextError] = []
 
     def sync_with_lock() -> None:
         try:
             with Memory.open(store_b) as mem:
                 with mem._store.acquire_writer_lock(timeout_seconds=5):
                     sync_holds_lock.set()
+                    # Commit only after join has decided to swap, so join must notice the change.
+                    assert join_read_generation.wait(timeout=30)
                     mem.sync(SyncRequest(revision="HEAD", offline=True))
         except BaseException as exc:
             errors.append(exc)
@@ -377,9 +400,11 @@ def test_sync_during_join_keeps_committed_writes(tmp_path) -> None:
             sync_holds_lock.set()
 
     def join_after_sync_starts() -> None:
-        sync_holds_lock.wait(timeout=10)
+        sync_holds_lock.wait(timeout=30)
         try:
             execute_join(store_b, share, repo_b)
+        except CodeContextError as exc:
+            join_errors.append(exc)
         except BaseException as exc:
             errors.append(exc)
 
@@ -387,20 +412,57 @@ def test_sync_during_join_keeps_committed_writes(tmp_path) -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=60)
+        t.join(timeout=90)
     assert errors == []
+    assert [e.code for e in join_errors] == ["STORE_BUSY"]
     with Memory.open(store_b, read_only=True) as mem:
         final_status = mem.status()
-    assert final_status.revision in (rev_before_join, share_rev)
+    assert final_status.revision == new_rev != share_rev
     with sqlite3.connect(store_b / "memory.sqlite3") as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_writer_waiting_during_join_locks_the_new_store(tmp_path, monkeypatch) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    (store_b / "team.json").unlink()
+    lock_path = store_b / "tmp" / "writer.lock"
+    join_holds_lock = threading.Event()
+    real_replace_tree = team._replace_tree
+
+    def replace_tree(source, destination):
+        join_holds_lock.set()
+        # Give the waiter time to start polling the old lock file.
+        threading.Event().wait(0.3)
+        real_replace_tree(source, destination)
+
+    monkeypatch.setattr(team, "_replace_tree", replace_tree)
+    seen: list[tuple[int, int]] = []
+    errors: list[BaseException] = []
+
+    def waiter() -> None:
+        join_holds_lock.wait(timeout=30)
+        try:
+            with _acquire_file_lock(lock_path, timeout_seconds=30) as fd:
+                held = os.fstat(fd)
+                current = os.stat(lock_path)
+                seen.append((held.st_ino, current.st_ino))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    execute_join(store_b, share, repo_b)
+    thread.join(timeout=60)
+    assert errors == []
+    assert len(seen) == 1 and seen[0][0] == seen[0][1]
+
+
 def test_truncated_object_is_repaired_on_merge(tmp_path) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     share_objs = share / "repository.git" / "objects"
-    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    rel = _object_file(share_objs)
     local_obj = store_b / "repository.git" / "objects" / rel
     local_obj.write_bytes(b"x")
     execute_team_merge(store_b, share, repo_b)
@@ -410,7 +472,7 @@ def test_truncated_object_is_repaired_on_merge(tmp_path) -> None:
 def test_merge_rejects_tampered_share_before_copying_objects(tmp_path) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     share_objs = share / "repository.git" / "objects"
-    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    rel = _object_file(share_objs)
     local_obj = store_b / "repository.git" / "objects" / rel
     local_obj.write_bytes(b"x")
     _add_decision(share, "claim_" + "f" * 64, "unsigned change")
@@ -510,7 +572,7 @@ def test_merge_rejects_share_db_that_changes_during_copy(tmp_path, monkeypatch) 
 def test_merge_rejects_object_that_changes_during_copy(tmp_path, monkeypatch) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     share_objs = share / "repository.git" / "objects"
-    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    rel = _object_file(share_objs)
     local_obj = store_b / "repository.git" / "objects" / rel
     local_obj.write_bytes(b"x")
     real_copyfile = shutil.copyfile
@@ -527,3 +589,51 @@ def test_merge_rejects_object_that_changes_during_copy(tmp_path, monkeypatch) ->
         execute_team_merge(store_b, share, repo_b)
     assert exc.value.code == "INVALID_REQUEST"
     assert local_obj.read_bytes() == b"x"
+
+
+def test_merge_keeps_valid_local_object_the_share_disagrees_with(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    local_git = store_b / "repository.git"
+    blob = tmp_path / "valid.txt"
+    blob.write_bytes(b"a valid local blob\n")
+    oid = run_git_fixture(
+        repo_b, ["--git-dir", str(local_git), "hash-object", "-w", str(blob)]
+    ).decode().strip()
+    rel = f"{oid[:2]}/{oid[2:]}"
+    local_obj = local_git / "objects" / rel
+    before = local_obj.read_bytes()
+    shared_obj = share / "repository.git" / "objects" / rel
+    shared_obj.parent.mkdir(parents=True, exist_ok=True)
+    shared_obj.write_bytes(b"crafted bytes the share signed itself")
+    manifest = json.loads((share / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files"][f"repository.git/objects/{rel}"] = _sha256(shared_obj)
+    (share / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    execute_team_merge(store_b, share, repo_b)
+    assert local_obj.read_bytes() == before
+
+
+def test_join_rejects_share_missing_a_known_trigger(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute("DROP TRIGGER search_documents_ai")
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert not store_b.exists()
+
+
+def test_merge_rejects_share_with_unknown_trigger(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "5" * 64, "trigger rides along")
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute(
+            "CREATE TRIGGER evil AFTER INSERT ON claims BEGIN"
+            " UPDATE store_meta SET principal_id = 'owned'; END"
+        )
+    _resign(share)
+    db_before = _sha256(store_b / "memory.sqlite3")
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert _sha256(store_b / "memory.sqlite3") == db_before

@@ -1,4 +1,6 @@
+import fcntl
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
 
@@ -6,7 +8,12 @@ import pytest
 
 from codecontext.archive import execute_purge
 from codecontext.models import InitRequest, PurgeRequest
-from codecontext.store import Store, get_migration_sql_and_hash, split_sql_statements
+from codecontext.store import (
+    Store,
+    _acquire_file_lock,
+    get_migration_sql_and_hash,
+    split_sql_statements,
+)
 from tests.fixtures.builders import build_f01_fixture
 
 
@@ -178,3 +185,35 @@ def test_purge_reports_cleanup_pending_when_rmtree_fails(tmp_path: Path) -> None
     finally:
         (stuck / "inner").chmod(0o700)
 
+
+
+def test_file_lock_retries_when_directory_is_swapped_after_open(tmp_path: Path, monkeypatch) -> None:
+    lock_path = tmp_path / "store" / "tmp" / "writer.lock"
+    lock_path.parent.mkdir(parents=True)
+    real_flock = fcntl.flock
+    swapped = []
+
+    def flock(fd, op):
+        if not swapped and op & fcntl.LOCK_EX:
+            # The fd already points at the old file; swap the directory before the lock lands.
+            os.rename(tmp_path / "store", tmp_path / "old-store")
+            lock_path.parent.mkdir(parents=True)
+            swapped.append(True)
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    with _acquire_file_lock(lock_path, timeout_seconds=2) as fd:
+        held = os.fstat(fd)
+        current = os.stat(lock_path)
+        assert (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+    assert swapped
+
+
+def test_read_connections_do_not_trust_schema(tmp_path: Path) -> None:
+    fixture = build_f01_fixture(tmp_path)
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=fixture.repo_dir))
+    try:
+        with store.connect_read() as conn:
+            assert conn.execute("PRAGMA trusted_schema").fetchone()[0] == 0
+    finally:
+        store.close()
