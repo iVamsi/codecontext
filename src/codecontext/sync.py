@@ -91,7 +91,7 @@ def _drain_commit_diff_jobs(
     session and one write transaction. Each job runs in its own savepoint, so a job that fails
     leaves no partial rows and does not stop the rest of the batch. A job that fails is skipped for
     the rest of this sync (`failed_this_sync`) and parks in `retryable_error` with an IO_ERROR gap
-    after MAX_DIFF_JOB_ATTEMPTS.
+    after MAX_DIFF_JOB_ATTEMPTS, until a reconcile sync makes it pending again.
     Returns False when the time budget is exhausted before the queue empties.
     """
     while True:
@@ -125,6 +125,9 @@ def _drain_commit_diff_jobs(
                         job_conn.execute(
                             "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
                             (now_us(), job_id),
+                        )
+                        Store.resolve_gaps_in_scope(
+                            job_conn, scope=f"git:commit:{commit_oid}", code="IO_ERROR"
                         )
                 except CodeContextError as exc:
                     failed_this_sync.append(job_id)
@@ -222,6 +225,13 @@ def _execute_sync(
     progress["structure_complete"] = True
     with store.write_transaction() as conn:
         Store.resolve_gaps_in_scope(conn, scope="sync:deadline")
+        if request.reconcile:
+            # Reconcile is the explicit retry for diff jobs that used up their attempts.
+            conn.execute(
+                "UPDATE jobs SET state = 'pending', attempts = 0, updated_at_us = ? "
+                "WHERE kind = 'git_commit_diff' AND state = 'retryable_error'",
+                (now_us(),),
+            )
     check_deadline()
     requests_attempted = 0
     sources_added = 0

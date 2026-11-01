@@ -449,6 +449,15 @@ def test_one_failing_commit_does_not_block_others(
 
         mem.sync(SyncRequest(offline=True))
         assert job_rows()[bad]["attempts"] == sync.MAX_DIFF_JOB_ATTEMPTS
+        assert job_rows()[bad]["state"] == "retryable_error"
+
+        monkeypatch.setattr(sync, "index_commit_changes_and_hunks", original)
+        mem.sync(SyncRequest(offline=True))
+        assert job_rows()[bad]["state"] == "retryable_error"
+        recovered = mem.sync(SyncRequest(offline=True, reconcile=True))
+        assert job_rows()[bad]["state"] == "complete"
+        assert not any(g.code == "IO_ERROR" for g in recovered.gaps)
+        assert recovered.coverage.git.state == "complete"
 
 
 def test_shallow_boundary_not_rediffed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
