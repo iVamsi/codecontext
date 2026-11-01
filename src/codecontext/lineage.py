@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from codecontext.deadline import check_deadline
+from codecontext.errors import CodeContextError
 from codecontext.git import (
     CatFileBatchSession,
     GitMirror,
@@ -376,13 +377,18 @@ def map_original_anchor_to_target(
             t_blob_obj = batch.read_object_bounded(t_same_path.oid, max_bytes=MAX_PARSE_BYTES)
             if t_blob_obj is not None and t_blob_obj[2] is not None:
                 t_bytes = t_blob_obj[2]
-                hunks = compute_unified_zero_hunks(
-                    orig_bytes,
-                    t_bytes,
-                    mirror=mirror,
-                    old_oid=orig_entry.oid,
-                    new_oid=t_same_path.oid,
-                )
+                try:
+                    hunks = compute_unified_zero_hunks(
+                        orig_bytes,
+                        t_bytes,
+                        mirror=mirror,
+                        old_oid=orig_entry.oid,
+                        new_oid=t_same_path.oid,
+                    )
+                except CodeContextError as exc:
+                    if exc.code != "IO_ERROR":
+                        raise
+                    hunks = None
                 transported = (
                     transport_line_range_across_hunks(original_line_start, original_line_end, hunks)
                     if hunks is not None
@@ -1443,19 +1449,17 @@ def index_focused_path_history(
                     break
 
     with store.write_transaction(bump_generation=True) as conn:
-        pending_commits = conn.execute(
-            "SELECT oid FROM commits WHERE diff_state != 'complete' ORDER BY first_seen_at_us ASC, oid ASC"
-        ).fetchall()
-        for r in pending_commits:
-            c_oid = str(r["oid"])
-            Store.enqueue_job(conn, kind="git_commit_diff", owner_id=c_oid, priority=50)
-        if pending_commits:
+        Store.enqueue_pending_diff_jobs(conn)
+        pending_count = int(
+            conn.execute("SELECT COUNT(*) FROM commits WHERE diff_state != 'complete'").fetchone()[0]
+        )
+        if pending_count:
             Store.upsert_gap(
                 conn,
                 repository_id=store.config.repository_id,
                 code="GIT_HISTORY_PENDING",
                 scope="git:history",
-                message=f"{len(pending_commits)} commit(s) remaining in full Git history backfill.",
+                message=f"{pending_count} commit(s) remaining in full Git history backfill.",
                 retryable=True,
             )
         else:

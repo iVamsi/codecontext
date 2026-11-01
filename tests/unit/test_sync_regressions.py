@@ -333,3 +333,201 @@ def test_shallow_source_import(tmp_path: Path, merge: bool) -> None:
             assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == (4 if merge else 2)
             assert conn.execute("SELECT COUNT(*) FROM commits WHERE diff_state != 'complete'").fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM changes WHERE commit_oid = ?", (boundary["oid"],)).fetchone()[0] > 0
+
+
+def _linear_repo(path: Path, commits: int) -> Path:
+    repo = init_fixture_repo(path)
+    for i in range(commits):
+        commit_fixture_spec(
+            repo, GitCommitSpec(message=f"C{i}", files={f"f{i}.py": f"def f{i}(): pass\n".encode()})
+        )
+    return repo
+
+
+def test_fetch_uses_sync_budget_not_60s(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext import git
+    from codecontext.deadline import remaining_timeout
+
+    repo = _linear_repo(tmp_path / "repo", 2)
+    original = git.run_safe_git
+    fetch_budgets: list[float] = []
+
+    def record(args, **kwargs):
+        if args and args[0] == "fetch":
+            fetch_budgets.append(remaining_timeout(kwargs.get("timeout", 30.0)))
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(git, "run_safe_git", record)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        report = mem.sync(SyncRequest(offline=True, max_seconds=600))
+    assert report.state in ("complete", "partial") and report.stop_reason != "error"
+    assert fetch_budgets and all(budget > 500 for budget in fetch_budgets)
+
+
+def test_interrupted_initial_fetch_resumes_in_depth_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codecontext import git
+    from codecontext.deadline import SyncDeadlineExceeded
+
+    repo = _linear_repo(tmp_path / "repo", 5)
+    monkeypatch.setattr(git, "FETCH_DEPTH_STEP", 2)
+    original = git.run_safe_git
+    fetches: list[str] = []
+    allowed = {"n": 0}
+
+    def limited(args, **kwargs):
+        if args and args[0] == "fetch":
+            mode = next((a for a in args if a.startswith(("--depth", "--deepen"))), "full")
+            if allowed["n"] == 0:
+                raise SyncDeadlineExceeded
+            allowed["n"] -= 1
+            fetches.append(mode)
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(git, "run_safe_git", limited)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        assert mem.sync(SyncRequest(offline=True)).stop_reason == "time_budget"
+        allowed["n"] = 1
+        assert mem.sync(SyncRequest(offline=True)).stop_reason == "time_budget"
+        assert fetches == ["--depth=2"]
+        allowed["n"] = 100
+        report = mem.sync(SyncRequest(offline=True))
+        assert fetches == ["--depth=2", "--deepen=2", "--deepen=2"]
+        assert report.coverage.git.state == "complete"
+        assert not (mem._mirror.git_dir / "shallow").exists()
+        with mem._store.connect_read() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 5
+        mem.sync(SyncRequest(offline=True))
+        assert fetches[-1] == "full"
+
+
+def test_one_failing_commit_does_not_block_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codecontext import sync
+    from codecontext.errors import CodeContextError
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="C0", files={"a.py": b"def a(): pass\n"}))
+    bad = commit_fixture_spec(
+        repo, GitCommitSpec(message="C1", files={"b.py": b"def b(): pass\n"})
+    )
+    commit_fixture_spec(repo, GitCommitSpec(message="C2", files={"c.py": b"def c(): pass\n"}))
+    original = sync.index_commit_changes_and_hunks
+
+    def failing(store, mirror, commit_oid, **kwargs):
+        result = original(store, mirror, commit_oid, **kwargs)
+        if commit_oid == bad:
+            raise CodeContextError(code="IO_ERROR", message="boom", retryable=True)
+        return result
+
+    monkeypatch.setattr(sync, "index_commit_changes_and_hunks", failing)
+
+    def job_rows():
+        with mem._store.connect_read() as conn:
+            return {
+                r["owner_id"]: r
+                for r in conn.execute("SELECT * FROM jobs WHERE kind = 'git_commit_diff'")
+            }
+
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        report = mem.sync(SyncRequest(offline=True))
+        assert report.stop_reason != "time_budget"
+        jobs = job_rows()
+        assert sum(r["state"] == "complete" for r in jobs.values()) == len(jobs) - 1
+        assert jobs[bad]["attempts"] == 1 and jobs[bad]["state"] == "pending"
+        assert jobs[bad]["last_error_code"] == "IO_ERROR"
+        with mem._store.connect_read() as conn:
+            assert not conn.execute("SELECT 1 FROM changes WHERE commit_oid = ?", (bad,)).fetchone()
+
+        mem.sync(SyncRequest(offline=True))
+        report = mem.sync(SyncRequest(offline=True))
+        assert job_rows()[bad]["attempts"] == sync.MAX_DIFF_JOB_ATTEMPTS
+        assert job_rows()[bad]["state"] == "retryable_error"
+        assert any(g.code == "IO_ERROR" and bad in g.scope for g in report.gaps)
+
+        mem.sync(SyncRequest(offline=True))
+        assert job_rows()[bad]["attempts"] == sync.MAX_DIFF_JOB_ATTEMPTS
+
+
+def test_shallow_boundary_not_rediffed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext import sync
+
+    source = _linear_repo(tmp_path / "source", 3)
+    shallow = tmp_path / "shallow"
+    run_git_fixture(source, ["clone", "--depth=1", "--no-local", str(source), str(shallow)])
+    original = sync.index_commit_changes_and_hunks
+    diffed: list[str] = []
+
+    def counting(store, mirror, commit_oid, **kwargs):
+        diffed.append(commit_oid)
+        return original(store, mirror, commit_oid, **kwargs)
+
+    monkeypatch.setattr(sync, "index_commit_changes_and_hunks", counting)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=shallow)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        n1 = len(diffed)
+        assert n1 == 1
+        mem.sync(SyncRequest(offline=True))
+        assert len(diffed) == n1
+
+
+def test_diff_blobs_unified_zero_rejects_non_oid(tmp_path: Path) -> None:
+    from codecontext.errors import CodeContextError
+    from codecontext.git import GitMirror
+    from codecontext.store import Store
+
+    repo = _linear_repo(tmp_path / "repo", 1)
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    try:
+        for bad in ("--output=/tmp/x", "HEAD"):
+            with pytest.raises(CodeContextError) as exc:
+                mirror.diff_blobs_unified_zero(bad, None)
+            assert exc.value.code == "INVALID_REQUEST"
+    finally:
+        mirror.close()
+        store.close()
+
+
+def test_anchor_mapping_survives_git_diff_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codecontext.errors import CodeContextError
+    from codecontext.git import PYTHON_DIFF_MAX_LINES, GitMirror
+    from codecontext.lineage import map_original_anchor_to_target
+    from codecontext.store import Store
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    lines = [f"line {i}\n" for i in range(PYTHON_DIFF_MAX_LINES + 10)]
+    first = commit_fixture_spec(
+        repo, GitCommitSpec(message="C0", files={"big.txt": "".join(lines).encode()})
+    )
+    second = commit_fixture_spec(
+        repo,
+        GitCommitSpec(message="C1", files={"big.txt": ("new\n" + "".join(lines)).encode()}),
+    )
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+
+    def broken_diff(self, old_oid, new_oid):
+        raise CodeContextError(code="IO_ERROR", message="git diff failed")
+
+    monkeypatch.setattr(GitMirror, "diff_blobs_unified_zero", broken_diff)
+    try:
+        mirror.prepare_snapshot("HEAD")
+        with store.connect_read() as conn:
+            result = map_original_anchor_to_target(
+                conn,
+                mirror,
+                original_commit_oid=first,
+                original_path=b"big.txt",
+                original_line_start=5,
+                original_line_end=6,
+                target_revision=second,
+            )
+    finally:
+        mirror.close()
+        store.close()
+    assert result.mapping == "unmapped" and result.gap_code == "MAPPING_UNAVAILABLE"

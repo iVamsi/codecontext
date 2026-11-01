@@ -1279,6 +1279,45 @@ class Store:
         return job_id
 
     @staticmethod
+    def enqueue_pending_diff_jobs(conn: sqlite3.Connection) -> int:
+        """Queue a `git_commit_diff` job for every commit whose diff is not complete.
+
+        A commit with an active MISSING_PARENT gap is left out until its first parent is imported,
+        so a shallow boundary is not re-diffed every sync. Jobs parked in `retryable_error` stay
+        parked: they already used their attempts.
+        """
+        conn.create_function(
+            "cc_diff_job_id",
+            1,
+            lambda oid: make_job_id(kind="git_commit_diff", owner_id=oid),
+            deterministic=True,
+        )
+        ts = now_us()
+        return conn.execute(
+            """
+            INSERT INTO jobs (id, kind, owner_id, priority, state, cursor_json, attempts,
+                              last_error_code, created_at_us, updated_at_us)
+            SELECT cc_diff_job_id(c.oid), 'git_commit_diff', c.oid, 50, 'pending', '{}', 0,
+                   NULL, ?, ?
+            FROM commits c
+            WHERE c.diff_state != 'complete'
+              AND NOT EXISTS (
+                SELECT 1 FROM coverage_gaps g
+                JOIN commit_parents p ON p.commit_oid = c.oid AND p.parent_index = 0
+                WHERE g.scope = 'git:commit:' || c.oid AND g.active = 1
+                  AND g.code = 'MISSING_PARENT'
+                  AND NOT EXISTS (SELECT 1 FROM commits pc WHERE pc.oid = p.parent_oid)
+              )
+            ORDER BY c.first_seen_at_us ASC, c.oid ASC
+            ON CONFLICT(kind, owner_id) DO UPDATE SET
+              priority = MIN(jobs.priority, excluded.priority),
+              state = CASE WHEN jobs.state = 'complete' THEN 'pending' ELSE jobs.state END,
+              updated_at_us = excluded.updated_at_us
+            """,
+            (ts, ts),
+        ).rowcount
+
+    @staticmethod
     def get_queue_counts(conn: sqlite3.Connection) -> QueueCounts:
         rows = conn.execute("SELECT state, COUNT(*) AS cnt FROM jobs GROUP BY state").fetchall()
         counts = {row["state"]: int(row["cnt"]) for row in rows}

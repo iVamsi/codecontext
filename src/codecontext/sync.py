@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import time
@@ -26,6 +27,7 @@ from codecontext.store import Store, now_us
 from codecontext.syntax import index_active_snapshot_files
 
 COMMIT_DIFF_BATCH_SIZE = 32
+MAX_DIFF_JOB_ATTEMPTS = 3
 
 
 def execute_sync(
@@ -82,10 +84,14 @@ def execute_sync(
                       cache_hits=0, jobs=jobs, stop_reason="time_budget")
 
 
-def _drain_commit_diff_jobs(store: Store, mirror: GitMirror, deadline_mono: float) -> bool:
+def _drain_commit_diff_jobs(
+    store: Store, mirror: GitMirror, deadline_mono: float, failed_this_sync: list[str]
+) -> bool:
     """Process pending `git_commit_diff` jobs in batches that share one `cat-file --batch`
-    session and one write transaction. A batch is committed atomically (job completion and
-    its changes together), so an interrupted batch rolls back to `pending` with no partial rows.
+    session and one write transaction. Each job runs in its own savepoint, so a job that fails
+    leaves no partial rows and does not stop the rest of the batch. A job that fails is skipped for
+    the rest of this sync (`failed_this_sync`) and parks in `retryable_error` with an IO_ERROR gap
+    after MAX_DIFF_JOB_ATTEMPTS.
     Returns False when the time budget is exhausted before the queue empties.
     """
     while True:
@@ -96,10 +102,11 @@ def _drain_commit_diff_jobs(store: Store, mirror: GitMirror, deadline_mono: floa
                 """
                 SELECT id, owner_id FROM jobs
                 WHERE state = 'pending' AND kind = 'git_commit_diff'
+                  AND id NOT IN (SELECT value FROM json_each(?))
                 ORDER BY priority ASC, created_at_us ASC, id ASC
                 LIMIT ?
                 """,
-                (COMMIT_DIFF_BATCH_SIZE,),
+                (json.dumps(failed_this_sync), COMMIT_DIFF_BATCH_SIZE),
             ).fetchall()
         if not jobs:
             return True
@@ -108,13 +115,43 @@ def _drain_commit_diff_jobs(store: Store, mirror: GitMirror, deadline_mono: floa
                 check_deadline()
                 if time.monotonic() >= deadline_mono:
                     break
-                index_commit_changes_and_hunks(
-                    store, mirror, str(job["owner_id"]), batch=batch, conn=conn
-                )
-                conn.execute(
-                    "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
-                    (now_us(), str(job["id"])),
-                )
+                job_id = str(job["id"])
+                commit_oid = str(job["owner_id"])
+                try:
+                    with store.write_transaction(bump_generation=True) as job_conn:
+                        index_commit_changes_and_hunks(
+                            store, mirror, commit_oid, batch=batch, conn=job_conn
+                        )
+                        job_conn.execute(
+                            "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
+                            (now_us(), job_id),
+                        )
+                except CodeContextError as exc:
+                    failed_this_sync.append(job_id)
+                    _record_diff_job_failure(store, conn, job_id, commit_oid, exc.code)
+
+
+def _record_diff_job_failure(
+    store: Store, conn: sqlite3.Connection, job_id: str, commit_oid: str, error_code: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE jobs SET attempts = attempts + 1, last_error_code = ?, updated_at_us = ?,
+            state = CASE WHEN attempts + 1 >= ? THEN 'retryable_error' ELSE 'pending' END
+        WHERE id = ?
+        """,
+        (error_code, now_us(), MAX_DIFF_JOB_ATTEMPTS, job_id),
+    )
+    state = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()["state"]
+    if state == "retryable_error":
+        Store.upsert_gap(
+            conn,
+            repository_id=store.config.repository_id,
+            code="IO_ERROR",
+            scope=f"git:commit:{commit_oid}",
+            message=f"Diffing commit {commit_oid[:12]} failed {MAX_DIFF_JOB_ATTEMPTS} times ({error_code}).",
+            retryable=True,
+        )
 
 
 def _execute_sync(
@@ -138,6 +175,7 @@ def _execute_sync(
     started_us = now_us()
     start_mono = time.monotonic()
     deadline_mono = start_mono + float(request.max_seconds)
+    failed_diff_jobs: list[str] = []
 
     with store.connect_read() as r_conn:
         meta = r_conn.execute(
@@ -208,13 +246,9 @@ def _execute_sync(
         )
     else:
         with store.write_transaction(bump_generation=True) as conn:
-            pending_c = conn.execute(
-                "SELECT oid FROM commits WHERE diff_state != 'complete' ORDER BY first_seen_at_us ASC, oid ASC"
-            ).fetchall()
-            for r in pending_c:
-                Store.enqueue_job(conn, kind="git_commit_diff", owner_id=str(r["oid"]), priority=50)
+            Store.enqueue_pending_diff_jobs(conn)
 
-    if focus_path_bytes is None and not _drain_commit_diff_jobs(store, mirror, deadline_mono):
+    if focus_path_bytes is None and not _drain_commit_diff_jobs(store, mirror, deadline_mono, failed_diff_jobs):
         stop_reason = "time_budget"
 
     gitlab_info: tuple[str, str] | None = None
@@ -348,7 +382,7 @@ def _execute_sync(
                             _apply(gh_done1)
 
     # History left over after remote collection uses whatever budget remains.
-    if stop_reason == "scope_complete" and not _drain_commit_diff_jobs(store, mirror, deadline_mono):
+    if stop_reason == "scope_complete" and not _drain_commit_diff_jobs(store, mirror, deadline_mono, failed_diff_jobs):
         stop_reason = "time_budget"
 
     # Check if all git commit diffs are complete and resolve GIT_HISTORY_PENDING if so

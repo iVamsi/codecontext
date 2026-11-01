@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from codecontext.deadline import check_deadline, remaining_timeout
+from codecontext.deadline import SyncDeadlineExceeded, check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import HEX_OID_RE
 from codecontext.store import Store, inspect_local_git_repository, now_us
@@ -24,6 +24,10 @@ HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Each cached revision holds a full path->blob listing, so switching between a handful of
 # branches stays fast without letting the table grow with every revision ever prepared.
 MAX_CACHED_REVISION_SNAPSHOTS = 8
+# A killed fetch keeps none of its objects. An initial import that outlives one sync budget
+# resumes as fetches of this many commits each, so every completed step persists.
+FETCH_DEPTH_STEP = 1000
+FETCH_RESUME_MARKER = "codecontext-fetch-resume"
 
 STATUS_TO_CHANGE_KIND: dict[str, str] = {
     "A": "added",
@@ -1087,7 +1091,8 @@ class GitMirror:
         source_repo: Path,
         requested_revision: str,
         *,
-        timeout: float = 60.0,
+        # The sync deadline is the real bound; this only caps a fetch made outside any sync.
+        timeout: float = 86_400.0,
     ) -> tuple[str, dict[str, str], bool]:
         """Import declared local refs and the requested revision into owned `refs/codecontext/local/*` namespaces.
         Returns (resolved_commit_oid, ref_map, is_shallow).
@@ -1150,23 +1155,42 @@ class GitMirror:
             head_oid = source_refs["HEAD"]
             refspecs.append(f"+{head_oid}:refs/codecontext/local/HEAD")
 
-        run_safe_git(
-            [
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--no-auto-maintenance",
-                "--update-shallow",
-                *(["--unshallow"] if not is_shallow and self.is_source_shallow(self.git_dir) else []),
-                "--end-of-options",
-                str(source_repo),
-                *refspecs,
-            ],
-            git_dir=self.git_dir,
-            empty_hooks_dir=self.empty_hooks_dir,
-            allow_file_protocol=True,
-            timeout=timeout,
-        )
+        resume_marker = self.git_dir / FETCH_RESUME_MARKER
+        mirror_shallow = not is_shallow and self.is_source_shallow(self.git_dir)
+        stepping = resume_marker.exists() and not is_shallow and (mirror_shallow or not old_oids)
+        if stepping:
+            depth_args = [f"--deepen={FETCH_DEPTH_STEP}" if mirror_shallow else f"--depth={FETCH_DEPTH_STEP}"]
+        else:
+            depth_args = ["--unshallow"] if mirror_shallow else []
+        while True:
+            try:
+                run_safe_git(
+                    [
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--no-auto-maintenance",
+                        "--update-shallow",
+                        *depth_args,
+                        "--end-of-options",
+                        str(source_repo),
+                        *refspecs,
+                    ],
+                    git_dir=self.git_dir,
+                    empty_hooks_dir=self.empty_hooks_dir,
+                    allow_file_protocol=True,
+                    timeout=timeout,
+                )
+            except SyncDeadlineExceeded:
+                # Only an empty mirror may go shallow: a depth fetch into existing history would
+                # hide the commits already imported.
+                if not old_oids and not is_shallow:
+                    resume_marker.touch()
+                raise
+            if not stepping or not self.is_source_shallow(self.git_dir):
+                break
+            depth_args = [f"--deepen={FETCH_DEPTH_STEP}"]
+        resume_marker.unlink(missing_ok=True)
         self.ensure_empty_objects()
         return resolved_oid, source_refs, is_shallow
 
@@ -1227,6 +1251,13 @@ class GitMirror:
         return parse_diff_tree_raw_z(proc.stdout, parent_index=parent_index, parent_oid=parent_oid)
 
     def diff_blobs_unified_zero(self, old_blob_oid: str | None, new_blob_oid: str | None) -> list[ParsedHunk]:
+        for oid in (old_blob_oid, new_blob_oid):
+            if oid is not None and not HEX_OID_RE.match(oid):
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message=f"Invalid blob OID: {oid!r}",
+                    retryable=False,
+                )
         _, empty_blob = self.ensure_empty_objects()
         lhs = old_blob_oid if old_blob_oid is not None else empty_blob
         rhs = new_blob_oid if new_blob_oid is not None else empty_blob
