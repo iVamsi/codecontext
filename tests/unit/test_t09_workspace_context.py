@@ -1,3 +1,4 @@
+import errno
 import os
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 import codecontext.github as gh_mod
 import codecontext.syntax as syntax_mod
+import codecontext.workspace as workspace
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.identity import sha256_bytes
@@ -20,6 +22,7 @@ from codecontext.models import (
 from codecontext.retrieval import execute_context, execute_get, execute_search
 from codecontext.store import Store
 from codecontext.syntax import index_active_snapshot_files
+from codecontext.workspace import inspect_workspace
 from tests.fixtures.builders import (
     GitCommitSpec,
     build_f01_fixture,
@@ -322,3 +325,129 @@ def test_truncated_code_anchor_matches_text(tmp_path: Path) -> None:
     assert view.text.endswith("\n")
     assert body[span.byte_start : span.byte_end].decode() == view.text
     assert span.line_end - span.line_start + 1 == view.text.count("\n")
+
+
+def _small_workspace(tmp_path: Path) -> tuple[Store, GitMirror, Path, str]:
+    repo_dir = init_fixture_repo(tmp_path / "ws_repo")
+    commit_fixture_spec(
+        repo_dir,
+        GitCommitSpec(
+            message="Base",
+            files={"src/app.py": b"x = 1\n", ".gitignore": b".env\n"},
+        ),
+    )
+    store = Store.initialize(tmp_path / "ws_store", InitRequest(repo_path=repo_dir))
+    mirror = GitMirror(store)
+    active_rev = mirror.prepare_snapshot("HEAD")
+    return store, mirror, repo_dir, active_rev
+
+
+def _inspect(store: Store, repo_dir: Path, active_rev: str, target: bytes):
+    return inspect_workspace(
+        store,
+        repo_dir,
+        active_revision=active_rev,
+        target_path_bytes=target,
+        index_blob_oid=None,
+        index_blob_bytes=None,
+    )
+
+
+@pytest.mark.parametrize("target", [b".git/config", b".GIT/config", b"sub/.git/config", b".git"])
+def test_inspect_rejects_git_dir_paths(tmp_path: Path, target: bytes) -> None:
+    store, _mirror, repo_dir, active_rev = _small_workspace(tmp_path)
+    with pytest.raises(CodeContextError) as exc:
+        _inspect(store, repo_dir, active_rev, target)
+    assert exc.value.code == "INVALID_REQUEST"
+    store.close()
+
+
+def test_context_rejects_git_dir_target_with_workspace(tmp_path: Path) -> None:
+    store, mirror, repo_dir, _active_rev = _small_workspace(tmp_path)
+    with pytest.raises(CodeContextError) as exc:
+        execute_context(
+            store,
+            mirror,
+            ContextRequest(query="config", target=PathTarget(kind="path", path=".git/config")),
+            workspace_path=repo_dir,
+        )
+    assert exc.value.code == "INVALID_REQUEST"
+    store.close()
+
+
+def test_ignored_file_has_no_hash(tmp_path: Path) -> None:
+    store, _mirror, repo_dir, active_rev = _small_workspace(tmp_path)
+    (repo_dir / ".env").write_bytes(b"TOKEN=secret\n")
+    (repo_dir / "notes.txt").write_bytes(b"plain\n")
+
+    ignored, _ = _inspect(store, repo_dir, active_rev, b".env")
+    assert ignored.target_state == "untracked"
+    assert ignored.working_content_hash is None
+
+    visible, _ = _inspect(store, repo_dir, active_rev, b"notes.txt")
+    assert visible.working_content_hash == sha256_bytes(b"plain\n")
+    store.close()
+
+
+def test_parent_swapped_for_symlink_is_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _mirror, repo_dir, _active_rev = _small_workspace(tmp_path)
+    store.close()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "app.py").write_bytes(b"OUTSIDE_SECRET\n")
+
+    real_check = workspace._resolve_root_confined_parent_dir
+
+    def check_then_swap(*args, **kwargs):
+        result = real_check(*args, **kwargs)
+        (repo_dir / "src").rename(tmp_path / "src_moved")
+        os.symlink(outside, repo_dir / "src")
+        return result
+
+    monkeypatch.setattr(workspace, "_resolve_root_confined_parent_dir", check_then_swap)
+    state, content, _mode = workspace._read_root_confined_regular_file(repo_dir, b"src/app.py")
+    assert state == "symlink"
+    assert content is None
+
+
+def test_open_repo_file_no_follow_refuses_symlinked_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "real").mkdir(parents=True)
+    (repo / "real" / "f").write_bytes(b"ok")
+    os.symlink(repo / "real", repo / "link")
+    root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = workspace.open_repo_file_no_follow(root_fd, b"real/f")
+        try:
+            assert os.read(fd, 10) == b"ok"
+        finally:
+            os.close(fd)
+        with pytest.raises(OSError) as exc:
+            workspace.open_repo_file_no_follow(root_fd, b"link/f")
+        assert exc.value.errno == errno.ELOOP
+    finally:
+        os.close(root_fd)
+
+
+def test_non_utf8_workspace_path(tmp_path: Path) -> None:  # Review Focus 4
+    store, _mirror, repo_dir, active_rev = _small_workspace(tmp_path)
+    name = b"caf\xe9.py"
+
+    missing, _ = _inspect(store, repo_dir, active_rev, name)
+    assert missing.target_state == "deleted"
+
+    try:
+        fd = os.open(os.path.join(os.fsencode(repo_dir), name), os.O_WRONLY | os.O_CREAT, 0o644)
+    except OSError as exc:
+        store.close()
+        if exc.errno == errno.EILSEQ:
+            pytest.skip("filesystem rejects non-UTF-8 names")
+        raise
+    os.write(fd, b"y = 2\n")
+    os.close(fd)
+    present, _ = _inspect(store, repo_dir, active_rev, name)
+    assert present.target_state == "untracked"
+    assert present.working_content_hash == sha256_bytes(b"y = 2\n")
+    store.close()

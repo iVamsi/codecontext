@@ -319,6 +319,43 @@ def _lstat_root_confined(
         return None
 
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+# O_NONBLOCK keeps a FIFO planted at a tracked path from hanging the open.
+_FILE_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+_DIR_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_DIRECTORY
+
+
+def open_repo_file_no_follow(repo_fd: int, rel_path: bytes) -> int:
+    """Open `rel_path` under the directory `repo_fd` for reading without following any symlink.
+
+    Each component is opened relative to the previous one, so a parent swapped for a symlink
+    after a path check cannot redirect the read. A symlink anywhere on the path raises
+    `OSError(ELOOP)`; the caller owns the returned fd.
+    """
+    parts = [p for p in rel_path.split(b"/") if p]
+    if not parts:
+        raise OSError(errno.ENOENT, "empty repository path")
+    fd = os.dup(repo_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                # macOS reports ENOTDIR, not ELOOP, for O_DIRECTORY | O_NOFOLLOW on a symlink.
+                if exc.errno == errno.ENOTDIR and stat.S_ISLNK(
+                    os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode
+                ):
+                    raise OSError(errno.ELOOP, "symlink in repository path") from exc
+                raise
+            os.close(fd)
+            fd = next_fd
+        return os.open(parts[-1], _FILE_OPEN_FLAGS, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
 def _read_root_confined_regular_file(
     workspace_root: Path,
     rel_path_bytes: bytes,
@@ -343,58 +380,50 @@ def _read_root_confined_regular_file(
     if p_status != "ok" or cur is None:
         return (p_status, None, 0o120000 if p_status == "symlink" else None)
 
-    leaf_path = cur / os.fsdecode(parts[-1])
-    for _attempt in range(2):
-        try:
-            st1 = os.lstat(leaf_path)
-        except FileNotFoundError:
-            return ("deleted", None, None)
-        except OSError:
-            return ("unavailable", None, None)
+    # The lexical check resolved in-root parent symlinks; the fd walk re-checks that real path
+    # with no-follow opens, so anything swapped in since is refused rather than followed.
+    real_rel = b"/".join([*(os.fsencode(c) for c in cur.relative_to(root_real).parts), parts[-1]])
+    try:
+        root_fd = os.open(root_real, _DIR_OPEN_FLAGS & ~_O_NOFOLLOW)
+    except OSError:
+        return ("unavailable", None, None)
+    try:
+        for _attempt in range(2):
+            try:
+                fd = open_repo_file_no_follow(root_fd, real_rel)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.EMLINK):
+                    return ("symlink", None, 0o120000)
+                if exc.errno == errno.ENOENT:
+                    return ("deleted", None, None)
+                return ("unavailable", None, None)
 
-        if stat.S_ISLNK(st1.st_mode):
-            return ("symlink", None, 0o120000)
-        if not stat.S_ISREG(st1.st_mode):
-            return ("unavailable", None, None)
-        if st1.st_size > MAX_PARSE_BYTES:
-            return ("oversized", None, None)
-
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(leaf_path, flags)
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.EMLINK):
-                return ("symlink", None, 0o120000)
-            if exc.errno == errno.ENOENT:
-                return ("deleted", None, None)
-            return ("unavailable", None, None)
-
-        try:
-            f_st1 = os.fstat(fd)
-            if f_st1.st_size > MAX_PARSE_BYTES:
-                return ("oversized", None, None)
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                buf = os.read(fd, 65536)
-                if not buf:
-                    break
-                total += len(buf)
-                if total > MAX_PARSE_BYTES:
+            try:
+                f_st1 = os.fstat(fd)
+                if not stat.S_ISREG(f_st1.st_mode):
+                    return ("unavailable", None, None)
+                if f_st1.st_size > MAX_PARSE_BYTES:
                     return ("oversized", None, None)
-                chunks.append(buf)
-            f_st2 = os.fstat(fd)
-        except OSError:
-            return ("unavailable", None, None)
-        finally:
-            os.close(fd)
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    buf = os.read(fd, 65536)
+                    if not buf:
+                        break
+                    total += len(buf)
+                    if total > MAX_PARSE_BYTES:
+                        return ("oversized", None, None)
+                    chunks.append(buf)
+                f_st2 = os.fstat(fd)
+            except OSError:
+                return ("unavailable", None, None)
+            finally:
+                os.close(fd)
 
-        if (
-            f_st1.st_ino == st1.st_ino
-            and f_st1.st_mtime_ns == f_st2.st_mtime_ns
-            and f_st1.st_size == f_st2.st_size == total
-        ):
-            return ("ok", b"".join(chunks), _normalize_git_file_mode(f_st2.st_mode))
+            if f_st1.st_mtime_ns == f_st2.st_mtime_ns and f_st1.st_size == f_st2.st_size == total:
+                return ("ok", b"".join(chunks), _normalize_git_file_mode(f_st2.st_mode))
+    finally:
+        os.close(root_fd)
 
     return ("unavailable", None, None)
 
@@ -416,6 +445,19 @@ def _lookup_workspace_base_revision(store: Store, active_revision: str) -> str |
     return None
 
 
+def _is_ignored(ws_root: Path, rel_path: bytes, empty_hooks: Path) -> bool:
+    """True when git ignores the untracked `rel_path`; a failed check counts as ignored."""
+    proc = run_safe_git(
+        ["check-ignore", "--stdin", "-z"],
+        cwd=ws_root,
+        empty_hooks_dir=empty_hooks,
+        stdin_bytes=rel_path + b"\0",
+        check=False,
+    )
+    # Exit 1 means "not ignored"; 0 is ignored and anything else is an error.
+    return proc.returncode != 1
+
+
 def inspect_workspace(
     store: Store,
     workspace_path: Path | None,
@@ -429,6 +471,16 @@ def inspect_workspace(
     invoking `git status`, `diff-files`, index refresh, hooks, or clean/smudge filters.
     Returns `(WorkspaceState, transient_gaps)`.
     """
+    # Compared case-insensitively because case-insensitive filesystems open `.GIT/config` as
+    # `.git/config`; any component counts so submodule `.git` dirs are covered too.
+    if target_path_bytes is not None and any(
+        part.lower() == b".git" for part in target_path_bytes.split(b"/")
+    ):
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Target path must not point inside a .git directory.",
+            retryable=False,
+        )
     if workspace_path is None:
         return (
             WorkspaceState(
@@ -716,6 +768,8 @@ def inspect_workspace(
     if head_entry_oid is None and staged_blob_oid is None:
         if wt_status == "ok":
             target_state = "untracked"
+            if _is_ignored(ws_root, target_path_bytes, empty_hooks):
+                working_hash = None
             gaps.append(
                 Gap(
                     id=None,
