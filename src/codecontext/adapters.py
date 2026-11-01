@@ -20,6 +20,7 @@ from codecontext.models import (
     ModelResponse,
 )
 
+MAX_MODEL_RESPONSE_BYTES = 8 * 1024 * 1024
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 _OPEN_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n?")
 _CLOSE_FENCE_RE = re.compile(r"\r?\n?[ \t]*```$")
@@ -132,6 +133,20 @@ def _retry_delay(
     return min(delay, max_sleep, room)
 
 
+def _read_capped(resp: httpx.Response, provider_label: str) -> bytes:
+    """Read the body, failing as soon as it passes MAX_MODEL_RESPONSE_BYTES."""
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in resp.iter_bytes():
+        size += len(chunk)
+        if size > MAX_MODEL_RESPONSE_BYTES:
+            raise _invalid_output(
+                provider_label, f"response exceeds {MAX_MODEL_RESPONSE_BYTES} bytes."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _post_json_with_retry(
     *,
     url: str,
@@ -165,12 +180,20 @@ def _post_json_with_retry(
                 raise timed_out
             last_try = attempt == max_retries
             try:
-                resp = client.post(
+                with client.stream(
+                    "POST",
                     url,
                     headers=headers,
                     json=json_body,
                     timeout=httpx.Timeout(max(0.05, remaining)),
-                )
+                ) as streamed:
+                    resp = streamed
+                    body = (
+                        _read_capped(streamed, provider_label)
+                        if 200 <= streamed.status_code < 300
+                        or streamed.status_code in passthrough_status_codes
+                        else b""
+                    )
             except httpx.TimeoutException:
                 delay = None if last_try else _retry_delay(
                     attempt, None, base_backoff=base_backoff, max_sleep=max_sleep, deadline=deadline
@@ -189,7 +212,7 @@ def _post_json_with_retry(
 
             status = resp.status_code
             if 200 <= status < 300 or status in passthrough_status_codes:
-                return resp
+                return httpx.Response(status, content=body)
             if status in (401, 403):
                 raise CodeContextError(
                     code="AUTH_REQUIRED",
