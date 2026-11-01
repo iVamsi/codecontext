@@ -241,9 +241,9 @@ def test_gitlab_incremental_sync_uses_updated_after_watermark(tmp_path: Path) ->
     issue_lists = [c for c in calls if "/issues?" in c]
     assert all("order_by=updated_at&sort=asc" in c for c in mr_lists + issue_lists)
     assert "updated_after" not in mr_lists[0]
-    assert mr_lists[1].endswith("&updated_after=2026-02-03T04%3A05%3A06Z")
+    assert mr_lists[1].endswith("&updated_after=2026-02-03T04%3A00%3A06Z")
     assert "updated_after" not in issue_lists[0]
-    assert issue_lists[1].endswith("&updated_after=2026-03-01T00%3A00%3A00Z")
+    assert issue_lists[1].endswith("&updated_after=2026-02-28T23%3A55%3A00Z")
 
     with store.connect_read() as conn:
         providers = {r[0] for r in conn.execute("SELECT DISTINCT provider FROM sources")}
