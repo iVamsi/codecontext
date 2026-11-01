@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from codecontext.identity import (
 from codecontext.store import Store, now_us
 
 GITLAB_REFRESH_OVERLAP_SECONDS = 300
+GITLAB_MAX_RETRY_AFTER_SECONDS = 60
 
 
 def detect_gitlab_repository_from_git(repo_path: Path) -> tuple[str, str] | None:
@@ -214,7 +216,7 @@ class GitLabClient:
         base_url: str = "https://gitlab.com",
         token: str | None = None,
         transport: httpx.BaseTransport | None = None,
-        sleep_fn: Any = time.sleep,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self._sleep_fn = sleep_fn
         ident = _gitlab_origin(base_url)
@@ -257,15 +259,18 @@ class GitLabClient:
                 message="Sync request budget exhausted before GitLab HTTP call.",
                 retryable=True,
             )
-        self.requests_attempted += 1
         target = path if path.startswith("/") else f"/{path}"
         transport_retried = False
         rate_limit_retried = False
+        attempts = 0
         while True:
+            attempts += 1
+            self.requests_attempted += 1
+            can_retry = attempts < remaining_requests
             try:
                 return self._get_once(target)
             except httpx.TransportError as exc:
-                if transport_retried:
+                if transport_retried or not can_retry:
                     raise CodeContextError(
                         code="IO_ERROR",
                         message=f"GitLab request failed ({type(exc).__name__}).",
@@ -273,7 +278,7 @@ class GitLabClient:
                     ) from None
                 transport_retried = True
             except _RateLimited as limited:
-                if rate_limit_retried or limited.delay is None:
+                if rate_limit_retried or not can_retry or limited.delay is None:
                     raise CodeContextError(
                         code="RATE_LIMITED",
                         message="GitLab API rate limit exceeded (429).",
@@ -293,7 +298,13 @@ class GitLabClient:
                 )
             if status == 429:
                 raw = (resp.headers.get("Retry-After") or "").strip()
-                raise _RateLimited(float(raw) if raw.isdigit() else None)
+                delay: float | None = None
+                if raw.isascii() and raw.isdigit():
+                    try:
+                        delay = float(min(int(raw), GITLAB_MAX_RETRY_AFTER_SECONDS))
+                    except ValueError:  # digit strings beyond the int-conversion limit
+                        delay = float(GITLAB_MAX_RETRY_AFTER_SECONDS)
+                raise _RateLimited(delay)
             if status == 403:
                 raise CodeContextError(
                     code="ACCESS_BLOCKED",

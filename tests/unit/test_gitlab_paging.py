@@ -1,8 +1,13 @@
 import httpx
 import pytest
 
+from codecontext.deadline import sync_deadline
 from codecontext.errors import CodeContextError
-from codecontext.gitlab import GitLabClient, collect_gitlab_merge_requests_and_issues
+from codecontext.gitlab import (
+    GITLAB_MAX_RETRY_AFTER_SECONDS,
+    GitLabClient,
+    collect_gitlab_merge_requests_and_issues,
+)
 from codecontext.models import InitRequest
 from codecontext.store import Store
 from tests.fixtures.builders import GitCommitSpec, commit_fixture_spec, init_fixture_repo
@@ -113,7 +118,8 @@ def test_late_visible_item_inside_overlap_is_ingested(tmp_path) -> None:
             assert collect_gitlab_merge_requests_and_issues(
                 store, client, project_path="group/app", remaining_requests=20
             )[3]
-        visible.append(late) if len(visible) == 1 else None
+        if len(visible) == 1:
+            visible.append(late)
     with store.connect_read() as conn:
         row = conn.execute("SELECT 1 FROM sources WHERE kind = 'pull_request' AND provider_id = '2'").fetchone()
     assert row is not None
@@ -171,3 +177,62 @@ def test_transport_error_retried_once() -> None:
         with pytest.raises(CodeContextError) as err:
             client.get_json("/projects/1")
     assert err.value.code == "IO_ERROR"
+
+
+def test_transport_retry_counts_against_budget() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    with _client(handler) as client:
+        with pytest.raises(CodeContextError):
+            client.get_json("/projects/1")
+        assert client.requests_attempted == 2
+    with _client(handler) as client:
+        with pytest.raises(CodeContextError):
+            client.get_json("/projects/1", remaining_requests=1)
+        assert client.requests_attempted == 1
+
+
+def test_second_429_after_retry_is_rate_limited() -> None:
+    sleeps: list[float] = []
+    with _client(lambda _r: httpx.Response(429, headers={"Retry-After": "1"}), sleeps) as client:
+        with pytest.raises(CodeContextError) as err:
+            client.get_json("/projects/1")
+    assert err.value.code == "RATE_LIMITED"
+    assert sleeps == [1]
+    assert client.requests_attempted == 2
+
+
+def test_429_without_budget_for_retry_does_not_sleep() -> None:
+    sleeps: list[float] = []
+    with _client(lambda _r: httpx.Response(429, headers={"Retry-After": "1"}), sleeps) as client:
+        with pytest.raises(CodeContextError) as err:
+            client.get_json("/projects/1", remaining_requests=1)
+    assert err.value.code == "RATE_LIMITED"
+    assert sleeps == []
+
+
+def test_retry_after_non_ascii_digit_is_rate_limited() -> None:
+    sleeps: list[float] = []
+    with _client(lambda _r: httpx.Response(429, headers={"Retry-After": "\u00b2".encode()}), sleeps) as client:
+        with pytest.raises(CodeContextError) as err:
+            client.get_json("/projects/1")
+    assert err.value.code == "RATE_LIMITED"
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("value", ["9" * 400, "86400"])
+def test_retry_after_is_clamped(value: str) -> None:
+    sleeps: list[float] = []
+    responses = iter([httpx.Response(429, headers={"Retry-After": value}), httpx.Response(200, json=[])])
+    with _client(lambda _r: next(responses), sleeps) as client:
+        client.get_json("/projects/1")
+    assert sleeps == [GITLAB_MAX_RETRY_AFTER_SECONDS]
+
+
+def test_retry_after_is_capped_by_remaining_deadline() -> None:
+    sleeps: list[float] = []
+    responses = iter([httpx.Response(429, headers={"Retry-After": "50"}), httpx.Response(200, json=[])])
+    with sync_deadline(5), _client(lambda _r: next(responses), sleeps) as client:
+        client.get_json("/projects/1")
+    assert 0 < sleeps[0] <= 5
