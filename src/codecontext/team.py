@@ -522,6 +522,20 @@ def _matching_store(dest: Path, repository_id: str) -> bool:
     return True
 
 
+def _db_file_stamps(store_path: Path) -> tuple[tuple[int, int] | None, ...]:
+    """`(size, mtime_ns)` of the database and its WAL. Many writes leave `generation` alone, so
+    join compares these too before replacing a store it read earlier."""
+    stamps: list[tuple[int, int] | None] = []
+    for name in ("memory.sqlite3", "memory.sqlite3-wal"):
+        try:
+            st = os.stat(store_path / name)
+        except FileNotFoundError:
+            stamps.append(None)
+        else:
+            stamps.append((st.st_size, st.st_mtime_ns))
+    return tuple(stamps)
+
+
 def _rebind(store_path: Path, repo_path: Path, *, floor_generation: int = 0) -> None:
     """Point the store at `repo_path` and move its generation past `floor_generation`.
 
@@ -597,6 +611,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
         )
 
     local_gen: int | None = None
+    local_files: tuple[tuple[int, int] | None, ...] | None = None
     if dest.exists():
         if not _dir_is_empty(dest):
             if not _matching_store(dest, str(team["repository_id"])):
@@ -610,6 +625,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                 local_gen = _store_generation(existing)
             finally:
                 existing.close()
+            local_files = _db_file_stamps(dest)
             local_published = None
             local_team = dest / TEAM_FILE
             if local_team.is_file() and not local_team.is_symlink():
@@ -642,7 +658,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                     with existing.acquire_writer_lock(
                         timeout_seconds=remaining_timeout(SWAP_LOCK_TIMEOUT_SECONDS), allow_read_only=True
                     ):
-                        if _store_generation(existing) != local_gen:
+                        if _store_generation(existing) != local_gen or _db_file_stamps(dest) != local_files:
                             raise CodeContextError(
                                 code="STORE_BUSY",
                                 message="This store changed while joining, so nothing was replaced. Run join again.",

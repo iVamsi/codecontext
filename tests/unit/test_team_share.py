@@ -378,6 +378,34 @@ def test_join_does_not_serve_the_replaced_stores_cached_graph(tmp_path) -> None:
     assert ancestors
 
 
+def test_join_notices_a_write_that_does_not_bump_generation(tmp_path, monkeypatch) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    (store_b / "team.json").unlink()
+    real_import_share = team._import_share
+
+    def import_then_write_locally(*args, **kwargs):
+        real_import_share(*args, **kwargs)
+        local = Store.open(store_b)
+        try:
+            with local.write_transaction(bump_generation=False) as conn:
+                conn.execute(
+                    "INSERT INTO checkpoints (stream_key, cursor_json, last_success_at_us)"
+                    " VALUES ('test:stream', '{}', 1)"
+                )
+        finally:
+            local.close()
+
+    monkeypatch.setattr(team, "_import_share", import_then_write_locally)
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "STORE_BUSY"
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        assert conn.execute(
+            "SELECT 1 FROM checkpoints WHERE stream_key = 'test:stream'"
+        ).fetchone() is not None
+
+
 def test_join_refuses_when_replaced_backup_exists(tmp_path) -> None:
     share, store_b, repo_b = _join_setup(tmp_path)
     execute_join(store_b, share, repo_b)
