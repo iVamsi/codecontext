@@ -193,9 +193,12 @@ def test_merge_rejects_share_with_newer_schema(tmp_path) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     with sqlite3.connect(share / "memory.sqlite3") as conn:
         conn.execute("UPDATE store_meta SET schema_version = 99")
+    objs = store_b / "repository.git" / "objects"
+    before = sorted(str(p) for p in objs.rglob("*"))
     with pytest.raises(CodeContextError) as exc:
         execute_team_merge(store_b, share, repo_b)
     assert exc.value.code == "INVALID_REQUEST"
+    assert sorted(str(p) for p in objs.rglob("*")) == before
 
 
 def test_merge_does_not_copy_alternates(tmp_path) -> None:
@@ -205,3 +208,34 @@ def test_merge_does_not_copy_alternates(tmp_path) -> None:
     (info / "alternates").write_text("/elsewhere/objects\n", encoding="utf-8")
     execute_team_merge(store_b, share, repo_b)
     assert not (store_b / "repository.git" / "objects" / "info" / "alternates").exists()
+
+
+def test_merge_evidence_pointing_at_new_change_and_hunk_has_no_dangling_fk(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "c" * 64, "evidence needs its change")
+    oid = "d" * 40
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute(
+            "INSERT INTO commits (oid, tree_oid, message, first_seen_at_us) VALUES (?, ?, 'm', 1)",
+            (oid, "e" * 40),
+        )
+        conn.execute(
+            "INSERT INTO changes (id, commit_oid, parent_index, change_kind) VALUES ('chg_x', ?, 0, 'M')",
+            (oid,),
+        )
+        conn.execute(
+            "INSERT INTO hunks (id, change_id, ordinal, old_start, old_count, new_start, new_count)"
+            " VALUES ('hunk_x', 'chg_x', 0, 1, 1, 1, 1)"
+        )
+        conn.execute(
+            "INSERT INTO evidence (id, kind, anchor_json, content_sha256)"
+            " VALUES ('ev_x', 'hunk', '{\"hunk_id\": \"hunk_x\"}', 'h')"
+        )
+        conn.execute(
+            "INSERT INTO claim_evidence (claim_id, evidence_id, role) VALUES (?, 'ev_x', 'support')",
+            ("claim_" + "c" * 64,),
+        )
+    execute_team_merge(store_b, share, repo_b)
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM hunks WHERE id = 'hunk_x'").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

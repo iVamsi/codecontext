@@ -497,6 +497,11 @@ MERGE_TABLE_ORDER: tuple[str, ...] = (
     "evidence",
     "model_runs",
     "commits",
+    "changes",
+    "hunks",
+    "extractions",
+    "symbols",
+    "syntax_occurrences",
     "episodes",
     "claims",
     "claim_evidence",
@@ -631,6 +636,12 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
     if not share_db_path.is_file() or share_db_path.is_symlink():
         raise CodeContextError(code="STORE_NOT_INITIALIZED", message="Shared memory is missing memory.sqlite3.", retryable=False)
 
+    schema_conn = sqlite3.connect(f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro", uri=True)
+    try:
+        _require_supported_share_schema(schema_conn)
+    finally:
+        schema_conn.close()
+
     share_git_objs = share / "repository.git" / "objects"
     local_git_objs = dest / "repository.git" / "objects"
     git_objs_copied = False
@@ -648,8 +659,9 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
         share_uri = f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro"
         share_conn = sqlite3.connect(share_uri, uri=True)
         try:
-            _require_supported_share_schema(share_conn)
             with local_store.write_transaction(bump_generation=True) as conn:
+                # symbols reference their parent symbol; rows arrive in arbitrary order.
+                conn.execute("PRAGMA defer_foreign_keys = ON")
                 counts: dict[str, int] = {}
                 for tbl in MERGE_TABLE_ORDER:
                     cols = _merge_columns(conn, share_conn, tbl)
