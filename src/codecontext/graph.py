@@ -251,7 +251,10 @@ _bounded_by_graph_time_limit = _time_limited(lambda: GRAPH_TOOL_MAX_SECONDS)
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
 
 
-MAX_VARIABLE_QUANTIFIERS = 2
+# Each variable quantifier or alternation is a point where the matcher can choose, and
+# chained choice points multiply backtracking: `(?:a|aa)` repeated 24 times takes seconds on
+# 48 chars, and two quantifiers already backtrack cubically. Two in total keeps it polynomial.
+MAX_AMBIGUOUS_CONSTRUCTS = 2
 # Even two variable quantifiers backtrack cubically (`\w*\w+!` takes ~0.1 s on 512 chars and
 # ~0.75 s on 1024), and a Python regex inside a SQLite UDF cannot be interrupted, so cap the text.
 MAX_REGEX_SUBJECT_CHARS = 512
@@ -283,9 +286,15 @@ def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
 
 
 def _regex_can_backtrack(pattern: str) -> bool:
-    """Reject a quantified group holding `|` or a quantifier, and too many variable quantifiers."""
+    """Reject a quantified group holding `|` or a quantifier, and too many ambiguous constructs.
+
+    Ambiguous constructs are variable quantifiers and alternations: each group with its own
+    top-level `|` counts once, as does a top-level `|` in the pattern itself.
+    """
+    # Each entry is [has_alt (own or nested), has_quant, has_own_alt].
     stack: list[list[bool]] = []
-    variable_count = 0
+    ambiguous_count = 0
+    top_level_alt = False
     i = 0
     n = len(pattern)
     while i < n:
@@ -307,20 +316,27 @@ def _regex_can_backtrack(pattern: str) -> bool:
             i += 1
             continue
         if char == "(":
-            stack.append([False, False])
+            stack.append([False, False, False])
             i += 1
             # `(?:`, `(?P<name>` and inline flags start with `?`, which is not a quantifier here.
             if i < n and pattern[i] == "?":
                 i += 1
             continue
-        if char == "|" and stack:
-            stack[-1][0] = True
+        if char == "|":
+            if stack:
+                stack[-1][0] = True
+                if not stack[-1][2]:
+                    stack[-1][2] = True
+                    ambiguous_count += 1
+            elif not top_level_alt:
+                top_level_alt = True
+                ambiguous_count += 1
             i += 1
             continue
         if char == ")" and stack:
-            has_alt, has_quant = stack.pop()
+            has_alt, has_quant, _ = stack.pop()
             i, quantified, variable = _read_quantifier(pattern, i + 1)
-            variable_count += variable
+            ambiguous_count += variable
             if quantified and (has_alt or has_quant):
                 return True
             if stack and has_alt:
@@ -330,17 +346,17 @@ def _regex_can_backtrack(pattern: str) -> bool:
             continue
         next_i, quantified, variable = _read_quantifier(pattern, i)
         if quantified:
-            variable_count += variable
+            ambiguous_count += variable
             if stack:
                 stack[-1][1] = True
             i = next_i
             continue
         i += 1
-    return variable_count > MAX_VARIABLE_QUANTIFIERS
+    return ambiguous_count > MAX_AMBIGUOUS_CONSTRUCTS
 
 
 def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
-    """Compile a user regex, rejecting backreferences, lookaround, and quantifier shapes that can backtrack."""
+    """Compile a user regex, rejecting backreferences, lookaround, and shapes that can backtrack."""
     if len(pattern) > max_length:
         raise CodeContextError(
             code="INVALID_REQUEST",
@@ -352,7 +368,7 @@ def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str
             code="INVALID_REQUEST",
             message=(
                 "Unsafe regex pattern rejected (nested quantifiers, more than "
-                f"{MAX_VARIABLE_QUANTIFIERS} variable quantifiers, lookarounds, "
+                f"{MAX_AMBIGUOUS_CONSTRUCTS} variable quantifiers or alternations, lookarounds, "
                 "or backreferences are forbidden)."
             ),
             retryable=False,
