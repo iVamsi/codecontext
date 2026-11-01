@@ -9,7 +9,7 @@ from codecontext.git import GitMirror
 from codecontext.memory import Memory
 from codecontext.models import InitRequest, SearchRequest, SyncRequest
 from codecontext.store import Store
-from codecontext.team import project_remote_key
+from codecontext.team import execute_team_merge, project_remote_key
 from tests.fixtures.builders import (
     GitCommitSpec,
     commit_fixture_spec,
@@ -137,3 +137,71 @@ def test_concurrent_readers_leave_runtime_directory_untouched(tmp_path) -> None:
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(read_store, range(4)))
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def _merge_setup(tmp_path):
+    origin = "https://github.com/acme/widget.git"
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    _repo(repo_a, origin, b"def hello():\n    return 1\n")
+    _repo(repo_b, origin, b"def hello():\n    return 1\n")
+    share = tmp_path / "share"
+    with Memory.initialize(tmp_path / "store-a", InitRequest(repo_path=repo_a)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        mem.publish(share)
+    store_b = repo_b / ".codecontext"
+    Memory.join(store_b, share, repo_b)
+    return share, store_b, repo_b
+
+
+def _add_decision(share, claim_id: str, text: str) -> None:
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute(
+            "INSERT INTO model_runs VALUES ('mr1','fp','rq',1,'completed',1,1,1,1,NULL,NULL,1,1)"
+        )
+        conn.execute("INSERT INTO episodes VALUES ('ep1','commit',NULL,NULL,'fp','complete',1)")
+        conn.execute(
+            "INSERT INTO claims (id, episode_id, model_run_id, statement, rationale, support,"
+            " lifecycle, state, created_at_us) VALUES (?, 'ep1', 'mr1', ?, 'because', 'direct',"
+            " 'active', 'ready', 1)",
+            (claim_id, text),
+        )
+
+
+def test_merge_claim_with_new_episode_succeeds_and_is_searchable(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "a" * 64, "adopt zebra caching strategy")
+    report = execute_team_merge(store_b, share, repo_b)
+    assert report.claims_merged == 1
+    with Memory.open(store_b) as mem:
+        hits = mem.search(SearchRequest(query="zebra caching", kind="decision")).hits
+    assert any(h.id == "claim_" + "a" * 64 for h in hits)
+
+
+def test_merge_ignores_injected_share_column(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute('ALTER TABLE claims ADD COLUMN "x) --" TEXT')
+    _add_decision(share, "claim_" + "b" * 64, "ignore injected columns")
+    execute_team_merge(store_b, share, repo_b)
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        assert "x) --" not in [r[1] for r in conn.execute("PRAGMA table_info(claims)")]
+        assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 1
+
+
+def test_merge_rejects_share_with_newer_schema(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute("UPDATE store_meta SET schema_version = 99")
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
+def test_merge_does_not_copy_alternates(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    info = share / "repository.git" / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text("/elsewhere/objects\n", encoding="utf-8")
+    execute_team_merge(store_b, share, repo_b)
+    assert not (store_b / "repository.git" / "objects" / "info" / "alternates").exists()

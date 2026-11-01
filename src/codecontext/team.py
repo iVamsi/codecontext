@@ -16,9 +16,16 @@ from pathlib import Path
 from codecontext.archive import execute_export, sanitized_bare_git_config
 from codecontext.errors import CodeContextError
 from codecontext.git import run_safe_git
-from codecontext.identity import datetime_to_us, parse_iso_utc, sha256_bytes, us_to_iso_z
+from codecontext.identity import (
+    canonical_json,
+    datetime_to_us,
+    parse_iso_utc,
+    sha256_bytes,
+    us_to_iso_z,
+)
 from codecontext.models import ExportReport, ExportRequest, TeamMergeReport
-from codecontext.store import Store, inspect_local_git_repository, now_us
+from codecontext.store import SCHEMA_VERSION, Store, inspect_local_git_repository, now_us
+from codecontext.syntax import normalize_search_text
 
 TEAM_FILE = "team.json"
 
@@ -286,6 +293,8 @@ def _copy_regular_tree(src: Path, dst: Path) -> None:
             _refuse_symlink(child, "Shared snapshot contains a symlink.")
             if not child.is_file():
                 continue
+            if name == "alternates" and current.name == "info" and current.parent == dst:
+                continue
             dest_file = current / name
             if dest_file.exists():
                 continue
@@ -482,6 +491,111 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
         raise
 
 
+MERGE_TABLE_ORDER: tuple[str, ...] = (
+    "sources",
+    "source_versions",
+    "evidence",
+    "model_runs",
+    "commits",
+    "episodes",
+    "claims",
+    "claim_evidence",
+    "dependencies",
+    "relations",
+    "summaries",
+)
+
+
+def _merge_columns(local: sqlite3.Connection, share: sqlite3.Connection, table: str) -> list[str]:
+    """Columns present in both databases, double-quoted. Column names from the share are untrusted."""
+    local_cols = {row[1] for row in local.execute(f'PRAGMA table_info("{table}")')}
+    return [
+        '"' + row[1].replace('"', '""') + '"'
+        for row in share.execute(f'PRAGMA table_info("{table}")')
+        if row[1] in local_cols
+    ]
+
+
+def _require_supported_share_schema(share: sqlite3.Connection) -> None:
+    try:
+        row = share.execute("SELECT schema_version FROM store_meta WHERE singleton = 1").fetchone()
+    except sqlite3.Error as exc:
+        raise CodeContextError(
+            code="INVALID_REQUEST", message="Shared memory has no readable store_meta.", retryable=False
+        ) from exc
+    if row is None or not isinstance(row[0], int) or row[0] > SCHEMA_VERSION:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="Shared memory was written by a newer version of codecontext. Upgrade before merging.",
+            retryable=False,
+        )
+
+
+def _index_merged_records(conn: sqlite3.Connection, share: sqlite3.Connection) -> None:
+    """Add search rows for ready claims and summaries that came from the share."""
+    claim_ids = [r[0] for r in share.execute("SELECT id FROM claims WHERE state = 'ready'")]
+    for claim_id in claim_ids:
+        row = conn.execute(
+            "SELECT episode_id, statement, rationale, alternatives_json, constraints_json, support, lifecycle"
+            " FROM claims WHERE id = ? AND state = 'ready'",
+            (claim_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        episode_id, statement, rationale, alts, constraints, support, lifecycle = row
+        meta = canonical_json(
+            {
+                "display_title": statement[:200],
+                "episode_id": episode_id,
+                "lifecycle": lifecycle,
+                "snippet": (rationale or statement)[:320],
+                "support": support,
+            }
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO search_documents"
+            " (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)"
+            " VALUES ('decision', ?, 0, ?, ?, ?, ?)",
+            (
+                claim_id,
+                normalize_search_text(statement),
+                normalize_search_text(" ".join(json.loads(constraints))),
+                normalize_search_text(f"{statement} {rationale or ''} {' '.join(json.loads(alts))}"),
+                meta,
+            ),
+        )
+    summary_ids = [r[0] for r in share.execute("SELECT id FROM summaries WHERE state = 'ready'")]
+    for summary_id in summary_ids:
+        row = conn.execute(
+            "SELECT scope_kind, scope_id, revision, text FROM summaries WHERE id = ? AND state = 'ready'",
+            (summary_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        scope_kind, scope_id, revision, text = row
+        meta = canonical_json(
+            {
+                "display_title": f"Summary ({scope_kind}: {scope_id})",
+                "revision": revision,
+                "scope_id": scope_id,
+                "scope_kind": scope_kind,
+                "snippet": text[:320],
+            }
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO search_documents"
+            " (record_kind, record_id, chunk_ordinal, title, identifiers, body, metadata_json)"
+            " VALUES ('summary', ?, 0, ?, ?, ?, ?)",
+            (
+                summary_id,
+                normalize_search_text(f"{scope_kind} {scope_id}"),
+                normalize_search_text(scope_id),
+                normalize_search_text(text),
+                meta,
+            ),
+        )
+
+
 def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> TeamMergeReport:
     """Non-destructive record-level union merge of a shared team memory into an existing local store."""
     raw_share = share_dir.expanduser()
@@ -534,43 +648,28 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
         share_uri = f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro"
         share_conn = sqlite3.connect(share_uri, uri=True)
         try:
-            tables = [
-                "sources",
-                "source_versions",
-                "commits",
-                "changes",
-                "hunks",
-                "extractions",
-                "symbols",
-                "syntax_occurrences",
-                "relations",
-                "claims",
-                "summaries",
-                "episodes",
-            ]
+            _require_supported_share_schema(share_conn)
             with local_store.write_transaction(bump_generation=True) as conn:
-                for tbl in tables:
-                    c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                    col_rows = share_conn.execute(f"PRAGMA table_info({tbl})").fetchall()
-                    cols = [c[1] for c in col_rows]
+                counts: dict[str, int] = {}
+                for tbl in MERGE_TABLE_ORDER:
+                    cols = _merge_columns(conn, share_conn, tbl)
+                    if not cols:
+                        continue
                     col_names = ", ".join(cols)
                     placeholders = ", ".join("?" for _ in cols)
+                    c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                     rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
                     if rows:
                         conn.executemany(
                             f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
                             rows,
                         )
-                    c_after = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                    diff = c_after - c_before
-                    if tbl == "sources":
-                        sources_merged = diff
-                    elif tbl == "source_versions":
-                        source_versions_merged = diff
-                    elif tbl == "claims":
-                        claims_merged = diff
-                    elif tbl == "summaries":
-                        summaries_merged = diff
+                    counts[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] - c_before
+                _index_merged_records(conn, share_conn)
+                sources_merged = counts.get("sources", 0)
+                source_versions_merged = counts.get("source_versions", 0)
+                claims_merged = counts.get("claims", 0)
+                summaries_merged = counts.get("summaries", 0)
         finally:
             share_conn.close()
 
