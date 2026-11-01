@@ -400,6 +400,7 @@ def test_interrupted_initial_fetch_resumes_in_depth_steps(
             assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 5
         mem.sync(SyncRequest(offline=True))
         assert fetches[-1] == "full"
+        assert not (mem._mirror.git_dir / git.FETCH_RESUME_MARKER).exists()
 
 
 def test_one_failing_commit_does_not_block_others(
@@ -458,6 +459,72 @@ def test_one_failing_commit_does_not_block_others(
         assert job_rows()[bad]["state"] == "complete"
         assert not any(g.code == "IO_ERROR" for g in recovered.gaps)
         assert recovered.coverage.git.state == "complete"
+
+
+def test_unexpected_error_in_one_commit_does_not_block_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codecontext import sync
+
+    repo = _linear_repo(tmp_path / "repo", 3)
+    bad = run_git_fixture(repo, ["rev-parse", "HEAD~1"]).decode().strip()
+    original = sync.index_commit_changes_and_hunks
+
+    def failing(store, mirror, commit_oid, **kwargs):
+        if commit_oid == bad:
+            raise ValueError("unexpected")
+        return original(store, mirror, commit_oid, **kwargs)
+
+    monkeypatch.setattr(sync, "index_commit_changes_and_hunks", failing)
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        report = mem.sync(SyncRequest(offline=True))
+        assert report.stop_reason != "time_budget"
+        with mem._store.connect_read() as conn:
+            jobs = {
+                r["owner_id"]: r
+                for r in conn.execute("SELECT * FROM jobs WHERE kind = 'git_commit_diff'")
+            }
+        assert jobs[bad]["state"] == "pending" and jobs[bad]["last_error_code"] == "INTERNAL"
+        assert sum(r["state"] == "complete" for r in jobs.values()) == len(jobs) - 1
+
+
+def test_missing_parent_skip_waits_for_every_parent(tmp_path: Path) -> None:
+    from codecontext.store import Store
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Base", files={"a.py": b"def a(): pass\n"}))
+    run_git_fixture(repo, ["checkout", "-b", "side"])
+    commit_fixture_spec(repo, GitCommitSpec(message="Side", files={"s.py": b"def s(): pass\n"}))
+    run_git_fixture(repo, ["checkout", "main"])
+    commit_fixture_spec(repo, GitCommitSpec(message="Main", files={"m.py": b"def m(): pass\n"}))
+    run_git_fixture(repo, ["merge", "--no-ff", "side", "-m", "Merge"])
+    merge = run_git_fixture(repo, ["rev-parse", "HEAD"]).decode().strip()
+    with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
+        mem.sync(SyncRequest(offline=True))
+        store = mem._store
+
+        def merge_queued(second_parent: str) -> bool:
+            with store.write_transaction() as conn:
+                conn.execute(
+                    "UPDATE commit_parents SET parent_oid = ? WHERE commit_oid = ? AND parent_index = 1",
+                    (second_parent, merge),
+                )
+                conn.execute("UPDATE commits SET diff_state = 'partial' WHERE oid = ?", (merge,))
+                conn.execute("DELETE FROM jobs WHERE owner_id = ?", (merge,))
+                Store.upsert_gap(
+                    conn,
+                    repository_id=store.config.repository_id,
+                    code="MISSING_PARENT",
+                    scope=f"git:commit:{merge}",
+                    message="missing",
+                    retryable=True,
+                )
+                Store.enqueue_pending_diff_jobs(conn)
+                return conn.execute("SELECT 1 FROM jobs WHERE owner_id = ?", (merge,)).fetchone() is not None
+
+        side = run_git_fixture(repo, ["rev-parse", "side"]).decode().strip()
+        assert not merge_queued("f" * 40)
+        assert merge_queued(side)
 
 
 def test_shallow_boundary_not_rediffed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

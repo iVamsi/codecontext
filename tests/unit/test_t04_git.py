@@ -193,3 +193,73 @@ def test_f09_unusual_paths_and_folded_commit_headers(tmp_path: Path) -> None:
     assert exc_info.value.code == "IO_ERROR"
 
     store.close()
+
+
+def test_diff_tree_batch_matches_per_commit_diffs(tmp_path: Path) -> None:
+    """The batched `-M` diff must yield the same raw changes and moves as the per-commit path."""
+    from codecontext.lineage import _changes_and_moves
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    big = b"".join(f"line {i}\n".encode() for i in range(40))
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(
+            message="Root",
+            files={"a.py": b"a\n", "b.py": b"same\n", "big.py": big, "m.txt": b"m\n", "d": b"d\n"},
+        ),
+    )
+    commit_fixture_spec(
+        repo, GitCommitSpec(message="Exact", files={"a.py": None, "a2.py": b"a\n", "m.txt": b"m2\n"})
+    )
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(message="Edited", files={"big.py": None, "big2.py": big + b"tail\n"}),
+    )
+    commit_fixture_spec(
+        repo,
+        GitCommitSpec(message="Ambiguous", files={"b.py": None, "c1.py": b"same\n", "c2.py": b"same\n"}),
+    )
+    commit_fixture_spec(repo, GitCommitSpec(message="Dir", files={"d": None, "d/x": b"d\n"}))
+    commit_fixture_spec(repo, GitCommitSpec(message="Empty", files={}))
+    run_git_fixture(repo, ["checkout", "-b", "side", "HEAD~2"])
+    commit_fixture_spec(
+        repo, GitCommitSpec(message="Side", files={"m.txt": None, "moved.txt": b"m2\n", "s.py": b"s\n"})
+    )
+    run_git_fixture(repo, ["checkout", "main"])
+    run_git_fixture(repo, ["merge", "--no-ff", "side", "-m", "Merge"])
+
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    try:
+        mirror.prepare_snapshot("HEAD")
+        pairs: list[tuple[str, str | None]] = []
+        for line in run_git_fixture(repo, ["rev-list", "--parents", "--all"]).decode().splitlines():
+            oids = line.split()
+            pairs.append((oids[0], oids[1] if len(oids) > 1 else None))
+        assert len(pairs) == 8
+        batched = mirror.diff_tree_batch(pairs)
+        assert set(batched) == {c for c, _ in pairs}
+        saw_rename = False
+        for commit, parent in pairs:
+            idx = -1 if parent is None else 0
+            expected = _changes_and_moves(mirror, parent, commit, idx, None)
+            assert _changes_and_moves(mirror, parent, commit, idx, batched[commit]) == expected
+            saw_rename = saw_rename or bool(expected[1])
+        assert saw_rename
+    finally:
+        mirror.close()
+        store.close()
+
+
+def test_diff_tree_batch_rejects_non_oid(tmp_path: Path) -> None:
+    f03 = build_f03_fixture(tmp_path / "f03")
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=f03.repo_dir))
+    mirror = GitMirror(store)
+    try:
+        for bad in [(f03.merge_oid + "\n", None), (f03.merge_oid, "HEAD")]:
+            with pytest.raises(CodeContextError) as exc:
+                mirror.diff_tree_batch([bad])
+            assert exc.value.code == "INVALID_REQUEST"
+    finally:
+        mirror.close()
+        store.close()

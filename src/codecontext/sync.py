@@ -21,7 +21,11 @@ from codecontext.gitlab import (
     detect_gitlab_repository_from_git,
 )
 from codecontext.identity import us_to_iso_z
-from codecontext.lineage import index_commit_changes_and_hunks, index_focused_path_history
+from codecontext.lineage import (
+    diff_first_parents,
+    index_commit_changes_and_hunks,
+    index_focused_path_history,
+)
 from codecontext.models import PathTarget, SymbolTarget, SyncReport, SyncRequest
 from codecontext.store import Store, now_us
 from codecontext.syntax import index_active_snapshot_files
@@ -111,6 +115,9 @@ def _drain_commit_diff_jobs(
         if not jobs:
             return True
         with mirror.open_batch_session() as batch, store.write_transaction(bump_generation=True) as conn:
+            p0_by_commit = diff_first_parents(
+                conn, mirror, batch, [str(job["owner_id"]) for job in jobs]
+            )
             for job in jobs:
                 check_deadline()
                 if time.monotonic() >= deadline_mono:
@@ -120,7 +127,12 @@ def _drain_commit_diff_jobs(
                 try:
                     with store.write_transaction(bump_generation=True) as job_conn:
                         index_commit_changes_and_hunks(
-                            store, mirror, commit_oid, batch=batch, conn=job_conn
+                            store,
+                            mirror,
+                            commit_oid,
+                            batch=batch,
+                            conn=job_conn,
+                            p0_changes=p0_by_commit.get(commit_oid),
                         )
                         job_conn.execute(
                             "UPDATE jobs SET state = 'complete', updated_at_us = ? WHERE id = ?",
@@ -129,9 +141,14 @@ def _drain_commit_diff_jobs(
                         Store.resolve_gaps_in_scope(
                             job_conn, scope=f"git:commit:{commit_oid}", code="IO_ERROR"
                         )
+                except SyncDeadlineExceeded:
+                    raise
                 except CodeContextError as exc:
                     failed_this_sync.append(job_id)
                     _record_diff_job_failure(store, conn, job_id, commit_oid, exc.code)
+                except Exception:
+                    failed_this_sync.append(job_id)
+                    _record_diff_job_failure(store, conn, job_id, commit_oid, "INTERNAL")
 
 
 def _record_diff_job_failure(

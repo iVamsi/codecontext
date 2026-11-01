@@ -40,6 +40,20 @@ STATUS_TO_CHANGE_KIND: dict[str, str] = {
 }
 
 
+def _quote_stdin_path(path: bytes) -> bytes:
+    """C-quote a path for a newline-separated `--stdin-paths` list when it would not survive
+    as one literal line."""
+    if b"\n" not in path and b"\r" not in path and not path.startswith(b'"'):
+        return path
+    escaped = (
+        path.replace(b"\\", b"\\\\")
+        .replace(b'"', b'\\"')
+        .replace(b"\n", b"\\n")
+        .replace(b"\r", b"\\r")
+    )
+    return b'"' + escaped + b'"'
+
+
 def validate_revision_arg(revision: str) -> str:
     if not revision or len(revision) > 1024:
         raise CodeContextError(
@@ -367,24 +381,43 @@ def parse_diff_tree_raw_z(
     parent_oid: str | None,
 ) -> list[RawChange]:
     """Parse `git diff-tree --no-commit-id --raw -r -z --no-abbrev ...` output."""
-    if not raw_stdout:
-        return []
-    tokens = raw_stdout.split(b"\x00")
+    tokens = _split_z_tokens(raw_stdout)
+    changes, end = _parse_raw_z_records(tokens, 0, parent_index=parent_index, parent_oid=parent_oid)
+    if end != len(tokens):
+        raise CodeContextError(
+            code="IO_ERROR",
+            message="Malformed diff-tree metadata token.",
+            retryable=False,
+        )
+    return changes
+
+
+def _split_z_tokens(raw_stdout: bytes) -> list[bytes]:
+    tokens = raw_stdout.split(b"\x00") if raw_stdout else []
     if tokens and tokens[-1] == b"":
         tokens.pop()
+    return tokens
 
+
+def _parse_raw_z_records(
+    tokens: list[bytes],
+    start: int,
+    *,
+    parent_index: int,
+    parent_oid: str | None,
+) -> tuple[list[RawChange], int]:
+    """Parse raw records from `tokens[start:]` up to the first token that is not a `:` record.
+    Returns the changes and the index of that token. Path tokens are consumed by position, so a
+    path that looks like an OID is never mistaken for a `--stdin` commit header.
+    """
     changes: list[RawChange] = []
-    i = 0
+    i = start
     n = len(tokens)
     while i < n:
         meta_tok = tokens[i]
-        i += 1
         if not meta_tok.startswith(b":"):
-            raise CodeContextError(
-                code="IO_ERROR",
-                message="Malformed diff-tree metadata token.",
-                retryable=False,
-            )
+            break
+        i += 1
         meta_str = meta_tok[1:].decode("ascii", errors="strict")
         parts = meta_str.split(" ")
         if len(parts) < 5:
@@ -447,7 +480,7 @@ def parse_diff_tree_raw_z(
                 new_path=new_path,
             )
         )
-    return changes
+    return changes, i
 
 
 def _split_git_lines(raw_bytes: bytes | None) -> list[bytes]:
@@ -1250,6 +1283,63 @@ class GitMirror:
         )
         return parse_diff_tree_raw_z(proc.stdout, parent_index=parent_index, parent_oid=parent_oid)
 
+    def diff_tree_batch(self, commits: list[tuple[str, str | None]]) -> dict[str, list[RawChange]]:
+        """Diff each `(commit, first_parent)` pair (`None` parent: against the empty tree) with one
+        `git diff-tree --stdin` process. Renames use the same `-M50% -l200` detection as the
+        per-commit similarity pass, so callers get raw changes and rename candidates together.
+        """
+        if not commits:
+            return {}
+        parents: dict[str, str | None] = {}
+        lines: list[bytes] = []
+        for commit_oid, parent_oid in commits:
+            for oid in (commit_oid, parent_oid):
+                if oid is not None and not HEX_OID_RE.fullmatch(oid):
+                    raise CodeContextError(
+                        code="INVALID_REQUEST",
+                        message=f"Invalid Git object ID for diff-tree: {oid!r}",
+                        retryable=False,
+                    )
+            parents[commit_oid] = parent_oid
+            line = commit_oid if parent_oid is None else f"{commit_oid} {parent_oid}"
+            lines.append(line.encode("ascii") + b"\n")
+        proc = run_safe_git(
+            [
+                "diff-tree",
+                "--stdin",
+                "--root",
+                "--always",
+                "--raw",
+                "-r",
+                "-z",
+                "--no-abbrev",
+                "-M50%",
+                "-l200",
+            ],
+            git_dir=self.git_dir,
+            empty_hooks_dir=self.empty_hooks_dir,
+            stdin_bytes=b"".join(lines),
+        )
+        tokens = _split_z_tokens(proc.stdout)
+        result: dict[str, list[RawChange]] = {}
+        i = 0
+        while i < len(tokens):
+            commit_oid = tokens[i].decode("ascii", errors="replace")
+            if commit_oid not in parents:
+                raise CodeContextError(
+                    code="IO_ERROR",
+                    message="Unexpected commit header in diff-tree --stdin output.",
+                    retryable=False,
+                )
+            parent_oid = parents[commit_oid]
+            result[commit_oid], i = _parse_raw_z_records(
+                tokens,
+                i + 1,
+                parent_index=-1 if parent_oid is None else 0,
+                parent_oid=parent_oid,
+            )
+        return result
+
     def diff_blobs_unified_zero(self, old_blob_oid: str | None, new_blob_oid: str | None) -> list[ParsedHunk]:
         for oid in (old_blob_oid, new_blob_oid):
             if oid is not None and not HEX_OID_RE.match(oid):
@@ -1329,7 +1419,10 @@ class GitMirror:
         tracked = {path for _, _, _, path in staged}
         updates: list[bytes] = []
         oversized: list[bytes] = []
+        # Symlink targets are hashed from bytes; regular files are hashed by git from their path,
+        # so blob contents are not held in memory.
         pending_blobs: dict[str, bytes] = {}
+        pending_paths: dict[str, bytes] = {}
         oid_len = len(head_oid)
         zero_oid = "0" * oid_len
         dir_cache: dict[Path, Path | None] = {}
@@ -1412,7 +1505,7 @@ class GitMirror:
                 )
             oid_str = git_blob_oid(content, oid_len=oid_len)
             if previous is None or previous.oid != oid_str or previous.mode != working_mode:
-                pending_blobs[oid_str] = content
+                pending_paths[oid_str] = path
                 updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
                 with contextlib.suppress(OSError):
                     st = os.lstat(source_repo / os.fsdecode(path))
@@ -1436,7 +1529,7 @@ class GitMirror:
                     continue
                 if state == "ok" and content is not None and working_mode is not None:
                     oid_str = git_blob_oid(content, oid_len=oid_len)
-                    pending_blobs[oid_str] = content
+                    pending_paths[oid_str] = path
                     updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
                     with contextlib.suppress(OSError):
                         st = os.lstat(source_repo / os.fsdecode(path))
@@ -1445,13 +1538,19 @@ class GitMirror:
         if not updates:
             return head_oid, oversized
 
-        if pending_blobs:
-            missing_blobs: list[tuple[str, bytes]] = []
+        if pending_blobs or pending_paths:
             with self.open_batch_session() as batch:
-                for b_oid, b_bytes in pending_blobs.items():
-                    if batch.read_object_bounded(b_oid, max_bytes=0) is None:
-                        missing_blobs.append((b_oid, b_bytes))
-            for _b_oid, b_bytes in missing_blobs:
+                missing_blobs = [
+                    b_bytes
+                    for b_oid, b_bytes in pending_blobs.items()
+                    if batch.read_object_bounded(b_oid, max_bytes=0) is None
+                ]
+                missing_paths = {
+                    b_oid: b_path
+                    for b_oid, b_path in pending_paths.items()
+                    if batch.read_object_bounded(b_oid, max_bytes=0) is None
+                }
+            for b_bytes in missing_blobs:
                 check_deadline()
                 run_safe_git(
                     ["hash-object", "-w", "--stdin"],
@@ -1459,6 +1558,7 @@ class GitMirror:
                     empty_hooks_dir=self.empty_hooks_dir,
                     stdin_bytes=b_bytes,
                 )
+            self._hash_workspace_paths(source_repo, missing_paths)
 
         with tempfile.TemporaryDirectory(prefix="codecontext-index-") as temp_dir:
             env = {"GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
@@ -1526,6 +1626,35 @@ class GitMirror:
         )
         self.pin_retained_oid(snapshot_oid)
         return snapshot_oid, oversized
+
+    def _hash_workspace_paths(self, source_repo: Path, expected: dict[str, bytes]) -> None:
+        """Write the files at `expected`'s paths into the mirror with one `hash-object` process and
+        check each lands under the OID computed when the file was read."""
+        if not expected:
+            return
+        lines: list[bytes] = []
+        for path in expected.values():
+            if path.startswith(b"/") or b".." in path.split(b"/"):
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Workspace path escapes the repository.",
+                    retryable=False,
+                )
+            lines.append(_quote_stdin_path(path) + b"\n")
+        written = run_safe_git(
+            ["hash-object", "-w", "--no-filters", "--stdin-paths"],
+            cwd=source_repo,
+            git_dir=self.git_dir,
+            empty_hooks_dir=self.empty_hooks_dir,
+            stdin_bytes=b"".join(lines),
+            timeout=300.0,
+        ).stdout.decode("ascii", errors="replace").split()
+        if written != list(expected):
+            raise CodeContextError(
+                code="IO_ERROR",
+                message="A workspace file changed while it was being captured. Run sync again.",
+                retryable=True,
+            )
 
     def prepare_snapshot(
         self,

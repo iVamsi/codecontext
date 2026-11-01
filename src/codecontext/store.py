@@ -1282,8 +1282,8 @@ class Store:
     def enqueue_pending_diff_jobs(conn: sqlite3.Connection) -> int:
         """Queue a `git_commit_diff` job for every commit whose diff is not complete.
 
-        A commit with an active MISSING_PARENT gap is left out until its first parent is imported,
-        so a shallow boundary is not re-diffed every sync. Jobs parked in `retryable_error` stay
+        A commit with an active MISSING_PARENT gap is left out until every one of its parents is
+        imported, so a shallow boundary is not re-diffed every sync. Jobs parked in `retryable_error` stay
         parked: they already used their attempts.
         """
         conn.create_function(
@@ -1303,7 +1303,7 @@ class Store:
             WHERE c.diff_state != 'complete'
               AND NOT EXISTS (
                 SELECT 1 FROM coverage_gaps g
-                JOIN commit_parents p ON p.commit_oid = c.oid AND p.parent_index = 0
+                JOIN commit_parents p ON p.commit_oid = c.oid
                 WHERE g.scope = 'git:commit:' || c.oid AND g.active = 1
                   AND g.code = 'MISSING_PARENT'
                   AND NOT EXISTS (SELECT 1 FROM commits pc WHERE pc.oid = p.parent_oid)
