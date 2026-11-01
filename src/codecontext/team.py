@@ -522,7 +522,12 @@ def _matching_store(dest: Path, repository_id: str) -> bool:
     return True
 
 
-def _rebind(store_path: Path, repo_path: Path) -> None:
+def _rebind(store_path: Path, repo_path: Path, *, floor_generation: int = 0) -> None:
+    """Point the store at `repo_path` and move its generation past `floor_generation`.
+
+    Graph and ancestor caches are keyed by path, revision and generation, so a database swapped
+    in at a path must not reuse its predecessor's generation.
+    """
     resolved_repo, common_real, st_dev, st_ino, _obj_fmt = inspect_local_git_repository(repo_path)
     store_json_path = store_path / "store.json"
     raw = json.loads(store_json_path.read_text(encoding="utf-8"))
@@ -533,7 +538,7 @@ def _rebind(store_path: Path, repo_path: Path) -> None:
     os.replace(tmp_json, store_json_path)
     store = Store.open(store_path, read_only=False)
     try:
-        with store.write_transaction(bump_generation=False) as conn:
+        with store.write_transaction(bump_generation=True) as conn:
             conn.execute(
                 """
                 UPDATE store_meta
@@ -541,10 +546,11 @@ def _rebind(store_path: Path, repo_path: Path) -> None:
                     common_dir_realpath = ?,
                     common_dir_device = ?,
                     common_dir_inode = ?,
-                    principal_id = NULL
+                    principal_id = NULL,
+                    generation = MAX(generation, ?)
                 WHERE singleton = 1
                 """,
-                (str(resolved_repo), str(common_real), st_dev, st_ino),
+                (str(resolved_repo), str(common_real), st_dev, st_ino, floor_generation),
             )
     finally:
         store.close()
@@ -624,7 +630,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
     staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}.joining-", dir=dest.parent))
     try:
         _import_share(share, staging, team)
-        _rebind(staging, repo_path)
+        _rebind(staging, repo_path, floor_generation=local_gen or 0)
         _ensure_checkout_ignore(staging, dest, resolved_repo)
         if dest.exists():
             if _dir_is_empty(dest):

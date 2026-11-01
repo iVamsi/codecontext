@@ -349,6 +349,35 @@ def test_join_while_writer_lock_held_is_store_busy(tmp_path, monkeypatch) -> Non
     assert not (store_b / "team.json").exists()
 
 
+def test_join_does_not_serve_the_replaced_stores_cached_graph(tmp_path) -> None:
+    from codecontext import graph
+    from codecontext.retrieval import load_ancestor_commits
+
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    # Diverge the local copy without touching its generation or revision.
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        conn.execute("UPDATE symbols SET name = 'local_only'")
+        conn.execute("DELETE FROM snapshot_commits")
+
+    def names_and_ancestors() -> tuple[set[str], frozenset[str]]:
+        store = Store.open(store_b, read_only=True)
+        try:
+            nodes, _edges, _epoch = graph._load_active_graph(store)
+            with store.connect_read() as conn:
+                ancestors = load_ancestor_commits(conn, store)
+        finally:
+            store.close()
+        return {n.name for n in nodes.values()}, ancestors
+
+    assert names_and_ancestors() == ({"local_only"}, frozenset())
+    (store_b / "team.json").unlink()
+    execute_join(store_b, share, repo_b)
+    names, ancestors = names_and_ancestors()
+    assert "hello" in names
+    assert ancestors
+
+
 def test_join_refuses_when_replaced_backup_exists(tmp_path) -> None:
     share, store_b, repo_b = _join_setup(tmp_path)
     execute_join(store_b, share, repo_b)

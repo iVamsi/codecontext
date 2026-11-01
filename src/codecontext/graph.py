@@ -418,7 +418,7 @@ def _load_active_graph(store: Store) -> tuple[Mapping[str, GraphNode], tuple[Gra
     """Load active snapshot symbols, active symbol-to-symbol edges, and `access_epoch`.
 
     Results are shared between calls, so the node map is read-only and edges are a tuple.
-    Every store write bumps `generation`, which changes the cache key.
+    Every write that changes symbols or relations bumps `generation`, which changes the cache key.
     """
     with store.read_snapshot() as snap:
         expected_epoch = snap.access_epoch
