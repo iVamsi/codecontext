@@ -2,8 +2,17 @@ from pathlib import Path
 
 import pytest
 
-from codecontext import InitRequest, Memory, SyncRequest
-from codecontext.graph import DetectChangesRequest, GetArchitectureRequest, is_test_path
+from codecontext import InitRequest, Memory, SyncRequest, graph
+from codecontext.errors import CodeContextError
+from codecontext.graph import (
+    DetectChangesRequest,
+    GetArchitectureRequest,
+    QueryGraphRequest,
+    SearchGraphRequest,
+    TracePathRequest,
+    compile_safe_regex,
+    is_test_path,
+)
 from tests.fixtures.builders import GitCommitSpec, commit_fixture_spec, init_fixture_repo
 
 MOD_V0 = (
@@ -135,3 +144,98 @@ def test_get_architecture_uses_louvain_communities_deterministically(tmp_path: P
 )
 def test_is_test_path_matches_segments_not_substrings(path: str, expected: bool) -> None:
     assert is_test_path(path) is expected
+
+
+def _many_inits_memory(tmp_path: Path) -> Memory:
+    repo = init_fixture_repo(tmp_path / "repo")
+    files = {
+        f"src/m{i}.py": (
+            f"class C{i}:\n    def __init__(self):\n        self.load()\n\n"
+            f"    def load(self):\n        return {i}\n"
+        ).encode()
+        for i in range(7)
+    }
+    files["src/keep.py"] = b"def keep():\n    return 1\n"
+    commit_fixture_spec(repo, GitCommitSpec(message="C0", files=files))
+    mem = Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mem.sync(SyncRequest(revision="HEAD", offline=True))
+    return mem
+
+
+@pytest.mark.parametrize("pattern", [".*" * 10 + "!", "a*" * 8 + "!", "(a|a)*b", "a{2,}b{3,}c+d"])
+def test_compile_safe_regex_rejects_backtracking(pattern: str) -> None:
+    with pytest.raises(CodeContextError) as exc_info:
+        compile_safe_regex(pattern)
+    assert exc_info.value.code == "INVALID_REQUEST"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [".*Handler", "^get_", "(foo|bar)", ".*foo.*", "process_.*", "(?:ab)+", "a*?b+c", "[*+]{1,3}x*"],
+)
+def test_compile_safe_regex_keeps_ordinary_patterns(pattern: str) -> None:
+    assert compile_safe_regex(pattern).pattern == pattern
+
+
+def test_variable_length_query_respects_time_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        monkeypatch.setattr(graph, "GRAPH_TOOL_MAX_SECONDS", 0.0)
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.query_graph(QueryGraphRequest(query="MATCH (a)-[*1..6]->(b) RETURN count(b)"))
+        assert exc_info.value.code == "INVALID_REQUEST"
+        assert exc_info.value.message == "Graph query exceeded its time limit"
+
+
+def test_graph_time_limit_keeps_tighter_outer_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext.deadline import check_deadline, sync_deadline
+
+    @graph._bounded_by_graph_time_limit
+    def probe() -> None:
+        check_deadline()
+
+    with sync_deadline(0.0), pytest.raises(CodeContextError):
+        probe()
+
+
+def test_order_by_unreturned_column_is_rejected(tmp_path: Path) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.query_graph(
+                QueryGraphRequest(query="MATCH (n) RETURN n.name ORDER BY n.degree DESC LIMIT 10")
+            )
+        assert exc_info.value.code == "INVALID_REQUEST"
+        ordered = mem.query_graph(
+            QueryGraphRequest(query="MATCH (n) RETURN n.name AS name ORDER BY name DESC LIMIT 1")
+        )
+        assert ordered.rows == [{"name": "load"}]
+
+
+def test_query_without_order_stops_at_cap(tmp_path: Path) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        res = mem.query_graph(QueryGraphRequest(query="MATCH (n) RETURN n.name LIMIT 2"))
+        assert res.row_count == 2
+        assert res.truncated is True
+        count = mem.query_graph(QueryGraphRequest(query="MATCH (n:Class) RETURN count(n) LIMIT 2"))
+        assert count.rows == [{"count(n)": 7}]
+
+
+def test_where_keeps_quoted_and(tmp_path: Path) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        res = mem.query_graph(
+            QueryGraphRequest(query="MATCH (n) WHERE n.name = 'Load AND Save' RETURN n.name")
+        )
+        assert res.rows == []
+        res = mem.query_graph(
+            QueryGraphRequest(
+                query="MATCH (n) WHERE n.name = 'x OR keep' OR n.name = \"keep\" RETURN n.name"
+            )
+        )
+        assert res.rows == [{"n.name": "keep"}]
+
+
+def test_trace_path_roots_capped(tmp_path: Path) -> None:
+    with _many_inits_memory(tmp_path) as mem:
+        everything = mem.search_graph(SearchGraphRequest(name_pattern="^__init__$"))
+        assert everything.total_matched == 7
+        res = mem.trace_path(TracePathRequest(function_name="__init__", limit=5))
+        assert len(res.root_nodes) <= 5

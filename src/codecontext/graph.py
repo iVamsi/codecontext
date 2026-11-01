@@ -1,13 +1,22 @@
+import functools
+import itertools
 import os
 import posixpath
 import re
 import stat
 from collections import deque
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
 from pydantic import Field
 
+from codecontext.deadline import (
+    SyncDeadlineExceeded,
+    check_deadline,
+    remaining_timeout,
+    sync_deadline,
+)
 from codecontext.enrichment import compute_snapshot_groups
 from codecontext.errors import CodeContextError
 from codecontext.git import (
@@ -200,12 +209,58 @@ def _kind_to_label(sym_kind: str) -> str:
     return "Variable"
 
 
+GRAPH_TOOL_MAX_SECONDS = 10.0
+DEADLINE_CHECK_EVERY = 256
+
+
+def _bounded_by_graph_time_limit[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Run a graph tool under `GRAPH_TOOL_MAX_SECONDS`, keeping any tighter outer deadline."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            with sync_deadline(remaining_timeout(GRAPH_TOOL_MAX_SECONDS)):
+                return fn(*args, **kwargs)
+        except SyncDeadlineExceeded as exc:
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message="Graph query exceeded its time limit",
+                retryable=False,
+            ) from exc
+
+    return wrapper
+
+
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
 
 
-def _quantified_group_can_backtrack(pattern: str) -> bool:
-    """Reject a group that is itself quantified and contains `|` or another quantifier."""
+MAX_UNBOUNDED_QUANTIFIERS = 2
+REGEX_BRACE_QUANTIFIER_RE = re.compile(r"\{(\d*)(,?)(\d*)\}")
+
+
+def _read_quantifier(pattern: str, i: int) -> tuple[int, bool, bool]:
+    """Return `(next_index, is_quantifier, is_unbounded)` for a quantifier starting at `i`."""
+    n = len(pattern)
+    if i >= n:
+        return i, False, False
+    if pattern[i] in "*+?":
+        unbounded = pattern[i] != "?"
+        i += 1
+    else:
+        brace = REGEX_BRACE_QUANTIFIER_RE.match(pattern, i)
+        if brace is None:
+            return i, False, False
+        unbounded = bool(brace.group(2)) and not brace.group(3)
+        i = brace.end()
+    if i < n and pattern[i] in "?+":
+        i += 1
+    return i, True, unbounded
+
+
+def _regex_can_backtrack(pattern: str) -> bool:
+    """Reject a quantified group holding `|` or a quantifier, and too many unbounded quantifiers."""
     stack: list[list[bool]] = []
+    unbounded_count = 0
     i = 0
     n = len(pattern)
     while i < n:
@@ -229,6 +284,9 @@ def _quantified_group_can_backtrack(pattern: str) -> bool:
         if char == "(":
             stack.append([False, False])
             i += 1
+            # `(?:`, `(?P<name>` and inline flags start with `?`, which is not a quantifier here.
+            if i < n and pattern[i] == "?":
+                i += 1
             continue
         if char == "|" and stack:
             stack[-1][0] = True
@@ -236,18 +294,8 @@ def _quantified_group_can_backtrack(pattern: str) -> bool:
             continue
         if char == ")" and stack:
             has_alt, has_quant = stack.pop()
-            i += 1
-            quantified = False
-            if i < n and pattern[i] in "*+?":
-                quantified = True
-                i += 1
-                if i < n and pattern[i] in "?+":
-                    i += 1
-            elif i < n and pattern[i] == "{":
-                quantified = True
-                while i < n and pattern[i] != "}":
-                    i += 1
-                i += 1
+            i, quantified, unbounded = _read_quantifier(pattern, i + 1)
+            unbounded_count += unbounded
             if quantified and (has_alt or has_quant):
                 return True
             if stack and has_alt:
@@ -255,27 +303,33 @@ def _quantified_group_can_backtrack(pattern: str) -> bool:
             if stack and (quantified or has_quant):
                 stack[-1][1] = True
             continue
-        if char in "*+?" or char == "{":
+        next_i, quantified, unbounded = _read_quantifier(pattern, i)
+        if quantified:
+            unbounded_count += unbounded
             if stack:
                 stack[-1][1] = True
-            i += 1
+            i = next_i
             continue
         i += 1
-    return False
+    return unbounded_count > MAX_UNBOUNDED_QUANTIFIERS
 
 
 def compile_safe_regex(pattern: str, *, max_length: int = 256) -> re.Pattern[str]:
-    """Compile a user regex, rejecting backreferences, lookaround, and quantified groups that can backtrack."""
+    """Compile a user regex, rejecting backreferences, lookaround, and quantifier shapes that can backtrack."""
     if len(pattern) > max_length:
         raise CodeContextError(
             code="INVALID_REQUEST",
             message=f"Regex pattern exceeds maximum allowed length ({max_length}).",
             retryable=False,
         )
-    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or _quantified_group_can_backtrack(pattern):
+    if UNSAFE_REGEX_BACKREF_RE.search(pattern) or _regex_can_backtrack(pattern):
         raise CodeContextError(
             code="INVALID_REQUEST",
-            message="Unsafe regex pattern rejected (nested quantifiers, lookarounds, or backreferences are forbidden).",
+            message=(
+                "Unsafe regex pattern rejected (nested quantifiers, more than "
+                f"{MAX_UNBOUNDED_QUANTIFIERS} unbounded quantifiers, lookarounds, "
+                "or backreferences are forbidden)."
+            ),
             retryable=False,
         )
     try:
@@ -377,6 +431,7 @@ def _load_active_graph(
     return nodes, edges, expected_epoch
 
 
+@_bounded_by_graph_time_limit
 def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGraphResult:
     """Search symbols in the active code knowledge graph by regex pattern, label, and degree."""
     name_re = compile_safe_regex(request.name_pattern) if request.name_pattern else None
@@ -467,6 +522,7 @@ def execute_search_graph(store: Store, request: SearchGraphRequest) -> SearchGra
     )
 
 
+@_bounded_by_graph_time_limit
 def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResult:
     """Perform multi-hop BFS call-graph traversal (`inbound`, `outbound`, or `both`) up to `request.depth`."""
     nodes, edges, expected_epoch = _load_active_graph(store)
@@ -479,6 +535,7 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
     ]
     if not roots:
         roots = [n for n in nodes.values() if q_name.lower() in n.qualified_name.lower()][:5]
+    roots = roots[: request.limit]
 
     outbound_adj: dict[str, list[tuple[str, str, str]]] = {}
     inbound_adj: dict[str, list[tuple[str, str, str]]] = {}
@@ -492,7 +549,11 @@ def execute_trace_path(store: Store, request: TracePathRequest) -> TracePathResu
     seen_edges: set[tuple[str, str, str]] = set()
 
     queue: deque[tuple[str, int]] = deque((r.id, 0) for r in roots)
+    steps = 0
     while queue and len(collected_edges) < request.limit:
+        if steps % DEADLINE_CHECK_EVERY == 0:
+            check_deadline()
+        steps += 1
         cur_id, cur_depth = queue.popleft()
         if cur_depth >= request.depth:
             continue
@@ -743,15 +804,26 @@ def _eval_where_atom(bindings: dict[str, Any], atom_str: str) -> bool:
     return (not res) if negate else res
 
 
+def _split_outside_quotes(clause: str, keyword: str) -> list[str]:
+    """Split on a whitespace-delimited keyword that is not inside a quoted literal."""
+    parts: list[str] = []
+    start = 0
+    for m in re.finditer(rf"'[^']*'|\"[^\"]*\"|\s+{keyword}\s+", clause, flags=re.IGNORECASE):
+        if m.group()[0] not in "'\"":
+            parts.append(clause[start : m.start()])
+            start = m.end()
+    parts.append(clause[start:])
+    return parts
+
+
 def _matches_where(bindings: dict[str, Any], where_clause: str | None) -> bool:
     """Evaluate Cypher WHERE clause with `OR`, `AND`, and `NOT` precedence.
     Strictly validates every condition atom and raises `INVALID_REQUEST` on unknown syntax or properties.
     """
     if not where_clause or not where_clause.strip():
         return True
-    or_groups = re.split(r"\s+OR\s+", where_clause.strip(), flags=re.IGNORECASE)
-    for or_grp in or_groups:
-        and_atoms = re.split(r"\s+AND\s+", or_grp.strip(), flags=re.IGNORECASE)
+    for or_grp in _split_outside_quotes(where_clause.strip(), "OR"):
+        and_atoms = _split_outside_quotes(or_grp.strip(), "AND")
         if all(_eval_where_atom(bindings, atom) for atom in and_atoms):
             return True
     return False
@@ -802,13 +874,33 @@ def _project_return_row(bindings: dict[str, Any], return_exprs: list[str]) -> di
     return row
 
 
+def _is_count_return(ret_cols: list[str]) -> bool:
+    return len(ret_cols) == 1 and bool(
+        re.match(r"^count\s*\(.+\)(?:\s+AS\s+\w+)?$", ret_cols[0], flags=re.IGNORECASE)
+    )
+
+
+def _return_column_name(expr: str) -> str:
+    as_parts = re.split(r"\s+AS\s+", expr.strip(), flags=re.IGNORECASE)
+    return as_parts[1].strip() if len(as_parts) > 1 else as_parts[0].strip()
+
+
+def _collect_matches(
+    matches: Iterator[dict[str, Any]], ret_cols: list[str], order_by_clause: str | None, cap: int
+) -> list[dict[str, Any]]:
+    """Without ORDER BY or count, rows past `cap + 1` can never be returned or change `truncated`."""
+    if order_by_clause or _is_count_return(ret_cols):
+        return list(matches)
+    return list(itertools.islice(matches, cap + 1))
+
+
 def _apply_order_by_and_count(
     matched_bindings: list[dict[str, Any]],
     ret_cols: list[str],
     order_by_clause: str | None,
     cap: int,
 ) -> tuple[list[str], list[dict[str, Any]], bool]:
-    if len(ret_cols) == 1 and re.match(r"^count\s*\(.+\)(?:\s+AS\s+\w+)?$", ret_cols[0], flags=re.IGNORECASE):
+    if _is_count_return(ret_cols):
         as_parts = re.split(r"\s+AS\s+", ret_cols[0].strip(), flags=re.IGNORECASE)
         col_name = as_parts[1].strip() if len(as_parts) > 1 else ret_cols[0].strip()
         return ([col_name], [{col_name: len(matched_bindings)}], False)
@@ -816,7 +908,15 @@ def _apply_order_by_and_count(
     projected = [_project_return_row(b, ret_cols) for b in matched_bindings]
 
     if order_by_clause:
+        returned = {_return_column_name(c) for c in ret_cols}
         order_parts = [p.strip() for p in order_by_clause.split(",") if p.strip()]
+        for opart in order_parts:
+            if opart.split()[0] not in returned:
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message=f"ORDER BY {opart.split()[0]!r} must name a RETURN column.",
+                    retryable=False,
+                )
         for opart in reversed(order_parts):
             tokens = opart.split()
             expr_key = tokens[0]
@@ -833,6 +933,7 @@ def _apply_order_by_and_count(
     return (ret_cols, projected[:cap], truncated)
 
 
+@_bounded_by_graph_time_limit
 def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphResult:
     """Execute a validated read-only Cypher query over the active snapshot symbol/relation graph."""
     nodes, edges, expected_epoch = _load_active_graph(store)
@@ -877,9 +978,10 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                 if pm.group(1) == "type" and pm.group(2):
                     req_edge_type = pm.group(2).upper()
 
-        matched_bindings: list[dict[str, Any]] = []
-        if max_hop == 1:
-            for f_id, t_id, etype, method in edges:
+        def single_hop_matches() -> Iterator[dict[str, Any]]:
+            for index, (f_id, t_id, etype, method) in enumerate(edges):
+                if index % DEADLINE_CHECK_EVERY == 0:
+                    check_deadline()
                 if req_edge_type and etype != req_edge_type:
                     continue
                 n1 = nodes[f_id]
@@ -894,24 +996,29 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                     relvar: {"confidence": 1.0, "depth": 1, "method": method, "type": etype},
                 }
                 if _matches_where(bindings, where_c):
-                    matched_bindings.append(bindings)
-        else:
+                    yield bindings
+
+        def variable_length_matches() -> Iterator[dict[str, Any]]:
             adj: dict[str, list[tuple[str, str, str]]] = {}
             for f_id, t_id, etype, method in edges:
                 if req_edge_type and etype != req_edge_type:
                     continue
                 adj.setdefault(f_id, []).append((t_id, etype, method))
 
+            steps = 0
             for start_id, n1 in nodes.items():
                 if not _matches_label(n1, l1) or not _matches_inline_props(n1, p1):
                     continue
-                bfs_q: deque[tuple[str, int, str, str]] = deque([(start_id, 0, "CALLS", "bfs")])
+                bfs_q: deque[tuple[str, int]] = deque([(start_id, 0)])
                 seen_at_start: set[str] = {start_id}
                 while bfs_q:
-                    cur_id, d, last_et, last_m = bfs_q.popleft()
+                    cur_id, d = bfs_q.popleft()
                     if d >= max_hop:
                         continue
                     for nxt_id, et, m in adj.get(cur_id, []):
+                        if steps % DEADLINE_CHECK_EVERY == 0:
+                            check_deadline()
+                        steps += 1
                         nd = d + 1
                         if nd >= min_hop:
                             n2 = nodes[nxt_id]
@@ -922,11 +1029,17 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
                                     relvar: {"confidence": 1.0, "depth": nd, "method": m, "type": et},
                                 }
                                 if _matches_where(bindings, where_c):
-                                    matched_bindings.append(bindings)
+                                    yield bindings
                         if nxt_id not in seen_at_start:
                             seen_at_start.add(nxt_id)
-                            bfs_q.append((nxt_id, nd, et, m))
+                            bfs_q.append((nxt_id, nd))
 
+        matched_bindings = _collect_matches(
+            single_hop_matches() if max_hop == 1 else variable_length_matches(),
+            ret_cols,
+            order_c,
+            cap,
+        )
         cols_out, rows_out, truncated = _apply_order_by_and_count(
             matched_bindings, ret_cols, order_c, cap
         )
@@ -951,13 +1064,17 @@ def execute_query_graph(store: Store, request: QueryGraphRequest) -> QueryGraphR
         cap = min(request.limit, int(lim_s) if lim_s else request.limit, 200)
         ret_cols = [c.strip() for c in ret_c.split(",") if c.strip()]
 
-        matched_bindings = []
-        for node in nodes.values():
-            if not _matches_label(node, label) or not _matches_inline_props(node, props):
-                continue
-            bindings = {var: node}
-            if _matches_where(bindings, where_c):
-                matched_bindings.append(bindings)
+        def node_matches() -> Iterator[dict[str, Any]]:
+            for index, node in enumerate(nodes.values()):
+                if index % DEADLINE_CHECK_EVERY == 0:
+                    check_deadline()
+                if not _matches_label(node, label) or not _matches_inline_props(node, props):
+                    continue
+                bindings = {var: node}
+                if _matches_where(bindings, where_c):
+                    yield bindings
+
+        matched_bindings = _collect_matches(node_matches(), ret_cols, order_c, cap)
 
         cols_out, rows_out, truncated = _apply_order_by_and_count(
             matched_bindings, ret_cols, order_c, cap
@@ -1143,6 +1260,7 @@ def _cluster_files(
     return file_to_cluster, cluster_files, cluster_meta
 
 
+@_bounded_by_graph_time_limit
 def execute_get_architecture(
     store: Store,
     request: GetArchitectureRequest,
@@ -1380,6 +1498,7 @@ def _classify_symbol_changes(
     return out
 
 
+@_bounded_by_graph_time_limit
 def execute_detect_changes(
     store: Store,
     mirror: GitMirror,
@@ -1529,6 +1648,7 @@ def execute_detect_changes(
     )
 
 
+@_bounded_by_graph_time_limit
 def execute_get_code_snippet(
     store: Store,
     mirror: GitMirror,
