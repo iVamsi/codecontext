@@ -13,12 +13,15 @@ import threading
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from codecontext.deadline import SyncDeadlineExceeded, check_deadline, remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.identity import HEX_OID_RE
 from codecontext.store import Store, inspect_local_git_repository, now_us
+
+if TYPE_CHECKING:
+    from codecontext.workspace import RepoDirFds
 
 PYTHON_DIFF_MAX_LINES = 2000
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -1380,6 +1383,21 @@ class GitMirror:
         include_untracked: bool = False,
     ) -> tuple[str, list[bytes]]:
         """Capture tracked (and optionally untracked) working files in the owned mirror without writing the source index."""
+        from codecontext.workspace import RepoDirFds
+
+        with RepoDirFds(source_repo) as dir_fds:
+            return self._capture_workspace_revision(
+                source_repo, head_oid, include_untracked=include_untracked, dir_fds=dir_fds
+            )
+
+    def _capture_workspace_revision(
+        self,
+        source_repo: Path,
+        head_oid: str,
+        *,
+        include_untracked: bool,
+        dir_fds: "RepoDirFds",
+    ) -> tuple[str, list[bytes]]:
         from codecontext.syntax import MAX_PARSE_BYTES
         from codecontext.workspace import (
             _lstat_root_confined,
@@ -1436,7 +1454,7 @@ class GitMirror:
                     updates.append(f"{mode:o} {staged_oid}\t".encode("ascii") + path + b"\0")
                 continue
             if mode == 0o120000:
-                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache)
+                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                 if sym_target is None:
                     if path in original:
                         updates.append(b"0 " + zero_oid.encode("ascii") + b"\t" + path + b"\0")
@@ -1450,12 +1468,12 @@ class GitMirror:
             if stat_cache is not None and previous is not None and previous.oid == staged_oid and previous.mode == mode:
                 cached = stat_cache[0].get(path)
                 if cached is not None and cached.oid == staged_oid:
-                    st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache)
+                    st = _lstat_root_confined(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                     if st is not None and st.st_size <= MAX_PARSE_BYTES and index_entry_matches_stat(cached, st, stat_cache[1]):
                         continue
 
             state, content, working_mode = _read_root_confined_regular_file(
-                source_repo, path, dir_cache=dir_cache
+                source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
             )
             if state == "deleted":
                 if path in original:
@@ -1467,7 +1485,7 @@ class GitMirror:
                     updates.append(b"0 " + zero_oid.encode("ascii") + b"\t" + path + b"\0")
                 continue
             if state == "symlink":
-                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache)
+                sym_target = _read_root_confined_symlink_target(source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds)
                 if sym_target is not None:
                     sym_oid = git_blob_oid(sym_target, oid_len=oid_len)
                     if previous is None or previous.oid != sym_oid or previous.mode != 0o120000:
@@ -1506,7 +1524,7 @@ class GitMirror:
                     continue
                 check_deadline()
                 state, content, working_mode = _read_root_confined_regular_file(
-                    source_repo, path, dir_cache=dir_cache
+                    source_repo, path, dir_cache=dir_cache, dir_fds=dir_fds
                 )
                 if state == "oversized":
                     oversized.append(path)

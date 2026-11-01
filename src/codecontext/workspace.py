@@ -4,6 +4,8 @@ import json
 import os
 import stat
 import struct
+from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,11 +139,146 @@ def _resolve_root_confined_parent_dir(
     return ("ok", cur)
 
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+# O_NONBLOCK keeps a FIFO swapped in after the type check from hanging the open.
+_FILE_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+_DIR_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_DIRECTORY
+MAX_CACHED_DIR_FDS = 256
+
+
+def _open_dir_at(dir_fd: int, name: bytes) -> int:
+    """Open subdirectory `name` of `dir_fd` without following a symlink (raises ELOOP for one)."""
+    try:
+        return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+    except OSError as exc:
+        # macOS reports ENOTDIR, not ELOOP, for O_DIRECTORY | O_NOFOLLOW on a symlink.
+        if exc.errno == errno.ENOTDIR and stat.S_ISLNK(
+            os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        ):
+            raise OSError(errno.ELOOP, "symlink in repository path") from exc
+        raise
+
+
+def _open_regular_file_at(dir_fd: int, name: bytes) -> int:
+    """Open regular file `name` of `dir_fd` for reading. Symlinks raise ELOOP and other
+    non-regular files raise EINVAL before any open, so device nodes and FIFOs are never opened.
+    """
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        raise OSError(errno.ELOOP, "repository path is a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "repository path is not a regular file")
+    return os.open(name, _FILE_OPEN_FLAGS, dir_fd=dir_fd)
+
+
+def open_repo_file_no_follow(repo_fd: int, rel_path: bytes) -> int:
+    """Open regular file `rel_path` under the directory `repo_fd` without following any symlink.
+
+    Each component is opened relative to the previous one, so a parent swapped for a symlink
+    after a path check cannot redirect the read. A symlink anywhere on the path raises
+    `OSError(ELOOP)`; the caller owns the returned fd.
+    """
+    parts = [p for p in rel_path.split(b"/") if p]
+    if not parts:
+        raise OSError(errno.ENOENT, "empty repository path")
+    fd = os.dup(repo_fd)
+    try:
+        for part in parts[:-1]:
+            next_fd = _open_dir_at(fd, part)
+            os.close(fd)
+            fd = next_fd
+        return _open_regular_file_at(fd, parts[-1])
+    finally:
+        os.close(fd)
+
+
+class RepoDirFds:
+    """No-follow directory fds under one workspace root, reused across the reads of one
+    snapshot or request. At most `max_open` stay open; the least recently used is closed first.
+
+    A cached fd keeps pointing at the directory that was checked, even if that path is later
+    replaced, so reads never move to a directory swapped in mid-snapshot.
+    """
+
+    def __init__(self, root: Path, *, max_open: int = MAX_CACHED_DIR_FDS) -> None:
+        self.root_real = root.resolve()
+        self._root_fd = os.open(self.root_real, _DIR_OPEN_FLAGS & ~_O_NOFOLLOW)
+        self._fds: OrderedDict[bytes, int] = OrderedDict()
+        self._max_open = max_open
+
+    def dir_fd(self, dir_parts: list[bytes]) -> int:
+        """Borrowed fd for the directory at `dir_parts`; valid until the next call or close."""
+        if not dir_parts:
+            return self._root_fd
+        key = b"/".join(dir_parts)
+        cached = self._fds.get(key)
+        if cached is not None:
+            self._fds.move_to_end(key)
+            return cached
+        fd = _open_dir_at(self.dir_fd(dir_parts[:-1]), dir_parts[-1])
+        self._fds[key] = fd
+        if len(self._fds) > self._max_open:
+            os.close(self._fds.popitem(last=False)[1])
+        return fd
+
+    def close(self) -> None:
+        while self._fds:
+            os.close(self._fds.popitem()[1])
+        os.close(self._root_fd)
+
+    def __enter__(self) -> "RepoDirFds":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+@contextlib.contextmanager
+def _dir_fds_for(workspace_root: Path, dir_fds: RepoDirFds | None) -> Iterator[RepoDirFds]:
+    if dir_fds is not None:
+        yield dir_fds
+        return
+    with RepoDirFds(workspace_root) as owned:
+        yield owned
+
+
+def _confined_parent(
+    dir_fds: RepoDirFds,
+    parts: list[bytes],
+    dir_cache: dict[Path, Path | None] | None,
+) -> tuple[str, int | None]:
+    """Return `(status, parent_fd)` for the last of `parts`, checked lexically then opened no-follow.
+
+    The lexical check keeps resolving in-root parent symlinks; the fd walk then opens that real
+    path with no-follow opens, so anything swapped in since is refused rather than followed.
+    """
+    root_real = dir_fds.root_real
+    p_status, cur = _resolve_root_confined_parent_dir(root_real, parts[:-1], dir_cache=dir_cache)
+    if p_status != "ok" or cur is None:
+        return (p_status, None)
+    real_parts = [os.fsencode(c) for c in cur.relative_to(root_real).parts]
+    try:
+        return ("ok", dir_fds.dir_fd(real_parts))
+    except OSError as exc:
+        return (_status_for_os_error(exc), None)
+
+
+def _status_for_os_error(exc: OSError) -> str:
+    if exc.errno in (errno.ELOOP, errno.EMLINK):
+        return "symlink"
+    if exc.errno == errno.ENOENT:
+        return "deleted"
+    return "unavailable"
+
+
 def _read_root_confined_symlink_target(
     workspace_root: Path,
     rel_path_bytes: bytes,
     *,
     dir_cache: dict[Path, Path | None] | None = None,
+    dir_fds: RepoDirFds | None = None,
 ) -> bytes | None:
     """Read symlink target bytes via `os.readlink` without following the symlink, provided all
     parent directories stay confined inside `workspace_root`.
@@ -149,21 +286,107 @@ def _read_root_confined_symlink_target(
     parts = [p for p in rel_path_bytes.split(b"/") if p]
     if not parts:
         return None
-    root_real = workspace_root.resolve()
-    p_status, parent_dir = _resolve_root_confined_parent_dir(
-        root_real, parts[:-1], dir_cache=dir_cache
-    )
-    if p_status != "ok" or parent_dir is None:
-        return None
-    leaf_path = parent_dir / os.fsdecode(parts[-1])
     try:
-        st = os.lstat(leaf_path)
-        if not stat.S_ISLNK(st.st_mode):
-            return None
-        target_str = os.readlink(leaf_path)
-        return os.fsencode(target_str)
+        with _dir_fds_for(workspace_root, dir_fds) as fds:
+            p_status, parent_fd = _confined_parent(fds, parts, dir_cache)
+            if p_status != "ok" or parent_fd is None:
+                return None
+            st = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISLNK(st.st_mode):
+                return None
+            return os.readlink(parts[-1], dir_fd=parent_fd)
     except OSError:
         return None
+
+
+def _lstat_root_confined(
+    workspace_root: Path,
+    rel_path_bytes: bytes,
+    *,
+    dir_cache: dict[Path, Path | None] | None = None,
+    dir_fds: RepoDirFds | None = None,
+) -> os.stat_result | None:
+    parts = [p for p in rel_path_bytes.split(b"/") if p]
+    if not parts:
+        return None
+    try:
+        with _dir_fds_for(workspace_root, dir_fds) as fds:
+            p_status, parent_fd = _confined_parent(fds, parts, dir_cache)
+            if p_status != "ok" or parent_fd is None:
+                return None
+            return os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return None
+
+
+def _read_root_confined_regular_file(
+    workspace_root: Path,
+    rel_path_bytes: bytes,
+    *,
+    dir_cache: dict[Path, Path | None] | None = None,
+    dir_fds: RepoDirFds | None = None,
+) -> tuple[str, bytes | None, int | None]:
+    """Safely read a regular file inside `workspace_root` without following symlinks outside the root.
+    Retries once if file changes while being read.
+    Returns `(status, raw_bytes, normalized_mode)` where status is:
+    - `'ok'`
+    - `'deleted'`
+    - `'symlink'`
+    - `'oversized'`
+    - `'unavailable'`
+    """
+    parts = [p for p in rel_path_bytes.split(b"/") if p]
+    if not parts:
+        return ("unavailable", None, None)
+    try:
+        with _dir_fds_for(workspace_root, dir_fds) as fds:
+            return _read_confined_leaf(fds, parts, dir_cache)
+    except OSError:
+        return ("unavailable", None, None)
+
+
+def _read_confined_leaf(
+    dir_fds: RepoDirFds,
+    parts: list[bytes],
+    dir_cache: dict[Path, Path | None] | None,
+) -> tuple[str, bytes | None, int | None]:
+    p_status, parent_fd = _confined_parent(dir_fds, parts, dir_cache)
+    if p_status != "ok" or parent_fd is None:
+        return (p_status, None, 0o120000 if p_status == "symlink" else None)
+
+    for _attempt in range(2):
+        try:
+            fd = _open_regular_file_at(parent_fd, parts[-1])
+        except OSError as exc:
+            status = _status_for_os_error(exc)
+            return (status, None, 0o120000 if status == "symlink" else None)
+
+        try:
+            f_st1 = os.fstat(fd)
+            if not stat.S_ISREG(f_st1.st_mode):
+                return ("unavailable", None, None)
+            if f_st1.st_size > MAX_PARSE_BYTES:
+                return ("oversized", None, None)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                buf = os.read(fd, 65536)
+                if not buf:
+                    break
+                total += len(buf)
+                if total > MAX_PARSE_BYTES:
+                    return ("oversized", None, None)
+                chunks.append(buf)
+            f_st2 = os.fstat(fd)
+        except OSError:
+            return ("unavailable", None, None)
+        finally:
+            os.close(fd)
+
+        if f_st1.st_mtime_ns == f_st2.st_mtime_ns and f_st1.st_size == f_st2.st_size == total:
+            return ("ok", b"".join(chunks), _normalize_git_file_mode(f_st2.st_mode))
+
+    return ("unavailable", None, None)
 
 
 # Large monorepo indexes reach tens of MiB; anything past this is read the slow way.
@@ -297,135 +520,6 @@ def index_entry_matches_stat(entry: IndexStatEntry, st: os.stat_result, index_mt
         and _normalize_git_file_mode(st.st_mode) == entry.mode
         and entry.mtime_ns < index_mtime_ns
     )
-
-
-def _lstat_root_confined(
-    workspace_root: Path,
-    rel_path_bytes: bytes,
-    *,
-    dir_cache: dict[Path, Path | None] | None = None,
-) -> os.stat_result | None:
-    parts = [p for p in rel_path_bytes.split(b"/") if p]
-    if not parts:
-        return None
-    p_status, parent_dir = _resolve_root_confined_parent_dir(
-        workspace_root.resolve(), parts[:-1], dir_cache=dir_cache
-    )
-    if p_status != "ok" or parent_dir is None:
-        return None
-    try:
-        return os.lstat(parent_dir / os.fsdecode(parts[-1]))
-    except OSError:
-        return None
-
-
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
-# O_NONBLOCK keeps a FIFO planted at a tracked path from hanging the open.
-_FILE_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
-_DIR_OPEN_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_DIRECTORY
-
-
-def open_repo_file_no_follow(repo_fd: int, rel_path: bytes) -> int:
-    """Open `rel_path` under the directory `repo_fd` for reading without following any symlink.
-
-    Each component is opened relative to the previous one, so a parent swapped for a symlink
-    after a path check cannot redirect the read. A symlink anywhere on the path raises
-    `OSError(ELOOP)`; the caller owns the returned fd.
-    """
-    parts = [p for p in rel_path.split(b"/") if p]
-    if not parts:
-        raise OSError(errno.ENOENT, "empty repository path")
-    fd = os.dup(repo_fd)
-    try:
-        for part in parts[:-1]:
-            try:
-                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
-            except OSError as exc:
-                # macOS reports ENOTDIR, not ELOOP, for O_DIRECTORY | O_NOFOLLOW on a symlink.
-                if exc.errno == errno.ENOTDIR and stat.S_ISLNK(
-                    os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode
-                ):
-                    raise OSError(errno.ELOOP, "symlink in repository path") from exc
-                raise
-            os.close(fd)
-            fd = next_fd
-        return os.open(parts[-1], _FILE_OPEN_FLAGS, dir_fd=fd)
-    finally:
-        os.close(fd)
-
-
-def _read_root_confined_regular_file(
-    workspace_root: Path,
-    rel_path_bytes: bytes,
-    *,
-    dir_cache: dict[Path, Path | None] | None = None,
-) -> tuple[str, bytes | None, int | None]:
-    """Safely read a regular file inside `workspace_root` without following symlinks outside the root.
-    Retries once if file changes while being read.
-    Returns `(status, raw_bytes, normalized_mode)` where status is:
-    - `'ok'`
-    - `'deleted'`
-    - `'symlink'`
-    - `'oversized'`
-    - `'unavailable'`
-    """
-    parts = [p for p in rel_path_bytes.split(b"/") if p]
-    if not parts:
-        return ("unavailable", None, None)
-
-    root_real = workspace_root.resolve()
-    p_status, cur = _resolve_root_confined_parent_dir(root_real, parts[:-1], dir_cache=dir_cache)
-    if p_status != "ok" or cur is None:
-        return (p_status, None, 0o120000 if p_status == "symlink" else None)
-
-    # The lexical check resolved in-root parent symlinks; the fd walk re-checks that real path
-    # with no-follow opens, so anything swapped in since is refused rather than followed.
-    real_rel = b"/".join([*(os.fsencode(c) for c in cur.relative_to(root_real).parts), parts[-1]])
-    try:
-        root_fd = os.open(root_real, _DIR_OPEN_FLAGS & ~_O_NOFOLLOW)
-    except OSError:
-        return ("unavailable", None, None)
-    try:
-        for _attempt in range(2):
-            try:
-                fd = open_repo_file_no_follow(root_fd, real_rel)
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.EMLINK):
-                    return ("symlink", None, 0o120000)
-                if exc.errno == errno.ENOENT:
-                    return ("deleted", None, None)
-                return ("unavailable", None, None)
-
-            try:
-                f_st1 = os.fstat(fd)
-                if not stat.S_ISREG(f_st1.st_mode):
-                    return ("unavailable", None, None)
-                if f_st1.st_size > MAX_PARSE_BYTES:
-                    return ("oversized", None, None)
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    buf = os.read(fd, 65536)
-                    if not buf:
-                        break
-                    total += len(buf)
-                    if total > MAX_PARSE_BYTES:
-                        return ("oversized", None, None)
-                    chunks.append(buf)
-                f_st2 = os.fstat(fd)
-            except OSError:
-                return ("unavailable", None, None)
-            finally:
-                os.close(fd)
-
-            if f_st1.st_mtime_ns == f_st2.st_mtime_ns and f_st1.st_size == f_st2.st_size == total:
-                return ("ok", b"".join(chunks), _normalize_git_file_mode(f_st2.st_mode))
-    finally:
-        os.close(root_fd)
-
-    return ("unavailable", None, None)
 
 
 def _lookup_workspace_base_revision(store: Store, active_revision: str) -> str | None:

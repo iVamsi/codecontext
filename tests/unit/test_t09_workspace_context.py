@@ -1,5 +1,6 @@
 import errno
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -451,3 +452,97 @@ def test_non_utf8_workspace_path(tmp_path: Path) -> None:  # Review Focus 4
     assert present.target_state == "untracked"
     assert present.working_content_hash == sha256_bytes(b"y = 2\n")
     store.close()
+
+
+def test_parent_swap_does_not_leak_outside_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    os.symlink("app.py", repo / "src" / "link")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink("/OUTSIDE_TARGET_MARKER", outside / "link")
+
+    real_check = workspace._resolve_root_confined_parent_dir
+
+    def check_then_swap(*args, **kwargs):
+        result = real_check(*args, **kwargs)
+        if not (repo / "src").is_symlink():
+            (repo / "src").rename(tmp_path / "src_moved")
+            os.symlink(outside, repo / "src")
+        return result
+
+    monkeypatch.setattr(workspace, "_resolve_root_confined_parent_dir", check_then_swap)
+    assert workspace._read_root_confined_symlink_target(repo, b"src/link") is None
+    assert workspace._lstat_root_confined(repo, b"src/link") is None
+
+
+def test_in_root_symlink_target_and_lstat_still_work(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    os.symlink("app.py", repo / "src" / "link")
+    with workspace.RepoDirFds(repo) as dir_fds:
+        assert workspace._read_root_confined_symlink_target(
+            repo, b"src/link", dir_fds=dir_fds
+        ) == b"app.py"
+        st = workspace._lstat_root_confined(repo, b"src/link", dir_fds=dir_fds)
+    assert st is not None and stat.S_ISLNK(st.st_mode)
+
+
+def test_fifo_is_rejected_without_being_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.mkfifo(repo / "pipe")
+    opened: list[object] = []
+    real_open = os.open
+
+    def recording_open(path, *args, **kwargs):
+        opened.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(workspace.os, "open", recording_open)
+    state, content, _mode = workspace._read_root_confined_regular_file(repo, b"pipe")
+    assert (state, content) == ("unavailable", None)
+    assert b"pipe" not in opened
+
+
+def test_snapshot_reuses_directory_fds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    files = {f"a/b/f{i}.py": f"v = {i}\n".encode() for i in range(200)}
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Many", files=files))
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    head = mirror.prepare_snapshot("HEAD")
+    for name in files:
+        (repo / name).write_bytes(b"changed = True\n")
+
+    dir_opens: list[bytes] = []
+    real_open_dir_at = workspace._open_dir_at
+
+    def counting(dir_fd: int, name: bytes) -> int:
+        dir_opens.append(name)
+        return real_open_dir_at(dir_fd, name)
+
+    monkeypatch.setattr(workspace, "_open_dir_at", counting)
+    snap, _ = mirror._prepare_workspace_revision(repo, head)
+    assert snap != head
+    assert dir_opens == [b"a", b"b"]
+    mirror.close()
+    store.close()
+
+
+def test_repo_dir_fds_closes_least_recently_used(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    for name in ("x", "y", "z"):
+        (repo / name).mkdir(parents=True)
+        (repo / name / "f").write_bytes(name.encode())
+    with workspace.RepoDirFds(repo, max_open=2) as dir_fds:
+        for name in ("x", "y", "z", "x"):
+            state, content, _ = workspace._read_root_confined_regular_file(
+                repo, f"{name}/f".encode(), dir_fds=dir_fds
+            )
+            assert (state, content) == ("ok", name.encode())
+        assert len(dir_fds._fds) == 2
