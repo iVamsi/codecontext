@@ -523,3 +523,29 @@ def test_search_graph_regex_udf_stops_at_the_deadline(
     assert exc_info.value.code == "INVALID_REQUEST"
     assert exc_info.value.message == "Graph query exceeded its time limit"
     assert elapsed < 1.0
+
+
+
+def test_worktree_read_does_not_follow_a_parent_swapped_for_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "a.py").write_bytes(b"inside\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.py").write_bytes(b"secret\n")
+    assert graph._read_worktree_file(root, b"src/a.py") == b"inside\n"
+
+    real_resolve = Path.resolve
+
+    def resolve_then_swap(self: Path, strict: bool = False) -> Path:
+        # Swap the parent right after any path check, as a racing process could.
+        result = real_resolve(self, strict)
+        if not (root / "src").is_symlink():
+            (root / "src").rename(tmp_path / "moved")
+            (root / "src").symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_swap)
+    assert graph._read_worktree_file(root, b"src/a.py") is None

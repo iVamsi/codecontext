@@ -1,11 +1,9 @@
 import functools
 import itertools
 import json
-import os
 import posixpath
 import re
 import sqlite3
-import stat
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Mapping
@@ -42,6 +40,7 @@ from codecontext.syntax import (
     is_lfs_pointer,
     parse_blob,
 )
+from codecontext.workspace import _read_root_confined_regular_file
 
 
 class GraphNode(PublicModel):
@@ -1529,16 +1528,8 @@ def _workspace_changes(
 
 def _read_worktree_file(root: Path, rel: bytes) -> bytes | None:
     """Read a regular file inside `root`; symlinks and oversized files yield None."""
-    full = root / os.fsdecode(rel)
-    try:
-        st = full.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_PARSE_BYTES:
-            return None
-        if not full.resolve().is_relative_to(root):
-            return None
-        return full.read_bytes()
-    except OSError:
-        return None
+    status, data, _mode = _read_root_confined_regular_file(root, rel)
+    return data if status == "ok" else None
 
 
 def _blob_symbols(
