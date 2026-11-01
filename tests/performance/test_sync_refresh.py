@@ -131,4 +131,4 @@ def test_2000_untracked_files_use_few_processes(
     assert tree[b"u/7.txt"] == git_blob_oid(b"u/7.txt body\n")
     # Typed writes (`-t`) are the empty objects and the snapshot commit, not workspace content.
     blob_writes = [args for args in spawned if "hash-object" in args and "-t" not in args]
-    assert len(blob_writes) <= 1, len(blob_writes)
+    assert blob_writes == []

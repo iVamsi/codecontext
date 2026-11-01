@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,20 +39,6 @@ STATUS_TO_CHANGE_KIND: dict[str, str] = {
     "T": "type_changed",
     "U": "unmerged",
 }
-
-
-def _quote_stdin_path(path: bytes) -> bytes:
-    """C-quote a path for a newline-separated `--stdin-paths` list when it would not survive
-    as one literal line."""
-    if b"\n" not in path and b"\r" not in path and not path.startswith(b'"'):
-        return path
-    escaped = (
-        path.replace(b"\\", b"\\\\")
-        .replace(b'"', b'\\"')
-        .replace(b"\n", b"\\n")
-        .replace(b"\r", b"\\r")
-    )
-    return b'"' + escaped + b'"'
 
 
 def validate_revision_arg(revision: str) -> str:
@@ -1319,6 +1306,7 @@ class GitMirror:
             git_dir=self.git_dir,
             empty_hooks_dir=self.empty_hooks_dir,
             stdin_bytes=b"".join(lines),
+            timeout=30.0 * len(lines),
         )
         tokens = _split_z_tokens(proc.stdout)
         result: dict[str, list[RawChange]] = {}
@@ -1419,10 +1407,6 @@ class GitMirror:
         tracked = {path for _, _, _, path in staged}
         updates: list[bytes] = []
         oversized: list[bytes] = []
-        # Symlink targets are hashed from bytes; regular files are hashed by git from their path,
-        # so blob contents are not held in memory.
-        pending_blobs: dict[str, bytes] = {}
-        pending_paths: dict[str, bytes] = {}
         oid_len = len(head_oid)
         zero_oid = "0" * oid_len
         dir_cache: dict[Path, Path | None] = {}
@@ -1459,7 +1443,7 @@ class GitMirror:
                     continue
                 sym_oid = git_blob_oid(sym_target, oid_len=oid_len)
                 if previous is None or previous.oid != sym_oid or previous.mode != 0o120000:
-                    pending_blobs[sym_oid] = sym_target
+                    self._write_loose_blob(sym_oid, sym_target)
                     updates.append(f"{0o120000:o} {sym_oid}\t".encode("ascii") + path + b"\0")
                 continue
 
@@ -1487,7 +1471,7 @@ class GitMirror:
                 if sym_target is not None:
                     sym_oid = git_blob_oid(sym_target, oid_len=oid_len)
                     if previous is None or previous.oid != sym_oid or previous.mode != 0o120000:
-                        pending_blobs[sym_oid] = sym_target
+                        self._write_loose_blob(sym_oid, sym_target)
                         updates.append(f"{0o120000:o} {sym_oid}\t".encode("ascii") + path + b"\0")
                 else:
                     if path in original:
@@ -1505,7 +1489,7 @@ class GitMirror:
                 )
             oid_str = git_blob_oid(content, oid_len=oid_len)
             if previous is None or previous.oid != oid_str or previous.mode != working_mode:
-                pending_paths[oid_str] = path
+                self._write_loose_blob(oid_str, content)
                 updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
                 with contextlib.suppress(OSError):
                     st = os.lstat(source_repo / os.fsdecode(path))
@@ -1529,7 +1513,7 @@ class GitMirror:
                     continue
                 if state == "ok" and content is not None and working_mode is not None:
                     oid_str = git_blob_oid(content, oid_len=oid_len)
-                    pending_paths[oid_str] = path
+                    self._write_loose_blob(oid_str, content)
                     updates.append(f"{working_mode:o} {oid_str}\t".encode("ascii") + path + b"\0")
                     with contextlib.suppress(OSError):
                         st = os.lstat(source_repo / os.fsdecode(path))
@@ -1537,28 +1521,6 @@ class GitMirror:
 
         if not updates:
             return head_oid, oversized
-
-        if pending_blobs or pending_paths:
-            with self.open_batch_session() as batch:
-                missing_blobs = [
-                    b_bytes
-                    for b_oid, b_bytes in pending_blobs.items()
-                    if batch.read_object_bounded(b_oid, max_bytes=0) is None
-                ]
-                missing_paths = {
-                    b_oid: b_path
-                    for b_oid, b_path in pending_paths.items()
-                    if batch.read_object_bounded(b_oid, max_bytes=0) is None
-                }
-            for b_bytes in missing_blobs:
-                check_deadline()
-                run_safe_git(
-                    ["hash-object", "-w", "--stdin"],
-                    git_dir=self.git_dir,
-                    empty_hooks_dir=self.empty_hooks_dir,
-                    stdin_bytes=b_bytes,
-                )
-            self._hash_workspace_paths(source_repo, missing_paths)
 
         with tempfile.TemporaryDirectory(prefix="codecontext-index-") as temp_dir:
             env = {"GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
@@ -1627,34 +1589,24 @@ class GitMirror:
         self.pin_retained_oid(snapshot_oid)
         return snapshot_oid, oversized
 
-    def _hash_workspace_paths(self, source_repo: Path, expected: dict[str, bytes]) -> None:
-        """Write the files at `expected`'s paths into the mirror with one `hash-object` process and
-        check each lands under the OID computed when the file was read."""
-        if not expected:
+    def _write_loose_blob(self, oid: str, content: bytes) -> None:
+        """Store `content` as a loose blob under `oid` straight from the bytes already read, so a
+        file that changes after it was read cannot desync the snapshot and no git process runs."""
+        obj_dir = self.git_dir / "objects" / oid[:2]
+        target = obj_dir / oid[2:]
+        if target.exists():
             return
-        lines: list[bytes] = []
-        for path in expected.values():
-            if path.startswith(b"/") or b".." in path.split(b"/"):
-                raise CodeContextError(
-                    code="INVALID_REQUEST",
-                    message="Workspace path escapes the repository.",
-                    retryable=False,
-                )
-            lines.append(_quote_stdin_path(path) + b"\n")
-        written = run_safe_git(
-            ["hash-object", "-w", "--no-filters", "--stdin-paths"],
-            cwd=source_repo,
-            git_dir=self.git_dir,
-            empty_hooks_dir=self.empty_hooks_dir,
-            stdin_bytes=b"".join(lines),
-            timeout=300.0,
-        ).stdout.decode("ascii", errors="replace").split()
-        if written != list(expected):
-            raise CodeContextError(
-                code="IO_ERROR",
-                message="A workspace file changed while it was being captured. Run sync again.",
-                retryable=True,
-            )
+        obj_dir.mkdir(exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=obj_dir, prefix="tmp_obj_")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(zlib.compress(f"blob {len(content)}\0".encode("ascii") + content))
+            os.chmod(tmp_name, 0o444)
+            os.replace(tmp_name, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
 
     def prepare_snapshot(
         self,

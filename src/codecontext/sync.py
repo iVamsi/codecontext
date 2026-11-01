@@ -147,13 +147,22 @@ def _drain_commit_diff_jobs(
                 except CodeContextError as exc:
                     failed_this_sync.append(job_id)
                     _record_diff_job_failure(store, conn, job_id, commit_oid, exc.code)
-                except Exception:
+                except Exception as exc:
                     failed_this_sync.append(job_id)
-                    _record_diff_job_failure(store, conn, job_id, commit_oid, "INTERNAL")
+                    # Only the type name: exception text may carry paths or secrets.
+                    _record_diff_job_failure(
+                        store, conn, job_id, commit_oid, "INTERNAL", detail=type(exc).__name__
+                    )
 
 
 def _record_diff_job_failure(
-    store: Store, conn: sqlite3.Connection, job_id: str, commit_oid: str, error_code: str
+    store: Store,
+    conn: sqlite3.Connection,
+    job_id: str,
+    commit_oid: str,
+    error_code: str,
+    *,
+    detail: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -165,12 +174,13 @@ def _record_diff_job_failure(
     )
     state = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()["state"]
     if state == "retryable_error":
+        reason = f"{error_code}: {detail}" if detail else error_code
         Store.upsert_gap(
             conn,
             repository_id=store.config.repository_id,
             code="IO_ERROR",
             scope=f"git:commit:{commit_oid}",
-            message=f"Diffing commit {commit_oid[:12]} failed {MAX_DIFF_JOB_ATTEMPTS} times ({error_code}).",
+            message=f"Diffing commit {commit_oid[:12]} failed {MAX_DIFF_JOB_ATTEMPTS} times ({reason}).",
             retryable=True,
         )
 

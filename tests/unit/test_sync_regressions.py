@@ -486,6 +486,14 @@ def test_unexpected_error_in_one_commit_does_not_block_others(
             }
         assert jobs[bad]["state"] == "pending" and jobs[bad]["last_error_code"] == "INTERNAL"
         assert sum(r["state"] == "complete" for r in jobs.values()) == len(jobs) - 1
+        mem.sync(SyncRequest(offline=True))
+        mem.sync(SyncRequest(offline=True))
+        with mem._store.connect_read() as conn:
+            message = conn.execute(
+                "SELECT message FROM coverage_gaps WHERE code = 'IO_ERROR' AND scope = ?",
+                (f"git:commit:{bad}",),
+            ).fetchone()["message"]
+        assert "INTERNAL: ValueError" in message and "unexpected" not in message
 
 
 def test_sqlite_error_in_job_propagates_without_burning_attempt(

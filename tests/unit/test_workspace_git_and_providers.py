@@ -207,3 +207,61 @@ def test_github_graphql_backfill_helper(tmp_path: Path) -> None:
     assert seen[0].headers["Authorization"] == "Bearer fake_token"
     assert json.loads(seen[0].content)["variables"] == {"owner": "owner", "name": "repo", "cursor": None}
     store.close()
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_workspace_blobs_written_as_loose_objects_git_can_read(
+    tmp_path: Path, object_format: str
+) -> None:
+    from codecontext.git import GitMirror
+    from tests.fixtures.builders import run_git_fixture
+
+    repo = init_fixture_repo(tmp_path / "repo", object_format=object_format)
+    commit_fixture_spec(repo, GitCommitSpec(message="Base", files={"a.py": b"def a(): pass\n"}))
+    (repo / "a.py").write_bytes(b"def a(): return 1\n")
+    (repo / "new.txt").write_bytes(b"untracked \xff bytes\n")
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    try:
+        rev = mirror.prepare_snapshot("HEAD", include_workspace=True, include_untracked=True)
+        tree = {e.path: e.oid for e in mirror.list_tree_entries(rev)}
+        for name in ("a.py", "new.txt"):
+            expected = run_git_fixture(repo, ["hash-object", name]).decode().strip()
+            assert tree[name.encode()] == expected
+            shown = run_git_fixture(
+                repo, ["--git-dir", str(mirror.git_dir), "cat-file", "-p", expected]
+            )
+            assert shown == (repo / name).read_bytes()
+    finally:
+        mirror.close()
+        store.close()
+
+
+def test_file_changing_after_read_does_not_fail_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codecontext import workspace
+    from codecontext.git import GitMirror, git_blob_oid
+
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="Base", files={"a.py": b"def a(): pass\n"}))
+    (repo / "app.log").write_bytes(b"first\n")
+    original = workspace._read_root_confined_regular_file
+
+    def read_then_append(root, path, **kwargs):
+        result = original(root, path, **kwargs)
+        if path == b"app.log":
+            with open(repo / "app.log", "ab") as fh:
+                fh.write(b"appended later\n")
+        return result
+
+    monkeypatch.setattr(workspace, "_read_root_confined_regular_file", read_then_append)
+    store = Store.initialize(tmp_path / "store", InitRequest(repo_path=repo))
+    mirror = GitMirror(store)
+    try:
+        rev = mirror.prepare_snapshot("HEAD", include_workspace=True, include_untracked=True)
+        tree = {e.path: e.oid for e in mirror.list_tree_entries(rev)}
+        assert tree[b"app.log"] == git_blob_oid(b"first\n")
+    finally:
+        mirror.close()
+        store.close()
