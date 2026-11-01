@@ -5,6 +5,8 @@ their own store and rebinds that store to their checkout. A later publish
 replaces the snapshot only after this store has joined the latest publish.
 """
 
+import functools
+import hashlib
 import json
 import os
 import shutil
@@ -14,6 +16,7 @@ import urllib.parse
 from pathlib import Path
 
 from codecontext.archive import execute_export, sanitized_bare_git_config
+from codecontext.deadline import remaining_timeout
 from codecontext.errors import CodeContextError
 from codecontext.git import run_safe_git
 from codecontext.identity import (
@@ -24,7 +27,13 @@ from codecontext.identity import (
     us_to_iso_z,
 )
 from codecontext.models import ExportReport, ExportRequest, TeamMergeReport
-from codecontext.store import SCHEMA_VERSION, Store, inspect_local_git_repository, now_us
+from codecontext.store import (
+    SCHEMA_VERSION,
+    Store,
+    get_all_migrations,
+    inspect_local_git_repository,
+    now_us,
+)
 from codecontext.syntax import normalize_search_text
 
 TEAM_FILE = "team.json"
@@ -154,7 +163,12 @@ def _replace_tree(source: Path, destination: Path) -> None:
         )
     backup = destination.parent / f".{destination.name}.replaced"
     if backup.exists() or backup.is_symlink():
-        shutil.rmtree(backup)
+        # A leftover backup means an earlier swap stopped halfway; it may hold the only good copy.
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message=f"An earlier replace left {backup} behind. Check it and remove it, then retry.",
+            retryable=False,
+        )
     os.rename(destination, backup)
     try:
         os.rename(source, destination)
@@ -274,6 +288,90 @@ def _copy_regular_file(src: Path, dst: Path) -> None:
     shutil.copyfile(src, dst)
 
 
+_ALTERNATES_FILES = ("alternates", "http-alternates")
+_SHARE_COPIED_FILES = (
+    "store.json",
+    "memory.sqlite3",
+    "OVERVIEW.md",
+    "repository.git/HEAD",
+    "repository.git/packed-refs",
+)
+_SHARE_COPIED_TREES = ("repository.git/objects/", "repository.git/refs/")
+
+
+def _invalid_share(message: str) -> CodeContextError:
+    return CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def _verify_share_manifest(share_dir: Path) -> None:
+    """Check every file the share lists, and that nothing join or merge copies is unlisted."""
+    manifest_path = share_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise _invalid_share("Shared memory is missing manifest.json.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _invalid_share("Shared memory manifest.json could not be read.") from exc
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(files, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in files.items()
+    ):
+        raise _invalid_share("Shared memory manifest.json has an unsupported shape.")
+
+    present: set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(share_dir, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath) / name
+            if not path.is_symlink() and path.is_file():
+                present.add(path.relative_to(share_dir).as_posix())
+
+    for rel, expected in files.items():
+        if rel not in present or _file_sha256(share_dir / rel) != expected:
+            raise _invalid_share(f"Shared memory file {rel} does not match manifest.json.")
+    for rel in present - files.keys():
+        copied = rel in _SHARE_COPIED_FILES or rel.startswith(_SHARE_COPIED_TREES)
+        skipped = rel in tuple(f"repository.git/objects/info/{n}" for n in _ALTERNATES_FILES)
+        if copied and not skipped:
+            raise _invalid_share(f"Shared memory file {rel} is not listed in manifest.json.")
+
+
+@functools.lru_cache(maxsize=1)
+def _known_triggers() -> frozenset[tuple[str, str]]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        for _, sql, _ in get_all_migrations():
+            conn.executescript(sql)
+        return frozenset(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"))
+    finally:
+        conn.close()
+
+
+def _open_share_db(db_path: Path) -> sqlite3.Connection:
+    """Read-only connection to a share database that passed the schema and trigger checks."""
+    try:
+        conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db_path))}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise _invalid_share("Shared memory database could not be opened.") from exc
+    try:
+        try:
+            conn.execute("PRAGMA trusted_schema=OFF")
+            triggers = set(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"))
+        except sqlite3.Error as exc:
+            raise _invalid_share("Shared memory database could not be read.") from exc
+        if not triggers <= _known_triggers():
+            raise _invalid_share("Shared memory database contains unknown triggers.")
+        _require_supported_share_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def _copy_regular_tree(src: Path, dst: Path) -> None:
     _refuse_symlink(src, "Shared snapshot contains a symlink.")
     if not src.is_dir():
@@ -293,12 +391,25 @@ def _copy_regular_tree(src: Path, dst: Path) -> None:
             _refuse_symlink(child, "Shared snapshot contains a symlink.")
             if not child.is_file():
                 continue
-            if name == "alternates" and current.name == "info" and current.parent == dst:
+            if name in _ALTERNATES_FILES and current.name == "info" and current.parent == dst:
                 continue
             dest_file = current / name
-            if dest_file.exists():
+            if (
+                dest_file.is_file()
+                and not dest_file.is_symlink()
+                and dest_file.stat().st_size == child.stat().st_size
+                and _file_sha256(dest_file) == _file_sha256(child)
+            ):
                 continue
-            shutil.copyfile(child, dest_file)
+            # Readers never see a half-written object: write beside it, then swap it in.
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", dir=current)
+            os.close(fd)
+            try:
+                shutil.copyfile(child, tmp_name)
+                os.replace(tmp_name, dest_file)
+            except BaseException:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
 
 
 def _import_share(share_dir: Path, store_path: Path) -> None:
@@ -324,9 +435,6 @@ def _import_share(share_dir: Path, store_path: Path) -> None:
             src = src_git / name
             if src.exists():
                 _copy_regular_tree(src, dest_git / name)
-        alternates = dest_git / "objects" / "info" / "alternates"
-        if alternates.exists() and not alternates.is_symlink():
-            alternates.unlink()
         with sqlite3.connect(store_path / "memory.sqlite3") as conn:
             row = conn.execute("SELECT object_format FROM store_meta WHERE singleton = 1").fetchone()
         obj_fmt = str(row[0]) if row else "sha1"
@@ -382,7 +490,9 @@ def _rebind(store_path: Path, repo_path: Path) -> None:
     raw = json.loads(store_json_path.read_text(encoding="utf-8"))
     raw["read_only_archive"] = False
     raw["repo_path"] = str(resolved_repo)
-    store_json_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_json = store_json_path.with_name(".store.json.tmp")
+    tmp_json.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_json, store_json_path)
     store = Store.open(store_path, read_only=False)
     try:
         with store.write_transaction(bump_generation=False) as conn:
@@ -471,10 +581,14 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                 _ensure_checkout_ignore(dest, dest, resolved_repo)
                 return
 
+    _verify_share_manifest(share)
+    _open_share_db(share / "memory.sqlite3").close()
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}.joining-", dir=dest.parent))
     try:
         _import_share(share, staging)
+        # The share can change after the check above; check the copy we are about to open.
+        _open_share_db(staging / "memory.sqlite3").close()
         _rebind(staging, repo_path)
         _ensure_checkout_ignore(staging, dest, resolved_repo)
         if dest.exists():
@@ -482,7 +596,14 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
                 dest.rmdir()
                 os.rename(staging, dest)
             else:
-                _replace_tree(staging, dest)
+                existing = Store.open(dest, read_only=True)
+                try:
+                    with existing.acquire_writer_lock(
+                        timeout_seconds=remaining_timeout(5.0), allow_read_only=True
+                    ):
+                        _replace_tree(staging, dest)
+                finally:
+                    existing.close()
         else:
             os.rename(staging, dest)
     except Exception:
@@ -536,6 +657,16 @@ def _require_supported_share_schema(share: sqlite3.Connection) -> None:
         )
 
 
+def _text_list(raw: object, field: str) -> list[str]:
+    try:
+        items = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise _invalid_share(f"Shared memory claim has malformed {field}.") from exc
+    if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+        raise _invalid_share(f"Shared memory claim {field} must be a list of strings.")
+    return items
+
+
 def _index_merged_records(conn: sqlite3.Connection, share: sqlite3.Connection) -> None:
     """Add search rows for ready claims and summaries that came from the share."""
     claim_ids = [r[0] for r in share.execute("SELECT id FROM claims WHERE state = 'ready'")]
@@ -564,8 +695,10 @@ def _index_merged_records(conn: sqlite3.Connection, share: sqlite3.Connection) -
             (
                 claim_id,
                 normalize_search_text(statement),
-                normalize_search_text(" ".join(json.loads(constraints))),
-                normalize_search_text(f"{statement} {rationale or ''} {' '.join(json.loads(alts))}"),
+                normalize_search_text(" ".join(_text_list(constraints, "constraints_json"))),
+                normalize_search_text(
+                    f"{statement} {rationale or ''} {' '.join(_text_list(alts, 'alternatives_json'))}"
+                ),
                 meta,
             ),
         )
@@ -636,67 +769,57 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
     if not share_db_path.is_file() or share_db_path.is_symlink():
         raise CodeContextError(code="STORE_NOT_INITIALIZED", message="Shared memory is missing memory.sqlite3.", retryable=False)
 
-    schema_conn = sqlite3.connect(f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro", uri=True)
+    _verify_share_manifest(share)
+    share_conn = _open_share_db(share_db_path)
     try:
-        _require_supported_share_schema(schema_conn)
-    finally:
-        schema_conn.close()
+        share_git_objs = share / "repository.git" / "objects"
+        local_git_objs = dest / "repository.git" / "objects"
+        git_objs_copied = False
+        if share_git_objs.is_dir() and local_git_objs.is_dir():
+            _copy_regular_tree(share_git_objs, local_git_objs)
+            git_objs_copied = True
 
-    share_git_objs = share / "repository.git" / "objects"
-    local_git_objs = dest / "repository.git" / "objects"
-    git_objs_copied = False
-    if share_git_objs.is_dir() and local_git_objs.is_dir():
-        _copy_regular_tree(share_git_objs, local_git_objs)
-        git_objs_copied = True
-
-    local_store = Store.open(dest, read_only=False)
-    sources_merged = 0
-    source_versions_merged = 0
-    claims_merged = 0
-    summaries_merged = 0
-
-    try:
-        share_uri = f"file:{urllib.parse.quote(str(share_db_path))}?mode=ro"
-        share_conn = sqlite3.connect(share_uri, uri=True)
+        local_store = Store.open(dest, read_only=False)
         try:
-            with local_store.write_transaction(bump_generation=True) as conn:
-                # symbols reference their parent symbol; rows arrive in arbitrary order.
-                conn.execute("PRAGMA defer_foreign_keys = ON")
-                counts: dict[str, int] = {}
-                for tbl in MERGE_TABLE_ORDER:
-                    cols = _merge_columns(conn, share_conn, tbl)
-                    if not cols:
-                        continue
-                    col_names = ", ".join(cols)
-                    placeholders = ", ".join("?" for _ in cols)
-                    c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                    rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
-                    if rows:
-                        conn.executemany(
-                            f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
-                            rows,
-                        )
-                    counts[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] - c_before
-                _index_merged_records(conn, share_conn)
-                sources_merged = counts.get("sources", 0)
-                source_versions_merged = counts.get("source_versions", 0)
-                claims_merged = counts.get("claims", 0)
-                summaries_merged = counts.get("summaries", 0)
+            try:
+                with local_store.write_transaction(bump_generation=True) as conn:
+                    # symbols reference their parent symbol; rows arrive in arbitrary order.
+                    conn.execute("PRAGMA defer_foreign_keys = ON")
+                    counts: dict[str, int] = {}
+                    for tbl in MERGE_TABLE_ORDER:
+                        cols = _merge_columns(conn, share_conn, tbl)
+                        if not cols:
+                            continue
+                        col_names = ", ".join(cols)
+                        placeholders = ", ".join("?" for _ in cols)
+                        c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                        rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
+                        if rows:
+                            conn.executemany(
+                                f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
+                                rows,
+                            )
+                        counts[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] - c_before
+                    _index_merged_records(conn, share_conn)
+            except sqlite3.IntegrityError as exc:
+                raise _invalid_share(
+                    "Shared memory has records that point at rows it does not contain. Nothing was merged."
+                ) from exc
+
+            local_team_file = dest / TEAM_FILE
+            if local_team_file.is_file():
+                _write_team(dest, team)
+
+            return TeamMergeReport(
+                repository_id=str(team["repository_id"]),
+                generation=_store_generation(local_store),
+                git_objects_fetched=git_objs_copied,
+                sources_merged=counts.get("sources", 0),
+                source_versions_merged=counts.get("source_versions", 0),
+                claims_merged=counts.get("claims", 0),
+                summaries_merged=counts.get("summaries", 0),
+            )
         finally:
-            share_conn.close()
-
-        local_team_file = dest / TEAM_FILE
-        if local_team_file.is_file():
-            _write_team(dest, team)
-
-        return TeamMergeReport(
-            repository_id=str(team["repository_id"]),
-            generation=_store_generation(local_store),
-            git_objects_fetched=git_objs_copied,
-            sources_merged=sources_merged,
-            source_versions_merged=source_versions_merged,
-            claims_merged=claims_merged,
-            summaries_merged=summaries_merged,
-        )
+            local_store.close()
     finally:
-        local_store.close()
+        share_conn.close()

@@ -1,5 +1,7 @@
+import hashlib
 import json
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -9,7 +11,7 @@ from codecontext.git import GitMirror
 from codecontext.memory import Memory
 from codecontext.models import InitRequest, SearchRequest, SyncRequest
 from codecontext.store import Store
-from codecontext.team import execute_team_merge, project_remote_key
+from codecontext.team import execute_join, execute_team_merge, project_remote_key
 from tests.fixtures.builders import (
     GitCommitSpec,
     commit_fixture_spec,
@@ -154,6 +156,19 @@ def _merge_setup(tmp_path):
     return share, store_b, repo_b
 
 
+def _resign(share) -> None:
+    """Recompute manifest hashes so a test can edit the share on purpose."""
+    path = share / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    for rel in manifest["files"]:
+        manifest["files"][rel] = hashlib.sha256((share / rel).read_bytes()).hexdigest()
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _sha256(path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _add_decision(share, claim_id: str, text: str) -> None:
     with sqlite3.connect(share / "memory.sqlite3") as conn:
         conn.execute(
@@ -171,6 +186,7 @@ def _add_decision(share, claim_id: str, text: str) -> None:
 def test_merge_claim_with_new_episode_succeeds_and_is_searchable(tmp_path) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     _add_decision(share, "claim_" + "a" * 64, "adopt zebra caching strategy")
+    _resign(share)
     report = execute_team_merge(store_b, share, repo_b)
     assert report.claims_merged == 1
     with Memory.open(store_b) as mem:
@@ -183,6 +199,7 @@ def test_merge_ignores_injected_share_column(tmp_path) -> None:
     with sqlite3.connect(share / "memory.sqlite3") as conn:
         conn.execute('ALTER TABLE claims ADD COLUMN "x) --" TEXT')
     _add_decision(share, "claim_" + "b" * 64, "ignore injected columns")
+    _resign(share)
     execute_team_merge(store_b, share, repo_b)
     with sqlite3.connect(store_b / "memory.sqlite3") as conn:
         assert "x) --" not in [r[1] for r in conn.execute("PRAGMA table_info(claims)")]
@@ -193,6 +210,7 @@ def test_merge_rejects_share_with_newer_schema(tmp_path) -> None:
     share, store_b, repo_b = _merge_setup(tmp_path)
     with sqlite3.connect(share / "memory.sqlite3") as conn:
         conn.execute("UPDATE store_meta SET schema_version = 99")
+    _resign(share)
     objs = store_b / "repository.git" / "objects"
     before = sorted(str(p) for p in objs.rglob("*"))
     with pytest.raises(CodeContextError) as exc:
@@ -235,7 +253,211 @@ def test_merge_evidence_pointing_at_new_change_and_hunk_has_no_dangling_fk(tmp_p
             "INSERT INTO claim_evidence (claim_id, evidence_id, role) VALUES (?, 'ev_x', 'support')",
             ("claim_" + "c" * 64,),
         )
+    _resign(share)
     execute_team_merge(store_b, share, repo_b)
     with sqlite3.connect(store_b / "memory.sqlite3") as conn:
         assert conn.execute("SELECT COUNT(*) FROM hunks WHERE id = 'hunk_x'").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def _join_setup(tmp_path):
+    origin = "https://github.com/acme/widget.git"
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    _repo(repo_a, origin, b"def hello():\n    return 1\n")
+    _repo(repo_b, origin, b"def hello():\n    return 1\n")
+    share = tmp_path / "share"
+    with Memory.initialize(tmp_path / "store-a", InitRequest(repo_path=repo_a)) as mem:
+        mem.sync(SyncRequest(revision="HEAD", offline=True))
+        mem.publish(share)
+    return share, repo_b / ".codecontext", repo_b
+
+
+def test_join_rejects_tampered_share(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    db = share / "memory.sqlite3"
+    data = bytearray(db.read_bytes())
+    data[-1] ^= 0xFF
+    db.write_bytes(bytes(data))
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert not store_b.exists()
+
+
+def test_join_rejects_unlisted_object(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    planted = share / "repository.git" / "objects" / "ab" / ("c" * 38)
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_bytes(b"planted")
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
+def test_join_rejects_share_with_triggers(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute(
+            "CREATE TRIGGER evil AFTER UPDATE ON store_meta BEGIN"
+            " UPDATE store_meta SET principal_id = 'owned'; END"
+        )
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert not store_b.exists()
+
+
+def test_join_rejects_share_with_newer_schema(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute("UPDATE store_meta SET schema_version = 99")
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert not store_b.exists()
+
+
+def test_join_while_writer_lock_held_is_store_busy(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    # Without a local team.json the store has not seen this publish, so join swaps it.
+    (store_b / "team.json").unlink()
+    holder = Store.open(store_b)
+    try:
+        with holder.acquire_writer_lock(timeout_seconds=1):
+            with pytest.raises(CodeContextError) as exc:
+                execute_join(store_b, share, repo_b)
+    finally:
+        holder.close()
+    assert exc.value.code == "STORE_BUSY"
+    assert not (store_b / "team.json").exists()
+
+
+def test_join_refuses_when_replaced_backup_exists(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    (store_b / "team.json").unlink()
+    backup = store_b.parent / f".{store_b.name}.replaced"
+    backup.mkdir()
+    (backup / "keep.txt").write_text("keep", encoding="utf-8")
+    with pytest.raises(CodeContextError) as exc:
+        execute_join(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert (backup / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_sync_during_join_keeps_committed_writes(tmp_path) -> None:
+    share, store_b, repo_b = _join_setup(tmp_path)
+    execute_join(store_b, share, repo_b)
+    (store_b / "team.json").unlink()
+    with Memory.open(store_b, read_only=True) as mem:
+        rev_before_join = mem.status().revision
+    share_rev = json.loads((share / "team.json").read_text(encoding="utf-8"))["active_revision"]
+    commit_fixture_spec(repo_b, GitCommitSpec(message="more", files={"src/b.py": b"x = 1\n"}))
+
+    sync_holds_lock = threading.Event()
+    errors: list[BaseException] = []
+
+    def sync_with_lock() -> None:
+        try:
+            with Memory.open(store_b) as mem:
+                with mem._store.acquire_writer_lock(timeout_seconds=5):
+                    sync_holds_lock.set()
+                    mem.sync(SyncRequest(revision="HEAD", offline=True))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            sync_holds_lock.set()
+
+    def join_after_sync_starts() -> None:
+        sync_holds_lock.wait(timeout=10)
+        try:
+            execute_join(store_b, share, repo_b)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=sync_with_lock), threading.Thread(target=join_after_sync_starts)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert errors == []
+    with Memory.open(store_b, read_only=True) as mem:
+        final_status = mem.status()
+    assert final_status.revision in (rev_before_join, share_rev)
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_truncated_object_is_repaired_on_merge(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    share_objs = share / "repository.git" / "objects"
+    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    local_obj = store_b / "repository.git" / "objects" / rel
+    local_obj.write_bytes(b"x")
+    execute_team_merge(store_b, share, repo_b)
+    assert _sha256(local_obj) == _sha256(share_objs / rel)
+
+
+def test_merge_rejects_tampered_share_before_copying_objects(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    share_objs = share / "repository.git" / "objects"
+    rel = next(p for p in share_objs.rglob("*") if p.is_file()).relative_to(share_objs)
+    local_obj = store_b / "repository.git" / "objects" / rel
+    local_obj.write_bytes(b"x")
+    _add_decision(share, "claim_" + "f" * 64, "unsigned change")
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    assert local_obj.read_bytes() == b"x"
+
+
+def test_merge_does_not_copy_http_alternates(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    info = share / "repository.git" / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "http-alternates").write_text("https://evil.example/objects\n", encoding="utf-8")
+    execute_team_merge(store_b, share, repo_b)
+    assert not (store_b / "repository.git" / "objects" / "info" / "http-alternates").exists()
+
+
+def test_merge_rejects_malformed_claim_json(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "1" * 64, "bad constraints")
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute("UPDATE claims SET constraints_json = 'not json'")
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
+def test_merge_rejects_non_string_alternatives(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "2" * 64, "bad alternatives")
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute("UPDATE claims SET alternatives_json = '[1, 2]'")
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
+def test_merge_rejects_dangling_foreign_key_and_rolls_back(tmp_path) -> None:
+    share, store_b, repo_b = _merge_setup(tmp_path)
+    _add_decision(share, "claim_" + "3" * 64, "dangling hunk")
+    with sqlite3.connect(share / "memory.sqlite3") as conn:
+        conn.execute(
+            "INSERT INTO hunks (id, change_id, ordinal, old_start, old_count, new_start, new_count)"
+            " VALUES ('hunk_dangling', 'chg_missing', 0, 1, 1, 1, 1)"
+        )
+    _resign(share)
+    with pytest.raises(CodeContextError) as exc:
+        execute_team_merge(store_b, share, repo_b)
+    assert exc.value.code == "INVALID_REQUEST"
+    with sqlite3.connect(store_b / "memory.sqlite3") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
