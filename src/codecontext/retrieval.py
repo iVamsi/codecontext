@@ -3058,8 +3058,7 @@ def execute_context(
                 omitted_code_count += 1
                 continue
             if len(admitted_code) == 1 and len(admitted_code[0].text) > 512:
-                c0 = admitted_code[0]
-                admitted_code[0] = c0.model_copy(update={"text": c0.text[: len(c0.text) // 2]})
+                admitted_code[0] = _cut_code_view_on_line(admitted_code[0])
                 continue
             if len(admitted_code) == 1:
                 admitted_code.pop()
@@ -3069,12 +3068,71 @@ def execute_context(
                 omitted_persisted_gaps += len(all_gaps) - 3
                 all_gaps = all_gaps[:3]
                 continue
-            break
+            cited_ids = {
+                ref.id
+                for d in admitted_decisions
+                for ref in (
+                    *d.evidence_refs,
+                    *d.counterevidence_refs,
+                    *d.applicability_evidence_refs,
+                )
+            }
+            uncited_ids = [ev_id for ev_id in admitted_ev_map if ev_id not in cited_ids]
+            if uncited_ids:
+                for ev_id in uncited_ids:
+                    del admitted_ev_map[ev_id]
+                    add_expand(ev_id, "Expand omitted raw evidence")
+                omitted_ev_count += len(uncited_ids)
+                continue
+            if admitted_decisions:
+                dropped = admitted_decisions.pop()
+                add_expand(dropped.id, "Expand omitted decision bundle")
+                omitted_decisions_count += 1
+                still_cited = {
+                    ref.id
+                    for d in admitted_decisions
+                    for ref in (
+                        *d.evidence_refs,
+                        *d.counterevidence_refs,
+                        *d.applicability_evidence_refs,
+                    )
+                }
+                for ref in (
+                    *dropped.evidence_refs,
+                    *dropped.counterevidence_refs,
+                    *dropped.applicability_evidence_refs,
+                ):
+                    if ref.id not in still_cited and admitted_ev_map.pop(ref.id, None) is not None:
+                        omitted_ev_count += 1
+                continue
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message=(
+                    f"max_tokens ({request.max_tokens}) is too small for the context envelope "
+                    f"({used_tokens} tokens)."
+                ),
+                retryable=False,
+                details={"minimum_required_tokens": used_tokens, "requested_tokens": request.max_tokens},
+            )
 
     if pre_authorize_hook is not None:
         pre_authorize_hook()
     store.verify_access_epoch_and_authorize(expected_epoch)
     return pack
+
+
+def _cut_code_view_on_line(view: CodeView) -> CodeView:
+    """Halve the text on a line boundary so the anchor span still describes the bytes shown."""
+    half = view.text[: len(view.text) // 2]
+    cut = half.rfind("\n") + 1
+    text = half[:cut] if cut > 0 else half
+    span = view.anchor.span
+    update: dict[str, int] = {"byte_end": span.byte_start + len(text.encode())}
+    if span.line_start is not None:
+        newlines = text.count("\n")
+        update["line_end"] = span.line_start + max(0, newlines - 1 if text.endswith("\n") else newlines)
+    anchor = view.anchor.model_copy(update={"span": span.model_copy(update=update)})
+    return view.model_copy(update={"text": text, "anchor": anchor})
 
 
 def _compute_rationale_status(

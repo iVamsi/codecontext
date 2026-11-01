@@ -282,3 +282,43 @@ def test_f04_ambiguous_target_and_i08_reads_have_no_hidden_processing(
     assert st_res.generation == pack.generation
 
     ro_store.close()
+
+
+def _big_file_context(tmp_path: Path, max_tokens: int):
+    repo_dir = init_fixture_repo(tmp_path / "big_repo")
+    body = b"".join(f"value_{i} = {i}  # filler line for budget\n".encode() for i in range(600))
+    commit_fixture_spec(repo_dir, GitCommitSpec(message="Big file", files={"src/big.py": body}))
+    store = Store.initialize(tmp_path / "big_store", InitRequest(repo_path=repo_dir))
+    mirror = GitMirror(store)
+    active_rev = mirror.prepare_snapshot("HEAD")
+    index_active_snapshot_files(store, mirror)
+    index_focused_path_history(store, mirror, active_revision=active_rev, focus_path=b"src/big.py")
+    pack = execute_context(
+        store,
+        mirror,
+        ContextRequest(
+            query="Why this file?",
+            target=PathTarget(kind="path", path="src/big.py"),
+            max_tokens=max_tokens,
+        ),
+        workspace_path=None,
+    )
+    store.close()
+    return pack, body
+
+
+def test_context_never_exceeds_requested_tokens(tmp_path: Path) -> None:
+    pack, _ = _big_file_context(tmp_path, 1600)
+    assert pack.budget.truncated is True
+    assert pack.budget.used_tokens <= pack.budget.requested_tokens
+
+
+def test_truncated_code_anchor_matches_text(tmp_path: Path) -> None:
+    pack, body = _big_file_context(tmp_path, 1600)
+    assert pack.code, "target code must survive the trim"
+    view = pack.code[0]
+    span = view.anchor.span
+    assert len(view.text.encode()) == span.byte_end - span.byte_start
+    assert view.text.endswith("\n")
+    assert body[span.byte_start : span.byte_end].decode() == view.text
+    assert span.line_end - span.line_start + 1 == view.text.count("\n")
