@@ -21,6 +21,7 @@ from codecontext.identity import (
     canonical_sha256,
     make_episode_id,
     make_relation_id,
+    us_to_iso_z,
 )
 from codecontext.store import Store, now_us
 
@@ -319,10 +320,10 @@ def verify_and_bind_gitlab_project(
 
     with store.connect_read() as conn:
         meta = conn.execute(
-            "SELECT github_repository_id, principal_id FROM store_meta WHERE singleton = 1"
+            "SELECT gitlab_project_id, principal_id FROM store_meta WHERE singleton = 1"
         ).fetchone()
         assert meta is not None
-        stored_proj_id = meta["github_repository_id"]
+        stored_proj_id = meta["gitlab_project_id"]
         stored_principal = meta["principal_id"]
 
     current_principal: str | None = None
@@ -377,7 +378,7 @@ def verify_and_bind_gitlab_project(
         conn.execute(
             """
             UPDATE store_meta
-            SET github_repository_id = ?,
+            SET gitlab_project_id = ?,
                 principal_id = COALESCE(principal_id, ?)
             WHERE singleton = 1
             """,
@@ -402,7 +403,27 @@ def _gitlab_cursor(store: Store, key: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _save_gitlab_cursor(store: Store, key: str, payload: dict[str, Any]) -> None:
+def _gitlab_updated_after(store: Store, watermark_key: str) -> str | None:
+    """Return the `updated_after` value for a new listing pass, or None for a full backfill."""
+    with store.connect_read() as conn:
+        row = conn.execute(
+            "SELECT high_watermark_us FROM checkpoints WHERE stream_key = ?",
+            (watermark_key,),
+        ).fetchone()
+    if row is None or row["high_watermark_us"] is None:
+        return None
+    return us_to_iso_z(int(row["high_watermark_us"]))
+
+
+def _save_gitlab_cursor(
+    store: Store,
+    key: str,
+    payload: dict[str, Any],
+    *,
+    watermark: tuple[str, int | None] | None = None,
+) -> None:
+    """Save the resume cursor and, in the same transaction, raise a stream's watermark."""
+    ts = now_us()
     with store.write_transaction(bump_generation=False) as conn:
         conn.execute(
             """
@@ -412,8 +433,65 @@ def _save_gitlab_cursor(store: Store, key: str, payload: dict[str, Any]) -> None
                 cursor_json = excluded.cursor_json,
                 last_success_at_us = excluded.last_success_at_us
             """,
-            (key, canonical_json(payload), now_us()),
+            (key, canonical_json(payload), ts),
         )
+        if watermark is not None and watermark[1] is not None:
+            conn.execute(
+                """
+                INSERT INTO checkpoints (stream_key, cursor_json, high_watermark_us, last_success_at_us)
+                VALUES (?, '{}', ?, ?)
+                ON CONFLICT(stream_key) DO UPDATE SET
+                    high_watermark_us = MAX(COALESCE(checkpoints.high_watermark_us, 0), excluded.high_watermark_us),
+                    last_success_at_us = excluded.last_success_at_us
+                """,
+                (watermark[0], watermark[1], ts),
+            )
+
+
+def _cursor_position(cursor: dict[str, Any]) -> tuple[int | None, list[int]]:
+    """Read the `(updated_at_us, iids seen at that instant)` resume position from a cursor."""
+    pos = cursor.get("pos")
+    if isinstance(pos, list) and len(pos) == 2 and isinstance(pos[0], int) and isinstance(pos[1], list):
+        return pos[0], [i for i in pos[1] if isinstance(i, int)]
+    return None, []
+
+
+def _list_since(pos_us: int | None, pass_since: str | None) -> str | None:
+    # updated_after is inclusive, so ties at pos_us come back and are skipped through the seen iids.
+    return us_to_iso_z(pos_us) if pos_us else pass_since
+
+
+def _already_seen(item: dict[str, Any], pos_us: int | None, seen: list[int]) -> bool:
+    ts = _parse_opt_time_us(item.get("updated_at")) or 0
+    if pos_us is None:
+        return False
+    return ts < pos_us or (ts == pos_us and int(item["iid"]) in seen)
+
+
+def _advance(item: dict[str, Any], pos_us: int | None, seen: list[int]) -> tuple[int, list[int]]:
+    ts = _parse_opt_time_us(item.get("updated_at")) or 0
+    return (ts, [*seen, int(item["iid"])]) if ts == pos_us else (ts, [int(item["iid"])])
+
+
+def _next_list_page(next_p: str | None, progressed: bool) -> str | None:
+    # After progress, re-query page 1 from the new position: page numbers shift whenever an item
+    # is updated mid-pass, so following them can silently skip items.
+    if not next_p:
+        return None
+    return "1" if progressed else next_p
+
+
+def _sorted_page(items: list[Any]) -> list[dict[str, Any]]:
+    rows = [i for i in items if isinstance(i, dict) and "iid" in i]
+    return sorted(rows, key=lambda i: (_parse_opt_time_us(i.get("updated_at")) or 0, int(i["iid"])))
+
+
+def _gitlab_list_path(base: str, page: str, updated_after: str | None) -> str:
+    # Ascending updated_at order lets the watermark trail exactly what has been committed.
+    path = f"{base}?state=all&order_by=updated_at&sort=asc&per_page=100&page={page}"
+    if updated_after:
+        path += f"&updated_after={urllib.parse.quote(updated_after, safe='')}"
+    return path
 
 
 def collect_gitlab_merge_requests_and_issues(
@@ -443,13 +521,18 @@ def collect_gitlab_merge_requests_and_issues(
         remaining_requests=budget_left(),
     )
     stream_key = f"gitlab:{proj_id_str}:collection"
+    mr_wm_key = f"gitlab:{proj_id_str}:merge_requests_wm"
+    issue_wm_key = f"gitlab:{proj_id_str}:issues_wm"
     cursor = _gitlab_cursor(store, stream_key)
     if cursor.get("phase") == "done":
         cursor = {}
+    # A pass resumes from its last committed (updated_at, iid) position, never from a bare page
+    # number, so items that moved while paused are still visited.
+    saved_since = cursor.get("since") if isinstance(cursor.get("since"), str) else None
+    pos_us, seen = _cursor_position(cursor)
 
     phase = str(cursor.get("phase") or "merge_requests")
     page = str(cursor.get("page") or "1")
-    skip_iid = cursor.get("skip_iid") if isinstance(cursor.get("skip_iid"), int) else None
     discussion_iid = cursor.get("discussion_iid") if isinstance(cursor.get("discussion_iid"), int) else None
     discussion_page = str(cursor.get("discussion_page") or "1")
 
@@ -457,28 +540,26 @@ def collect_gitlab_merge_requests_and_issues(
         _save_gitlab_cursor(store, stream_key, payload)
         return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
 
-    # 1. Enumerate Merge Requests (`/projects/{id}/merge_requests?state=all&per_page=100`)
+    # 1. Enumerate Merge Requests incrementally from the stored updated_at watermark.
     if phase != "issues":
-        passed_skip = skip_iid is None
+        mr_since = saved_since if cursor else _gitlab_updated_after(store, mr_wm_key)
         while page:
             if budget_left() <= 0:
-                return paused({"phase": "merge_requests", "page": page, "skip_iid": skip_iid,
-                               "discussion_iid": discussion_iid, "discussion_page": discussion_page})
+                return paused({"phase": "merge_requests", "page": page, "pos": [pos_us, seen],
+                               "discussion_iid": discussion_iid, "discussion_page": discussion_page,
+                               "since": mr_since})
             st_mr, mrs_data, next_p = client.get_json(
-                f"/projects/{encoded_proj}/merge_requests?state=all&per_page=100&page={page}",
+                _gitlab_list_path(f"/projects/{encoded_proj}/merge_requests", page, _list_since(pos_us, mr_since)),
                 remaining_requests=budget_left(),
             )
             if st_mr == 404 or not isinstance(mrs_data, list):
                 break
 
-            for mr in mrs_data:
-                if not isinstance(mr, dict) or "iid" not in mr:
+            progressed = False
+            for mr in _sorted_page(mrs_data):
+                if _already_seen(mr, pos_us, seen):
                     continue
                 iid = int(mr["iid"])
-                if not passed_skip:
-                    if iid == skip_iid:
-                        passed_skip = True
-                    continue
                 merge_sha = mr.get("merge_commit_sha") or mr.get("squash_commit_sha")
                 head_sha = mr.get("sha")
                 author_raw = mr.get("author") or {}
@@ -510,6 +591,7 @@ def collect_gitlab_merge_requests_and_issues(
                             "state": mr.get("state"),
                         },
                         raw_payload=mr,
+                        provider="gitlab",
                     )
                     if s_a:
                         sources_added += 1
@@ -565,7 +647,8 @@ def collect_gitlab_merge_requests_and_issues(
                                 "discussion_page": disc_page,
                                 "page": page,
                                 "phase": "merge_requests",
-                                "skip_iid": skip_iid,
+                                "pos": [pos_us, seen],
+                                "since": mr_since,
                             }
                         )
                     st_d, discs_data, next_d = client.get_json(
@@ -618,6 +701,7 @@ def collect_gitlab_merge_requests_and_issues(
                                         anchors=n_anchors,
                                         lifecycle_fields={},
                                         raw_payload=note,
+                                        provider="gitlab",
                                     )
                                     if sa:
                                         sources_added += 1
@@ -636,38 +720,50 @@ def collect_gitlab_merge_requests_and_issues(
                                 (ep_fp, ep_id),
                             )
                     disc_page = next_d if st_d == 200 else None
-                skip_iid = iid
+                pos_us, seen = _advance(mr, pos_us, seen)
+                progressed = True
                 discussion_iid = None
                 discussion_page = "1"
+                # The watermark only ever covers MRs that are fully processed.
                 _save_gitlab_cursor(
                     store,
                     stream_key,
-                    {"page": page, "phase": "merge_requests", "skip_iid": iid},
+                    {"page": "1", "phase": "merge_requests", "pos": [pos_us, seen], "since": mr_since},
+                    watermark=(mr_wm_key, pos_us or None),
                 )
 
-            page = next_p
-            skip_iid = None
-            passed_skip = True
-            if page:
-                _save_gitlab_cursor(store, stream_key, {"page": page, "phase": "merge_requests"})
-        phase = "issues"
-        page = "1"
+            page = _next_list_page(next_p, progressed)
+            _save_gitlab_cursor(
+                store,
+                stream_key,
+                {"page": page, "phase": "merge_requests", "pos": [pos_us, seen], "since": mr_since}
+                if page
+                else {"page": "1", "phase": "issues", "since": _gitlab_updated_after(store, issue_wm_key)},
+            )
+        pos_us, seen = None, []
+        iss_page: str | None = "1"
+        iss_since = _gitlab_updated_after(store, issue_wm_key)
+    else:
+        iss_page = page
+        iss_since = saved_since
 
-    # 2. Enumerate GitLab Issues (`/projects/{id}/issues?state=all&per_page=100`)
-    iss_page = page if phase == "issues" else "1"
+    # 2. Enumerate GitLab Issues incrementally from the stored updated_at watermark.
     while iss_page:
         if budget_left() <= 0:
-            return paused({"page": iss_page, "phase": "issues"})
+            return paused({"page": iss_page, "phase": "issues", "pos": [pos_us, seen], "since": iss_since})
         st_i, issues_data, next_ip = client.get_json(
-            f"/projects/{encoded_proj}/issues?state=all&per_page=100&page={iss_page}",
+            _gitlab_list_path(f"/projects/{encoded_proj}/issues", iss_page, _list_since(pos_us, iss_since)),
             remaining_requests=budget_left(),
         )
         if st_i == 404 or not isinstance(issues_data, list):
             break
+        progressed = False
         with store.write_transaction(bump_generation=True) as conn:
-            for iss in issues_data:
-                if not isinstance(iss, dict) or "iid" not in iss:
+            for iss in _sorted_page(issues_data):
+                if _already_seen(iss, pos_us, seen):
                     continue
+                pos_us, seen = _advance(iss, pos_us, seen)
+                progressed = True
                 i_auth = iss.get("author") or {}
                 _, _, sa, va = upsert_github_source_and_version(
                     conn,
@@ -688,14 +784,21 @@ def collect_gitlab_merge_requests_and_issues(
                     anchors={"number": int(iss["iid"]), "repository": project_path},
                     lifecycle_fields={"state": iss.get("state")},
                     raw_payload=iss,
+                    provider="gitlab",
                 )
                 if sa:
                     sources_added += 1
                 if va:
                     versions_added += 1
-        iss_page = next_ip
-        if iss_page:
-            _save_gitlab_cursor(store, stream_key, {"page": iss_page, "phase": "issues"})
+        iss_page = _next_list_page(next_ip, progressed)
+        _save_gitlab_cursor(
+            store,
+            stream_key,
+            {"page": iss_page, "phase": "issues", "pos": [pos_us, seen], "since": iss_since}
+            if iss_page
+            else {"phase": "done"},
+            watermark=(issue_wm_key, pos_us or None),
+        )
 
     _save_gitlab_cursor(store, stream_key, {"phase": "done"})
     return (client.requests_attempted - start_reqs, sources_added, versions_added, True)

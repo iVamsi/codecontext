@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -451,9 +452,9 @@ def execute_export(store: Store, request: ExportRequest) -> ExportReport:
                     rel = fpath.relative_to(tmp_export_dir).as_posix()
                     if rel == "manifest.json":
                         continue
-                    fbytes = fpath.read_bytes()
-                    file_hashes[rel] = sha256_bytes(fbytes)
-                    total_bytes += len(fbytes)
+                    with fpath.open("rb") as f:
+                        file_hashes[rel] = hashlib.file_digest(f, "sha256").hexdigest()
+                    total_bytes += fpath.stat().st_size
                     file_count += 1
 
             manifest_payload = {

@@ -21,6 +21,7 @@ from codecontext.identity import (
     format_iso_z,
     parse_iso_utc,
     validate_github_repo_name,
+    validate_gitlab_project_path,
     validate_relative_repo_path_bytes,
 )
 
@@ -240,7 +241,7 @@ class Anchor(PublicModel):
 
 
 class Attribution(PublicModel):
-    provider: Literal["github", "git", "unknown"]
+    provider: Literal["github", "gitlab", "git", "unknown"]
     actor_id: Annotated[str, Field(max_length=200)] | None = None
     display_name: Annotated[str, Field(max_length=400)] | None = None
     source_url: Annotated[str, Field(max_length=4096)] | None = None
@@ -416,7 +417,7 @@ class SearchHit(PublicModel):
     title: Annotated[str, Field(max_length=1000)]
     snippet: Annotated[str, Field(max_length=320)]
     rank: Positive
-    match: Literal["exact_id", "exact_path", "exact_symbol", "lexical"]
+    match: Literal["exact_id", "exact_path", "exact_symbol", "lexical", "semantic", "hybrid"]
     path: PathRef | None = None
     evidence_id: RecordID | None = None
     state: DerivedState | None = None
@@ -699,8 +700,10 @@ class SourceRecord(PublicModel):
         "review",
         "review_comment",
         "timeline_event",
+        "adr",
+        "design_doc",
     ]
-    provider: Literal["github"]
+    provider: Literal["github", "gitlab", "git"]
     repository_provider_id: Annotated[str, Field(min_length=1, max_length=200)]
     provider_id: Annotated[str, Field(min_length=1, max_length=200)]
     parent_source_id: RecordID | None = None
@@ -834,12 +837,14 @@ class RecordPage(Envelope):
 
 
 class Capabilities(PublicModel):
-    syntax_languages: Annotated[list[str], Field(max_length=10)]
+    syntax_languages: Annotated[list[str], Field(max_length=64)]
     text_fallback: bool
     git_history: bool
     github_history: bool
+    gitlab_history: bool = False
     offline_git_objects: bool
     enriched_claims_available: bool
+    semantic_embeddings_available: bool = False
 
 
 class QueueCounts(PublicModel):
@@ -855,6 +860,7 @@ class Status(Envelope):
     access_state: Literal["allowed", "blocked"]
     read_only: bool
     github_repository: Annotated[str, Field(max_length=200)] | None = None
+    gitlab_repository: Annotated[str, Field(max_length=300)] | None = None
     object_format: Literal["sha1", "sha256"]
     jobs: QueueCounts
     snapshot_file_count: NonNegative
@@ -1034,12 +1040,25 @@ QueryText = Annotated[str, Field(min_length=1, max_length=4500), AfterValidator(
 class InitRequest(PublicModel):
     repo_path: Path
     github_repository: Annotated[str, Field(min_length=3, max_length=200)] | None = None
+    gitlab_repository: Annotated[str, Field(min_length=3, max_length=300)] | None = None
+    gitlab_project_path: Annotated[str, Field(min_length=3, max_length=300)] | None = None
+    gitlab_base_url: Annotated[str, Field(min_length=8, max_length=500)] | None = None
     allowed_issue_repositories: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_init(self) -> "InitRequest":
         if self.github_repository is not None:
             validate_github_repo_name(self.github_repository)
+        if self.gitlab_repository is not None:
+            validate_gitlab_project_path(self.gitlab_repository)
+        if self.gitlab_project_path is not None:
+            validate_gitlab_project_path(self.gitlab_project_path)
+            if self.gitlab_repository is None:
+                object.__setattr__(self, "gitlab_repository", self.gitlab_project_path)
+        elif self.gitlab_repository is not None:
+            object.__setattr__(self, "gitlab_project_path", self.gitlab_repository)
+        if self.gitlab_base_url is not None and not self.gitlab_base_url.startswith("https://"):
+            raise ValueError("gitlab_base_url must use https://")
         seen: set[str] = set()
         for entry in self.allowed_issue_repositories:
             validate_github_repo_name(entry)
@@ -1057,6 +1076,9 @@ class SyncRequest(PublicModel):
     focus: Target | None = None
     max_requests: Annotated[int, Field(ge=1, le=100_000)] = 1000
     max_seconds: Annotated[int, Field(ge=1, le=86_400)] = 900
+    include_untracked: bool = False
+    use_graphql: bool = False
+    ingest_docs: bool = True
 
 
 class EnrichRequest(PublicModel):
@@ -1065,6 +1087,8 @@ class EnrichRequest(PublicModel):
     max_output_tokens: Annotated[int, Field(ge=1, le=1_000_000_000)]
     max_calls: Annotated[int, Field(ge=1, le=1_000_000)]
     max_cost_usd: Decimal | None = None
+    concurrency: Annotated[int, Field(ge=1, le=16)] = 1
+    generate_embeddings: bool = False
 
     @model_validator(mode="after")
     def _validate_enrich(self) -> "EnrichRequest":
@@ -1086,6 +1110,7 @@ class SearchRequest(PublicModel):
     limit: Annotated[int, Field(ge=1, le=100)] = 20
     knowledge_cutoff: AwareDatetime | None = None
     cursor: Cursor | None = None
+    semantic: bool = True
 
 
 class GetRequest(PublicModel):
@@ -1172,15 +1197,47 @@ class ModelAdapter(Protocol):
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 
 
+@runtime_checkable
+class EmbeddingAdapter(Protocol):
+    @property
+    def model_fingerprint(self) -> str: ...
+
+    @property
+    def dimensions(self) -> int: ...
+
+    def embed(self, texts: list[str], *, timeout_seconds: int = 60) -> list[list[float]]: ...
+
+
+class SCIPImportReport(PublicModel):
+    repository_id: Annotated[str, Field(min_length=36, max_length=36)]
+    revision: ObjectID | None = None
+    generation: NonNegative
+    documents_processed: NonNegative
+    symbols_matched: NonNegative
+    relations_added: NonNegative
+
+
+class TeamMergeReport(PublicModel):
+    repository_id: Annotated[str, Field(min_length=36, max_length=36)]
+    generation: NonNegative
+    git_objects_fetched: bool
+    sources_merged: NonNegative
+    source_versions_merged: NonNegative
+    claims_merged: NonNegative
+    summaries_merged: NonNegative
+
+
 class ExtractionCitation(PublicModel):
     slot: Annotated[str, Field(min_length=1, max_length=64)]
     quote: Annotated[str, Field(min_length=1, max_length=4000)]
+    occurrence: Positive | None = None
 
 
 class CorroborationCitation(PublicModel):
     slot: Annotated[str, Field(min_length=1, max_length=64)]
     quote: Annotated[str, Field(min_length=1, max_length=4000)]
     target_anchor_key: Annotated[str, Field(min_length=1, max_length=200)]
+    occurrence: Positive | None = None
 
 
 class ExtractedClaimOutput(PublicModel):

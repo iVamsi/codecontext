@@ -49,6 +49,7 @@ FORBIDDEN_DETAIL_KEYS = frozenset(
     {
         "token",
         "github_token",
+        "gitlab_token",
         "authorization",
         "password",
         "secret",

@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from codecontext import __version__
+from codecontext.adapters import (
+    EMBEDDING_PROVIDER_NAMES,
+    PROVIDER_NAMES,
+    create_builtin_adapter,
+    create_builtin_embedding_adapter,
+)
+from codecontext.enrichment import MAX_ENRICH_CONCURRENCY
 from codecontext.errors import CodeContextError
 from codecontext.graph import (
     DetectChangesRequest,
@@ -22,6 +29,7 @@ from codecontext.identity import parse_iso_utc
 from codecontext.memory import Memory
 from codecontext.models import (
     ContextRequest,
+    EmbeddingAdapter,
     EnrichRequest,
     ExportRequest,
     GetRequest,
@@ -95,6 +103,90 @@ def load_cli_adapter(adapter_spec: str) -> ModelAdapter:
     return adapter
 
 
+DEFAULT_PROVIDER_CONCURRENCY = 4
+
+
+def _concurrency(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= MAX_ENRICH_CONCURRENCY:
+        raise argparse.ArgumentTypeError(f"must be a whole number from 1 to {MAX_ENRICH_CONCURRENCY}")
+    return value
+
+
+def _add_model_args(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    group = parser.add_mutually_exclusive_group(required=required)
+    group.add_argument("--adapter", default=None, help="Your own adapter as MODULE:FACTORY.")
+    group.add_argument(
+        "--provider",
+        choices=PROVIDER_NAMES,
+        default=None,
+        help="Built-in model provider. The API key is read from the environment.",
+    )
+    parser.add_argument("--model", default=None, help="Model name for --provider. Required; there is no default.")
+    parser.add_argument(
+        "--concurrency",
+        type=_concurrency,
+        default=None,
+        help=f"Model calls to run at once, 1 to {MAX_ENRICH_CONCURRENCY}. "
+        f"Defaults to {DEFAULT_PROVIDER_CONCURRENCY} with --provider and 1 with --adapter.",
+    )
+
+
+def _add_embedding_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--embedding-provider",
+        dest="embedding_provider",
+        choices=EMBEDDING_PROVIDER_NAMES,
+        default=None,
+        help="Turn on hybrid vector search with this embedding provider.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        dest="embedding_model",
+        default=None,
+        help="Embedding model name for --embedding-provider. Required with it.",
+    )
+
+
+def _model_from_args(args: argparse.Namespace) -> tuple[ModelAdapter | None, int]:
+    """Return the configured model adapter (or None) and its call concurrency."""
+    if args.model is not None and args.provider is None:
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="--model only works with --provider.",
+            retryable=False,
+        )
+    if args.provider is not None:
+        if not (args.model or "").strip():
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message="--provider needs --model. There is no default model.",
+                retryable=False,
+            )
+        adapter = create_builtin_adapter(args.provider, args.model)
+        return adapter, args.concurrency or DEFAULT_PROVIDER_CONCURRENCY
+    if args.adapter is not None:
+        return load_cli_adapter(args.adapter), args.concurrency or 1
+    return None, 1
+
+
+def _embedding_from_args(args: argparse.Namespace) -> EmbeddingAdapter | None:
+    provider = args.embedding_provider
+    model = args.embedding_model
+    if provider is None and model is None:
+        return None
+    if provider is None or not (model or "").strip():
+        raise CodeContextError(
+            code="INVALID_REQUEST",
+            message="--embedding-provider and --embedding-model must be used together.",
+            retryable=False,
+        )
+    return create_builtin_embedding_adapter(provider, model)
+
+
 def _parse_cli_target(args: argparse.Namespace) -> Target | None:
     path_val = getattr(args, "path", None)
     b64_val = getattr(args, "path_bytes_b64", None)
@@ -139,8 +231,16 @@ def _parse_cli_cutoff(raw: str | None) -> datetime | None:
         ) from exc
 
 
+class JSONArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        err = CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
+        sys.stdout.write(err.to_json(pretty=False) + "\n")
+        sys.stdout.flush()
+        sys.exit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = JSONArgumentParser(
         prog="codecontext",
         description="Local project memory for coding agents.",
     )
@@ -148,12 +248,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--store", type=Path, help="Path to the CodeContext memory store directory.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
 
-    subparsers = parser.add_subparsers(dest="subcommand")
+    subparsers = parser.add_subparsers(dest="subcommand", parser_class=JSONArgumentParser)
 
-    # init
     p_init = subparsers.add_parser("init", help="Initialize a CodeContext store.")
     p_init.add_argument("--repo", required=True, type=Path, help="Path to local Git repository.")
-    p_init.add_argument("--github", dest="github", default=None, help="GitHub OWNER/REPO.")
+    p_init.add_argument(
+        "--github", dest="github", default=None, help="GitHub OWNER/REPO. Token comes from GITHUB_TOKEN."
+    )
+    p_init.add_argument(
+        "--gitlab", dest="gitlab", default=None, help="GitLab project path. Token comes from GITLAB_TOKEN."
+    )
     p_init.add_argument(
         "--allow-issue-repo",
         dest="allow_issue_repos",
@@ -162,11 +266,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allowlisted external OWNER/REPO for one-hop linked issues.",
     )
 
-    # sync
     p_sync = subparsers.add_parser("sync", help="Synchronize Git history and GitHub discussions.")
     p_sync.add_argument("--revision", default="HEAD")
     p_sync.add_argument("--offline", action="store_true")
     p_sync.add_argument("--reconcile", action="store_true")
+    p_sync.add_argument(
+        "--include-untracked",
+        dest="include_untracked",
+        action="store_true",
+        default=False,
+        help="Also index untracked files in the working tree.",
+    )
+    p_sync.add_argument(
+        "--use-graphql",
+        dest="use_graphql",
+        action="store_true",
+        default=False,
+        help="Backfill GitHub history in bulk through the GraphQL API.",
+    )
+    p_sync.add_argument(
+        "--ingest-docs",
+        dest="ingest_docs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Read ADRs, ARCHITECTURE.md, and DESIGN.md as decision sources (on by default).",
+    )
     g_sync_target = p_sync.add_mutually_exclusive_group()
     g_sync_target.add_argument("--path", default=None)
     g_sync_target.add_argument("--path-bytes-b64", dest="path_bytes_b64", default=None)
@@ -175,16 +299,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--max-requests", dest="max_requests", type=int, default=1000)
     p_sync.add_argument("--max-seconds", dest="max_seconds", type=int, default=900)
 
-    # enrich
     p_enrich = subparsers.add_parser("enrich", help="Run budgeted model extraction.")
-    p_enrich.add_argument("--adapter", required=True, help="Explicit MODULE:FACTORY adapter.")
+    _add_model_args(p_enrich, required=True)
+    _add_embedding_args(p_enrich)
     p_enrich.add_argument("--max-input-tokens", dest="max_input_tokens", required=True, type=int)
     p_enrich.add_argument("--max-output-tokens", dest="max_output_tokens", required=True, type=int)
     p_enrich.add_argument("--max-calls", dest="max_calls", required=True, type=int)
     p_enrich.add_argument("--max-cost-usd", dest="max_cost_usd", default=None)
     p_enrich.add_argument("--target-id", dest="target_ids", action="append", default=None)
 
-    # search
     p_search = subparsers.add_parser("search", help="Search code, history, decisions, or summaries.")
     p_search.add_argument("query")
     p_search.add_argument(
@@ -196,15 +319,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=20)
     p_search.add_argument("--knowledge-cutoff", dest="knowledge_cutoff", default=None)
     p_search.add_argument("--cursor", default=None)
+    _add_embedding_args(p_search)
 
-    # get
     p_get = subparsers.add_parser("get", help="Expand a record, citation, or coverage gap by ID.")
     p_get.add_argument("id")
     p_get.add_argument("--max-tokens", dest="max_tokens", type=int, default=6000)
     p_get.add_argument("--knowledge-cutoff", dest="knowledge_cutoff", default=None)
     p_get.add_argument("--cursor", default=None)
 
-    # context
     p_ctx = subparsers.add_parser("context", help="Assemble a cited context pack for a question.")
     p_ctx.add_argument("query")
     g_ctx_target = p_ctx.add_mutually_exclusive_group()
@@ -217,10 +339,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctx.add_argument("--knowledge-cutoff", dest="knowledge_cutoff", default=None)
     p_ctx.add_argument("--workspace", type=Path, default=None)
 
-    # status
     subparsers.add_parser("status", help="Show store status, coverage, and gaps.")
 
-    # export
     p_export = subparsers.add_parser("export", help="Export a portable read-only archive.")
     p_export.add_argument("--destination", required=True, type=Path)
     p_export.add_argument("--metadata-only", dest="metadata_only", action="store_true")
@@ -242,14 +362,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_join.add_argument("--from", dest="share", required=True, type=Path, help="Shared directory from publish.")
     p_join.add_argument("--repo", required=True, type=Path, help="Local checkout whose origin matches the share.")
+    p_join.add_argument("--merge", action="store_true", default=False, help="Perform non-destructive union merge instead of overwrite.")
 
-    # purge
+    p_scip = subparsers.add_parser("import-scip", help="Import a SCIP index protobuf file into project memory.")
+    p_scip.add_argument("scip_file", type=Path, help="Path to SCIP index protobuf file.")
+
     p_purge = subparsers.add_parser("purge", help="Purge a discussion source or the entire store.")
     g_purge = p_purge.add_mutually_exclusive_group(required=True)
     g_purge.add_argument("--source-id", dest="source_id", default=None)
     g_purge.add_argument("--entire-store", dest="entire_store", action="store_true")
 
-    # serve
     p_serve = subparsers.add_parser("serve", help="Run the read-only stdio MCP server.")
     p_serve.add_argument("--workspace", type=Path, default=None)
     p_serve.add_argument(
@@ -259,8 +381,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Expose structural graph tools (enabled by default).",
     )
+    p_serve.add_argument("--auto-sync", action="store_true", default=False, help="Automatically trigger background sync on workspace changes.")
+    p_serve.add_argument("--allow-sync", action="store_true", default=False, help="Expose opt-in sync MCP tool.")
+    p_serve.add_argument(
+        "--allow-enrich",
+        action="store_true",
+        default=False,
+        help="Expose the enrich tool. Needs --provider and --model, or --adapter.",
+    )
+    _add_model_args(p_serve, required=False)
+    _add_embedding_args(p_serve)
 
-    # search-graph
     p_sg = subparsers.add_parser("search-graph", help="Search the structural code graph by regex, label, or degree.")
     p_sg.add_argument("--name-pattern", dest="name_pattern", default=None)
     p_sg.add_argument("--qn-pattern", dest="qn_pattern", default=None)
@@ -273,30 +404,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_sg.add_argument("--limit", type=int, default=20)
     p_sg.add_argument("--offset", type=int, default=0)
 
-    # trace-path
     p_tp = subparsers.add_parser("trace-path", help="Trace inbound/outbound call chains in the code graph.")
     p_tp.add_argument("function_name")
     p_tp.add_argument("--direction", choices=["inbound", "outbound", "both"], default="both")
     p_tp.add_argument("--depth", type=int, default=2)
     p_tp.add_argument("--limit", type=int, default=50)
 
-    # query-graph
     p_qg = subparsers.add_parser("query-graph", help="Run a Cypher pattern query over the code graph.")
     p_qg.add_argument("query")
     p_qg.add_argument("--limit", type=int, default=50)
 
-    # get-architecture
     p_arch = subparsers.add_parser("get-architecture", help="Get module/package clusters, cohesion, and hotspots.")
     p_arch.add_argument("--max-clusters", dest="max_clusters", type=int, default=50)
 
-    # detect-changes
     p_dc = subparsers.add_parser("detect-changes", help="Detect changed symbols and trace inbound caller impact.")
     p_dc.add_argument("--since", default=None)
     p_dc.add_argument("--depth", type=int, default=2)
     p_dc.add_argument("--limit", type=int, default=50)
     p_dc.add_argument("--workspace", type=Path, default=None)
 
-    # get-code-snippet
     p_gcs = subparsers.add_parser("get-code-snippet", help="Read symbol source code by qualified_name.")
     p_gcs.add_argument("qualified_name")
     p_gcs.add_argument("--file-path", dest="file_path", default=None)
@@ -330,10 +456,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from codecontext.mcp_server import run_stdio_server
 
+            serve_model, serve_concurrency = _model_from_args(args)
             run_stdio_server(
                 args.store,
                 workspace_path=args.workspace,
                 include_graph_tools=bool(args.include_graph_tools),
+                auto_sync=bool(getattr(args, "auto_sync", False)),
+                allow_sync=bool(getattr(args, "allow_sync", False)),
+                allow_enrich=bool(getattr(args, "allow_enrich", False)),
+                model_adapter=serve_model,
+                enrich_concurrency=serve_concurrency,
+                embedding_adapter=_embedding_from_args(args),
             )
             return 0
         except KeyboardInterrupt:
@@ -362,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_path=args.repo,
                 github_repository=args.github,
                 allowed_issue_repositories=args.allow_issue_repos,
+                gitlab_project_path=getattr(args, "gitlab", None),
             )
             with Memory.initialize(store_path, init_req) as mem:
                 st = mem.status()
@@ -377,6 +511,9 @@ def main(argv: list[str] | None = None) -> int:
                 focus=target,
                 max_requests=args.max_requests,
                 max_seconds=args.max_seconds,
+                include_untracked=bool(getattr(args, "include_untracked", False)),
+                use_graphql=bool(getattr(args, "use_graphql", False)),
+                ingest_docs=bool(getattr(args, "ingest_docs", True)),
             )
             with Memory.open(store_path, read_only=False) as mem:
                 rep = mem.sync(sync_req)
@@ -395,16 +532,20 @@ def main(argv: list[str] | None = None) -> int:
                         retryable=False,
                     ) from exc
 
+            embedder = _embedding_from_args(args)
             enrich_req = EnrichRequest(
                 target_ids=args.target_ids,
                 max_input_tokens=args.max_input_tokens,
                 max_output_tokens=args.max_output_tokens,
                 max_calls=args.max_calls,
                 max_cost_usd=cost_dec,
+                generate_embeddings=embedder is not None,
             )
-            adapter = load_cli_adapter(args.adapter)
+            adapter, concurrency = _model_from_args(args)
+            assert adapter is not None
             with Memory.open(store_path, read_only=False) as mem:
-                rep = mem.enrich(enrich_req, model=adapter)
+                mem.configure_embedding_adapter(embedder)
+                rep = mem.enrich(enrich_req, model=adapter, concurrency=concurrency)
             _emit_json(rep, pretty=pretty)
             return 0
 
@@ -418,7 +559,9 @@ def main(argv: list[str] | None = None) -> int:
                 knowledge_cutoff=cutoff,
                 cursor=args.cursor,
             )
+            embedder = _embedding_from_args(args)
             with Memory.open(store_path, read_only=True) as mem:
+                mem.configure_embedding_adapter(embedder)
                 res = mem.search(s_req)
             _emit_json(res, pretty=pretty)
             return 0
@@ -476,7 +619,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.subcommand == "join":
-            res = Memory.join(store_path, args.share, args.repo)
+            if getattr(args, "merge", False):
+                res = Memory.merge_share(store_path, args.share, args.repo)
+            else:
+                res = Memory.join(store_path, args.share, args.repo)
+            _emit_json(res, pretty=pretty)
+            return 0
+
+        if args.subcommand == "import-scip":
+            with Memory.open(store_path, read_only=False) as mem:
+                res = mem.import_scip(args.scip_file)
             _emit_json(res, pretty=pretty)
             return 0
 

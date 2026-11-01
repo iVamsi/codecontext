@@ -153,8 +153,20 @@ def resolve_github_token() -> str | None:
     return None
 
 
+_GRAPHQL_COMMENT_RE = re.compile(r"#[^\n]*")
+_GRAPHQL_WRITE_OP_RE = re.compile(r"\b(?:mutation|subscription)\b")
+
+
+def _is_read_only_graphql(document: str) -> bool:
+    stripped = _GRAPHQL_COMMENT_RE.sub("", document).lstrip()
+    if not (stripped.startswith("query") or stripped.startswith("{")):
+        return False
+    # Operation keywords never appear in our queries, so any occurrence means a write slipped in.
+    return _GRAPHQL_WRITE_OP_RE.search(stripped) is None
+
+
 class GitHubClient:
-    """Synchronous GET client for `https://api.github.com` with streaming 32 MiB enforcement,
+    """Synchronous GET (plus read-only GraphQL POST) client for `https://api.github.com` with streaming 32 MiB enforcement,
     ETag/Last-Modified support, budget accounting, and rate-limit handling.
     """
 
@@ -229,7 +241,68 @@ class GitHubClient:
             req_headers["If-None-Match"] = etag
         if last_modified:
             req_headers["If-Modified-Since"] = last_modified
+        return self._fetch(
+            "GET",
+            target,
+            req_headers=req_headers,
+            etag=etag,
+            last_modified=last_modified,
+            remaining_requests=remaining_requests,
+            deadline_monotonic=deadline_monotonic,
+        )
 
+    def graphql_query(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        remaining_requests: int = 1000,
+        deadline_monotonic: float | None = None,
+    ) -> HttpFetchResult:
+        """POST a read-only GraphQL v4 query to `/graphql` through the same auth, retry,
+        rate-limit, timeout and body-size handling as `get_json`. GraphQL-level errors raise.
+        """
+        if not _is_read_only_graphql(query):
+            raise CodeContextError(
+                code="INVALID_REQUEST",
+                message="GitHubClient only sends read-only GraphQL queries.",
+                retryable=False,
+            )
+        if remaining_requests <= 0:
+            raise CodeContextError(
+                code="BUDGET_EXHAUSTED",
+                message="Sync request budget exhausted before HTTP call.",
+                retryable=True,
+            )
+        res = self._fetch(
+            "POST",
+            "/graphql",
+            req_headers={},
+            json_body={"query": query, "variables": variables or {}},
+            remaining_requests=remaining_requests,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if res.body_too_large or not isinstance(res.data, dict) or res.data.get("errors") or not isinstance(res.data.get("data"), dict):
+            raise CodeContextError(
+                code="IO_ERROR",
+                message="GitHub GraphQL query failed.",
+                retryable=False,
+                details={"status_code": res.status_code},
+            )
+        return res
+
+    def _fetch(
+        self,
+        method: str,
+        target: str,
+        *,
+        req_headers: dict[str, str],
+        json_body: dict[str, Any] | None = None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        remaining_requests: int,
+        deadline_monotonic: float | None,
+    ) -> HttpFetchResult:
         attempts_this_call = 0
         max_attempts = min(3, remaining_requests)
 
@@ -255,7 +328,9 @@ class GitHubClient:
             self.requests_attempted += 1
 
             try:
-                with self._client.stream("GET", target, headers=req_headers, timeout=req_timeout) as resp:
+                with self._client.stream(
+                    method, target, headers=req_headers, json=json_body, timeout=req_timeout
+                ) as resp:
                     status = resp.status_code
 
                     if status == 304:
@@ -533,13 +608,14 @@ def upsert_github_source_and_version(
     lifecycle_fields: dict[str, Any] | None,
     raw_payload: dict[str, Any],
     observed_us: int | None = None,
+    provider: str = "github",
 ) -> tuple[str, str, bool, bool]:
-    """Normalize and persist a GitHub source and immutable `source_version` following Storage §4 Source refresh recipe.
+    """Normalize and persist a provider source and immutable `source_version`.
     Returns `(src_id, ver_id, source_added, version_added)`.
     """
     ts = observed_us if observed_us is not None else now_us()
     src_id = make_src_id(
-        provider="github",
+        provider=provider,
         repository_provider_id=repository_provider_id,
         kind=kind,
         provider_id=provider_id,
@@ -556,7 +632,7 @@ def upsert_github_source_and_version(
     author_id = str(author_dict["id"]) if author_dict and author_dict.get("id") is not None else None
     author_login = str(author_dict["login"]) if author_dict and author_dict.get("login") is not None else None
     author_json_str = (
-        canonical_json({"actor_id": author_id, "display_name": author_login, "provider": "github"})
+        canonical_json({"actor_id": author_id, "display_name": author_login, "provider": provider})
         if (author_id or author_login)
         else None
     )
@@ -586,9 +662,9 @@ def upsert_github_source_and_version(
             INSERT INTO sources (
                 id, provider, repository_provider_id, provider_id, kind,
                 parent_source_id, current_version_id, availability, last_seen_at_us, last_reconciled_at_us
-            ) VALUES (?, 'github', ?, ?, ?, ?, NULL, 'available', ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'available', ?, NULL)
             """,
-            (src_id, repository_provider_id, str(provider_id), kind, parent_source_id, ts),
+            (src_id, provider, repository_provider_id, str(provider_id), kind, parent_source_id, ts),
         )
     else:
         conn.execute(
@@ -1747,6 +1823,115 @@ def ingest_issue_and_children(
     return (used_requests, sources_added, versions_added, True)
 
 
+def collect_github_graphql_backfill(
+    store: Store,
+    client: GitHubClient,
+    repo_uuid: str,
+    repo_prov_id: str,
+    repo_full_name: str,
+    *,
+    remaining_requests: int = 100,
+    deadline_monotonic: float | None = None,
+) -> tuple[int, int, int, bool]:
+    """Backfill pull request metadata with paged GraphQL v4 queries.
+
+    Returns `completed=False` on any GraphQL failure so the caller falls back to REST.
+    The last `endCursor` is persisted so a re-sync only fetches PRs created since then.
+    REST still has to run afterwards: this pass skips issues, comments, reviews and episodes.
+    """
+    if "/" not in repo_full_name:
+        return (0, 0, 0, False)
+    owner, name = repo_full_name.split("/", 1)
+    query = """
+    query($owner: String!, $name: String!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequests(first: 50, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            number title body url createdAt updatedAt mergedAt state
+            author { login ... on User { databaseId } }
+            headRefOid
+            mergeCommit { oid }
+          }
+        }
+      }
+    }
+    """
+    stream_key = f"github:{repo_prov_id}:graphql_prs"
+    with store.connect_read() as r_conn:
+        ckpt = r_conn.execute("SELECT cursor_json FROM checkpoints WHERE stream_key = ?", (stream_key,)).fetchone()
+    cursor: str | None = json.loads(str(ckpt["cursor_json"])).get("cursor") if ckpt else None
+    sources_added = 0
+    versions_added = 0
+    used_requests = 0
+    start_reqs = client.requests_attempted
+
+    while True:
+        if used_requests >= remaining_requests:
+            return (used_requests, sources_added, versions_added, False)
+        try:
+            res = client.graphql_query(
+                query,
+                {"owner": owner, "name": name, "cursor": cursor},
+                remaining_requests=remaining_requests - used_requests,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except CodeContextError:
+            # Any GraphQL failure hands over to the REST path, which has its own resume checkpoints.
+            return (client.requests_attempted - start_reqs, sources_added, versions_added, False)
+        used_requests = client.requests_attempted - start_reqs
+        repo_data = res.data["data"].get("repository")
+        if not isinstance(repo_data, dict):
+            return (used_requests, sources_added, versions_added, False)
+        prs_data = repo_data.get("pullRequests") or {}
+        nodes = [n for n in (prs_data.get("nodes") or []) if isinstance(n, dict) and isinstance(n.get("number"), int)]
+        with store.write_transaction(bump_generation=True) as conn:
+            for pr in nodes:
+                auth = pr.get("author") or {}
+                p_num = pr.get("number")
+                head_sha = pr.get("headRefOid")
+                merge_c = pr.get("mergeCommit") or {}
+                merge_sha = merge_c.get("oid")
+                mr_src_id, mr_ver_id, sa, va = upsert_github_source_and_version(
+                    conn,
+                    repository_id=repo_uuid,
+                    repository_provider_id=repo_prov_id,
+                    kind="pull_request",
+                    provider_id=str(p_num),
+                    parent_source_id=None,
+                    title=pr.get("title"),
+                    body=pr.get("body"),
+                    author_dict={"id": auth.get("databaseId"), "login": auth.get("login")},
+                    source_url=pr.get("url"),
+                    authored_at_us=_parse_opt_time_us(pr.get("createdAt")),
+                    updated_at_us=_parse_opt_time_us(pr.get("updatedAt")),
+                    anchors={"number": p_num, "commit_id": head_sha, "merge_commit_sha": merge_sha},
+                    lifecycle_fields={"state": pr.get("state"), "merged_at": pr.get("mergedAt")},
+                    raw_payload=pr,
+                    provider="github",
+                )
+                if sa:
+                    sources_added += 1
+                if va:
+                    versions_added += 1
+            page_info = prs_data.get("pageInfo") or {}
+            # An empty page has no endCursor; keep the old one so the next sync resumes there.
+            cursor = page_info.get("endCursor") or cursor
+            conn.execute(
+                """
+                INSERT INTO checkpoints (stream_key, cursor_json, last_success_at_us)
+                VALUES (?, ?, ?)
+                ON CONFLICT(stream_key) DO UPDATE SET
+                    cursor_json = excluded.cursor_json,
+                    last_success_at_us = excluded.last_success_at_us
+                """,
+                (stream_key, canonical_json({"cursor": cursor}), now_us()),
+            )
+
+        if not page_info.get("hasNextPage"):
+            return (used_requests, sources_added, versions_added, True)
+
+
 def collect_full_and_incremental_github(
     store: Store,
     client: GitHubClient,
@@ -1754,6 +1939,7 @@ def collect_full_and_incremental_github(
     reconcile: bool = False,
     remaining_requests: int = 1000,
     deadline_monotonic: float | None = None,
+    use_graphql: bool = False,
 ) -> tuple[int, int, int, bool]:
     """Execute full GitHub `/issues?state=all&sort=created&direction=asc` backfill,
     incremental comment update streams (`/issues/comments?sort=updated&direction=asc&since=...`
@@ -1779,6 +1965,22 @@ def collect_full_and_incremental_github(
 
     def budget_left() -> int:
         return remaining_requests - used_requests
+
+    if use_graphql and not reconcile:
+        gql_used, gql_sa, gql_va, _gql_done = collect_github_graphql_backfill(
+            store,
+            client,
+            repo_uuid,
+            repo_prov_id,
+            repo_full_name,
+            remaining_requests=budget_left(),
+            deadline_monotonic=deadline_monotonic,
+        )
+        # GraphQL only bulk-loads PR metadata. REST below still collects issues, comments,
+        # reviews, commit relations and episodes, and decides whether the sync is complete.
+        used_requests += gql_used
+        sources_added += gql_sa
+        versions_added += gql_va
 
     issues_stream_key = f"github:{repo_prov_id}:issues_all"
     with store.connect_read() as r_conn:
