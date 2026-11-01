@@ -1,4 +1,7 @@
+import json
+import re
 import subprocess
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +14,20 @@ from codecontext.github import (
     GITHUB_API_VERSION,
     GitHubClient,
     collect_focused_github_evidence,
+    collect_full_and_incremental_github,
+    upsert_github_source_and_version,
     verify_and_bind_github_repository,
 )
 from codecontext.gitlab import GitLabClient, parse_gitlab_remote_url, resolve_gitlab_token
+from codecontext.identity import make_src_id
 from codecontext.models import InitRequest
 from codecontext.store import Store
-from tests.fixtures.builders import build_f01_fixture
+from tests.fixtures.builders import (
+    GitCommitSpec,
+    build_f01_fixture,
+    commit_fixture_spec,
+    init_fixture_repo,
+)
 
 
 def make_mock_github_transport(
@@ -303,3 +314,290 @@ def test_gitlab_env_token_stays_on_named_host(
     assert exc_info.value.code == "INVALID_REQUEST"
     assert "secret" not in exc_info.value.message
     assert "dummy-token" not in exc_info.value.message
+
+
+# --- Incremental discovery against a small fake GitHub -----------------------------------------
+
+OLD_TS = "2026-01-01T00:00:00Z"
+API = "https://api.github.com"
+
+
+def _now_iso() -> str:
+    from codecontext.identity import us_to_iso_z
+    from codecontext.store import now_us
+
+    return us_to_iso_z(now_us())
+
+
+class FakeGitHub:
+    """Serves `owner/repo` from mutable state so tests can change it between syncs."""
+
+    def __init__(self, page_size: int = 100) -> None:
+        self.page_size = page_size
+        self.issues: dict[int, dict[str, Any]] = {}
+        self.hidden: set[int] = set()
+        self.issue_comments: list[dict[str, Any]] = []
+        self.review_comments: list[dict[str, Any]] = []
+        self.reviews: dict[int, list[dict[str, Any]]] = {}
+        self.commit_pulls: dict[str, list[int]] = {}
+        self.requested: list[str] = []
+        self._next_id = 1000
+
+    def add_issue(self, number: int, *, pr: bool = False, updated_at: str = OLD_TS) -> None:
+        item: dict[str, Any] = {
+            "number": number,
+            "title": f"item {number}",
+            "body": "",
+            "state": "open",
+            "user": {"id": 1, "login": "a"},
+            "created_at": updated_at,
+            "updated_at": updated_at,
+        }
+        if pr:
+            item["pull_request"] = {"url": f"{API}/repos/owner/repo/pulls/{number}"}
+            item["head"] = {"sha": "h" * 40}
+            item["base"] = {"sha": "b" * 40}
+        self.issues[number] = item
+
+    def touch(self, number: int) -> None:
+        self.issues[number]["updated_at"] = _now_iso()
+
+    def _comment(self, **extra: Any) -> dict[str, Any]:
+        self._next_id += 1
+        ts = extra.pop("updated_at", _now_iso())
+        return {"id": self._next_id, "body": "c", "user": {"id": 2, "login": "b"},
+                "created_at": ts, "updated_at": ts, **extra}
+
+    def add_issue_comment(self, number: int, **extra: Any) -> None:
+        self.issue_comments.append(
+            self._comment(issue_url=f"{API}/repos/owner/repo/issues/{number}", **extra)
+        )
+
+    def add_review(self, pr: int) -> None:
+        self._next_id += 1
+        self.reviews.setdefault(pr, []).append(
+            {"id": self._next_id, "body": "lgtm", "state": "APPROVED",
+             "user": {"id": 3, "login": "c"}, "submitted_at": _now_iso()}
+        )
+
+    def _page(self, request: httpx.Request, items: list[dict[str, Any]]) -> httpx.Response:
+        query = dict(urllib.parse.parse_qsl(request.url.query.decode("ascii")))
+        page = int(query.get("page", "1"))
+        start = (page - 1) * self.page_size
+        headers = {}
+        if start + self.page_size < len(items):
+            query["page"] = str(page + 1)
+            nxt = f"{API}{request.url.path}?{urllib.parse.urlencode(query, safe=':')}"
+            headers["Link"] = f'<{nxt}>; rel="next"'
+        return httpx.Response(200, json=items[start : start + self.page_size], headers=headers)
+
+    @staticmethod
+    def _since(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query = dict(urllib.parse.parse_qsl(request.url.query.decode("ascii")))
+        if query.get("sort") == "updated":
+            items = sorted(items, key=lambda i: i["updated_at"])
+        since = query.get("since")
+        return [i for i in items if since is None or i["updated_at"] >= since]
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.requested.append(request.url.raw_path.decode("ascii"))
+        base = "/repos/owner/repo"
+        if path == base:
+            return httpx.Response(200, json={"id": 77, "full_name": "owner/repo", "private": False})
+        if path == f"{base}/issues":
+            listed = [i for n, i in sorted(self.issues.items()) if n not in self.hidden]
+            return self._page(request, self._since(request, listed))
+        if path == f"{base}/issues/comments":
+            return self._page(request, self._since(request, self.issue_comments))
+        if path == f"{base}/pulls/comments":
+            return self._page(request, self._since(request, self.review_comments))
+        m = re.fullmatch(rf"{base}/pulls/(\d+)", path)
+        if m and int(m.group(1)) in self.issues:
+            return httpx.Response(200, json=self.issues[int(m.group(1))])
+        m = re.fullmatch(rf"{base}/issues/(\d+)/comments", path)
+        if m:
+            url = f"{API}{base}/issues/{m.group(1)}"
+            return self._page(request, [c for c in self.issue_comments if c["issue_url"] == url])
+        m = re.fullmatch(rf"{base}/pulls/(\d+)/reviews", path)
+        if m:
+            return self._page(request, self.reviews.get(int(m.group(1)), []))
+        m = re.fullmatch(rf"{base}/pulls/(\d+)/comments", path)
+        if m:
+            url = f"{API}{base}/pulls/{m.group(1)}"
+            return self._page(request, [c for c in self.review_comments if c["pull_request_url"] == url])
+        if re.fullmatch(rf"{base}/(issues/\d+/timeline|pulls/\d+/(commits|files))", path):
+            return httpx.Response(200, json=[])
+        m = re.fullmatch(rf"{base}/commits/([0-9a-f]+)/pulls", path)
+        if m and m.group(1) in self.commit_pulls:
+            return httpx.Response(200, json=[{"number": n} for n in self.commit_pulls[m.group(1)]])
+        return httpx.Response(404, json={"message": "Not Found"})
+
+
+def _fake_store(tmp_path: Path) -> Store:
+    repo = init_fixture_repo(tmp_path / "repo")
+    commit_fixture_spec(repo, GitCommitSpec(message="init", files={"a.py": b"x = 1\n"}))
+    return Store.initialize(
+        tmp_path / "store", InitRequest(repo_path=repo, github_repository="owner/repo")
+    )
+
+
+def _sync(store: Store, fake: FakeGitHub, **kwargs: Any) -> tuple[int, int, int, bool]:
+    with GitHubClient(token="", transport=httpx.MockTransport(fake.handler)) as client:
+        return collect_full_and_incremental_github(store, client, **kwargs)
+
+
+def _sid(kind: str, number: int | str) -> str:
+    return make_src_id(provider="github", repository_provider_id="77", kind=kind, provider_id=str(number))
+
+
+def test_new_issue_found_after_backfill(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(1)
+    assert _sync(store, fake)[3] is True
+    fake.add_issue(42, updated_at=_now_iso())
+    assert _sync(store, fake)[3] is True
+    with store.connect_read() as conn:
+        found = conn.execute("SELECT 1 FROM sources WHERE id = ?", (_sid("issue", 42),)).fetchone()
+        ckpt = conn.execute(
+            "SELECT cursor_json, high_watermark_us FROM checkpoints WHERE stream_key = ?",
+            ("github:77:issues_refresh",),
+        ).fetchone()
+    store.close()
+    assert found is not None
+    assert json.loads(ckpt["cursor_json"])["next_url"] is None
+    assert ckpt["high_watermark_us"] is not None
+    refresh = [p for p in fake.requested if "sort=updated" in p and p.startswith("/repos/owner/repo/issues?")]
+    assert refresh and all("&since=" in p for p in refresh)
+
+
+def test_changed_pr_reschedules_child_streams(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(7, pr=True)
+    fake.add_issue(8, pr=True)
+    _sync(store, fake)
+    fake.add_review(pr=7)
+    fake.add_review(pr=8)
+    fake.touch(7)
+    assert _sync(store, fake)[3] is True
+    with store.connect_read() as conn:
+        counts = {
+            pr: int(conn.execute(
+                "SELECT COUNT(*) FROM sources WHERE kind = 'review' AND parent_source_id = ?",
+                (_sid("pull_request", pr),),
+            ).fetchone()[0])
+            for pr in (7, 8)
+        }
+    store.close()
+    # PR 8 did not change, so its finished child streams stay finished.
+    assert counts == {7: 1, 8: 0}
+
+
+def test_comment_stream_resumes_mid_pages(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub(page_size=2)
+    for _ in range(5):
+        fake.add_issue_comment(3, updated_at=OLD_TS)
+    # repo + issues backfill page + issues refresh page + two comment pages
+    assert _sync(store, fake, remaining_requests=5)[3] is False
+    assert fake.requested[-1].endswith("page=2")
+    fake.requested.clear()
+    assert _sync(store, fake)[3] is True
+    comment_urls = [p for p in fake.requested if p.startswith("/repos/owner/repo/issues/comments")]
+    assert comment_urls[0].endswith("page=3")
+    with store.connect_read() as conn:
+        n = int(conn.execute("SELECT COUNT(*) FROM sources WHERE kind = 'issue_comment'").fetchone()[0])
+    store.close()
+    assert n == 5
+
+
+def test_comment_stream_sets_parent_of_stored_pr(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(7, pr=True)
+    _sync(store, fake)
+    # PR 7 is unchanged, so only the repository-wide comment stream sees the new comment.
+    fake.add_issue_comment(7)
+    _sync(store, fake)
+    with store.connect_read() as conn:
+        parent = conn.execute(
+            "SELECT parent_source_id FROM sources WHERE id = ?",
+            (_sid("issue_comment", fake.issue_comments[0]["id"]),),
+        ).fetchone()["parent_source_id"]
+    store.close()
+    assert parent == _sid("pull_request", 7)
+
+
+def test_comment_before_pr_keeps_parent_and_survives_reconcile(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(7, pr=True)
+    fake.hidden.add(7)
+    fake.add_issue_comment(7)
+    comment_sid = _sid("issue_comment", fake.issue_comments[0]["id"])
+    _sync(store, fake)  # comment stored before its PR
+    fake.hidden.clear()
+    assert _sync(store, fake, reconcile=True)[3] is True
+    with store.connect_read() as conn:
+        row = conn.execute(
+            "SELECT availability, parent_source_id FROM sources WHERE id = ?", (comment_sid,)
+        ).fetchone()
+    store.close()
+    assert row["availability"] == "available"
+    assert row["parent_source_id"] == _sid("pull_request", 7)
+
+
+def test_upsert_without_parent_keeps_existing_parent(tmp_path: Path) -> None:
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(7, pr=True)
+    fake.add_issue_comment(7)
+    _sync(store, fake)
+    comment = fake.issue_comments[0]
+    with store.write_transaction(bump_generation=False) as conn:
+        upsert_github_source_and_version(
+            conn, repository_id=store.config.repository_id, repository_provider_id="77",
+            kind="issue_comment", provider_id=str(comment["id"]), parent_source_id=None,
+            title=None, body="edited", author_dict=None, source_url=None, authored_at_us=None,
+            updated_at_us=None, anchors={}, lifecycle_fields={}, raw_payload=comment,
+        )
+        parent = conn.execute(
+            "SELECT parent_source_id FROM sources WHERE id = ?",
+            (_sid("issue_comment", comment["id"]),),
+        ).fetchone()["parent_source_id"]
+    store.close()
+    assert parent == _sid("pull_request", 7)
+
+
+def test_commit_pr_lookup_retried_after_404(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import codecontext.github as gh
+
+    store = _fake_store(tmp_path)
+    fake = FakeGitHub()
+    fake.add_issue(9, pr=True)
+    oid = "c" * 40
+    lookup = f"/repos/owner/repo/commits/{oid}/pulls"
+
+    def focus() -> None:
+        with GitHubClient(token="", transport=httpx.MockTransport(fake.handler)) as client:
+            collect_focused_github_evidence(store, client, commit_oids=[oid])
+
+    focus()  # 404
+    fake.commit_pulls[oid] = [9]
+    focus()  # still inside the re-check delay: no new lookup
+    assert fake.requested.count(lookup) == 1
+    real_now = gh.now_us
+    monkeypatch.setattr(gh, "now_us", lambda: real_now() + gh.COMMIT_PULLS_RECHECK_US + 1)
+    focus()
+    assert fake.requested.count(lookup) == 2
+    focus()  # done: never asked again
+    assert fake.requested.count(lookup) == 2
+    with store.connect_read() as conn:
+        rel = conn.execute(
+            "SELECT 1 FROM relations WHERE from_id = ? AND relation_kind = 'associated_pr' AND to_id = ?",
+            (oid, _sid("pull_request", 9)),
+        ).fetchone()
+    store.close()
+    assert rel is not None
