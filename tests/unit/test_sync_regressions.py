@@ -523,7 +523,7 @@ def test_sqlite_error_in_job_propagates_without_burning_attempt(
         assert row["attempts"] == 0 and row["last_error_code"] is None
 
 
-def test_missing_parent_skip_waits_for_every_parent(tmp_path: Path) -> None:
+def test_missing_parent_skip_lifts_once_first_parent_exists(tmp_path: Path) -> None:
     from codecontext.store import Store
 
     repo = init_fixture_repo(tmp_path / "repo")
@@ -534,16 +534,18 @@ def test_missing_parent_skip_waits_for_every_parent(tmp_path: Path) -> None:
     commit_fixture_spec(repo, GitCommitSpec(message="Main", files={"m.py": b"def m(): pass\n"}))
     run_git_fixture(repo, ["merge", "--no-ff", "side", "-m", "Merge"])
     merge = run_git_fixture(repo, ["rev-parse", "HEAD"]).decode().strip()
+    first = run_git_fixture(repo, ["rev-parse", "HEAD^1"]).decode().strip()
     with Memory.initialize(tmp_path / "store", InitRequest(repo_path=repo)) as mem:
         mem.sync(SyncRequest(offline=True))
         store = mem._store
 
-        def merge_queued(second_parent: str) -> bool:
+        def merge_queued(first_parent: str, second_parent: str) -> bool:
             with store.write_transaction() as conn:
-                conn.execute(
-                    "UPDATE commit_parents SET parent_oid = ? WHERE commit_oid = ? AND parent_index = 1",
-                    (second_parent, merge),
-                )
+                for index, parent in [(0, first_parent), (1, second_parent)]:
+                    conn.execute(
+                        "UPDATE commit_parents SET parent_oid = ? WHERE commit_oid = ? AND parent_index = ?",
+                        (parent, merge, index),
+                    )
                 conn.execute("UPDATE commits SET diff_state = 'partial' WHERE oid = ?", (merge,))
                 conn.execute("DELETE FROM jobs WHERE owner_id = ?", (merge,))
                 Store.upsert_gap(
@@ -557,9 +559,10 @@ def test_missing_parent_skip_waits_for_every_parent(tmp_path: Path) -> None:
                 Store.enqueue_pending_diff_jobs(conn)
                 return conn.execute("SELECT 1 FROM jobs WHERE owner_id = ?", (merge,)).fetchone() is not None
 
-        side = run_git_fixture(repo, ["rev-parse", "side"]).decode().strip()
-        assert not merge_queued("f" * 40)
-        assert merge_queued(side)
+        # Lineage only diffs against the first parent, so a side parent that never arrives
+        # must not hold the merge back forever.
+        assert not merge_queued("e" * 40, "f" * 40)
+        assert merge_queued(first, "f" * 40)
 
 
 def test_shallow_boundary_not_rediffed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
