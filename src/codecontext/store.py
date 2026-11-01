@@ -48,7 +48,7 @@ from codecontext.models import (
     Status,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIN_READ_ONLY_SCHEMA_VERSION = 1
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 MIGRATION_FILE = MIGRATIONS_DIR / "001_initial.sql"
@@ -117,7 +117,7 @@ def split_sql_statements(sql: str) -> list[str]:
         elif ch == ";" and depth == 0:
             flush()
             i += 1
-        elif ch.isalpha() or ch == "_":
+        elif ch.isascii() and (ch.isalpha() or ch == "_"):
             word = _WORD.match(sql, i).group()  # type: ignore[union-attr]
             upper = word.upper()
             if _TRIGGER_HEAD.match("".join(buf)):

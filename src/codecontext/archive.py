@@ -5,12 +5,31 @@ import shutil
 import sqlite3
 import tempfile
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 
 from codecontext.errors import CodeContextError
 from codecontext.identity import sha256_bytes
 from codecontext.models import ExportReport, ExportRequest, PurgeReport, PurgeRequest
 from codecontext.store import Store, now_us
+
+_CHUNK = 500
+
+
+def _chunks(ids: list[str]) -> Iterator[list[str]]:
+    for start in range(0, len(ids), _CHUNK):
+        yield ids[start : start + _CHUNK]
+
+
+def _marks(chunk: list[str]) -> str:
+    return ",".join("?" * len(chunk))
+
+
+def _delete_in(
+    conn: sqlite3.Connection, table: str, column: str, ids: list[str], extra: str = "1 = 1"
+) -> None:
+    for chunk in _chunks(ids):
+        conn.execute(f"DELETE FROM {table} WHERE {extra} AND {column} IN ({_marks(chunk)})", chunk)
 
 
 def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
@@ -65,10 +84,16 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
                 if p.exists() or p.is_symlink():
                     p.unlink()
 
+            cleanup_pending = False
+
+            def _note_rmtree_failure(_func: object, _path: object, _exc: BaseException) -> None:
+                nonlocal cleanup_pending
+                cleanup_pending = True
+
             for dir_name in ("repository.git", "tmp"):
                 dp = store.store_path / dir_name
                 if dp.exists():
-                    shutil.rmtree(dp, ignore_errors=True)
+                    shutil.rmtree(dp, onexc=_note_rmtree_failure)
 
             # Remove the store directory itself if now empty
             try:
@@ -86,7 +111,7 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
                 removed_source_versions=ver_cnt,
                 removed_claims=cl_cnt,
                 removed_summaries=sum_cnt,
-                cleanup_pending=False,
+                cleanup_pending=cleanup_pending,
                 closed=True,
             )
 
@@ -121,20 +146,20 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
             affected_sources.append(str(cr["id"]))
 
         # Collect all source_versions and evidence rows for affected sources
-        ver_ids: list[str] = []
-        ev_ids: list[str] = []
-        for s_id in affected_sources:
-            v_rows = conn.execute(
-                "SELECT id FROM source_versions WHERE source_id = ?", (s_id,)
-            ).fetchall()
-            for vr in v_rows:
-                vid = str(vr["id"])
-                ver_ids.append(vid)
-                e_rows = conn.execute(
-                    "SELECT id FROM evidence WHERE source_version_id = ?", (vid,)
-                ).fetchall()
-                for er in e_rows:
-                    ev_ids.append(str(er["id"]))
+        ver_ids = [
+            str(r["id"])
+            for chunk in _chunks(affected_sources)
+            for r in conn.execute(
+                f"SELECT id FROM source_versions WHERE source_id IN ({_marks(chunk)})", chunk
+            )
+        ]
+        ev_ids = [
+            str(r["id"])
+            for chunk in _chunks(ver_ids)
+            for r in conn.execute(
+                f"SELECT id FROM evidence WHERE source_version_id IN ({_marks(chunk)})", chunk
+            )
+        ]
 
         # Compute full reverse dependency closure (claims and summaries influenced by any affected version/evidence)
         queue: deque[tuple[str, str]] = deque()
@@ -166,67 +191,53 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
                     queue.append(pair)
 
         # Also include any claims directly linked via claim_evidence to affected evidence
-        for eid in ev_ids:
-            ce_rows = conn.execute(
-                "SELECT claim_id FROM claim_evidence WHERE evidence_id = ?", (eid,)
-            ).fetchall()
-            for cer in ce_rows:
+        new_claims: list[str] = []
+        for chunk in _chunks(ev_ids):
+            for cer in conn.execute(
+                f"SELECT claim_id FROM claim_evidence WHERE evidence_id IN ({_marks(chunk)})", chunk
+            ):
                 cid = str(cer["claim_id"])
                 if cid not in claims_to_remove:
                     claims_to_remove.add(cid)
-                    # Check summaries depending on this claim
-                    s_deps = conn.execute(
-                        "SELECT dependent_id FROM dependencies WHERE input_kind = 'claim' AND input_id = ? AND dependent_kind = 'summary'",
-                        (cid,),
-                    ).fetchall()
-                    for sd in s_deps:
-                        summaries_to_remove.add(str(sd["dependent_id"]))
+                    new_claims.append(cid)
+        for chunk in _chunks(new_claims):
+            for sd in conn.execute(
+                "SELECT dependent_id FROM dependencies WHERE input_kind = 'claim'"
+                f" AND dependent_kind = 'summary' AND input_id IN ({_marks(chunk)})",
+                chunk,
+            ):
+                summaries_to_remove.add(str(sd["dependent_id"]))
+
+        claim_ids = list(claims_to_remove)
+        summary_ids = list(summaries_to_remove)
 
         # Delete FTS search documents for purged versions, claims, and summaries
-        for vid in ver_ids:
-            conn.execute(
-                "DELETE FROM search_documents WHERE record_kind = 'history' AND record_id = ?",
-                (vid,),
-            )
-        for cid in claims_to_remove:
-            conn.execute(
-                "DELETE FROM search_documents WHERE record_kind = 'decision' AND record_id = ?",
-                (cid,),
-            )
-            conn.execute("DELETE FROM relations WHERE from_kind = 'claim' AND from_id = ?", (cid,))
-            conn.execute("DELETE FROM relations WHERE to_kind = 'claim' AND to_id = ?", (cid,))
-            conn.execute("DELETE FROM dependencies WHERE dependent_kind = 'claim' AND dependent_id = ?", (cid,))
-            conn.execute("DELETE FROM dependencies WHERE input_kind = 'claim' AND input_id = ?", (cid,))
-            conn.execute("DELETE FROM claims WHERE id = ?", (cid,))
+        _delete_in(conn, "search_documents", "record_id", ver_ids, "record_kind = 'history'")
+        _delete_in(conn, "search_documents", "record_id", claim_ids, "record_kind = 'decision'")
+        _delete_in(conn, "relations", "from_id", claim_ids, "from_kind = 'claim'")
+        _delete_in(conn, "relations", "to_id", claim_ids, "to_kind = 'claim'")
+        _delete_in(conn, "dependencies", "dependent_id", claim_ids, "dependent_kind = 'claim'")
+        _delete_in(conn, "dependencies", "input_id", claim_ids, "input_kind = 'claim'")
+        _delete_in(conn, "claims", "id", claim_ids)
 
-        for sum_id in summaries_to_remove:
-            conn.execute(
-                "DELETE FROM search_documents WHERE record_kind = 'summary' AND record_id = ?",
-                (sum_id,),
-            )
-            conn.execute("DELETE FROM dependencies WHERE dependent_kind = 'summary' AND dependent_id = ?", (sum_id,))
-            conn.execute("DELETE FROM dependencies WHERE input_kind = 'summary' AND input_id = ?", (sum_id,))
-            conn.execute("DELETE FROM summaries WHERE id = ?", (sum_id,))
+        _delete_in(conn, "search_documents", "record_id", summary_ids, "record_kind = 'summary'")
+        _delete_in(conn, "dependencies", "dependent_id", summary_ids, "dependent_kind = 'summary'")
+        _delete_in(conn, "dependencies", "input_id", summary_ids, "input_kind = 'summary'")
+        _delete_in(conn, "summaries", "id", summary_ids)
 
-        # Delete relations referencing affected evidence or sources BEFORE deleting evidence (foreign key does not cascade)
-        for eid in ev_ids:
-            conn.execute("DELETE FROM relations WHERE evidence_id = ?", (eid,))
-            conn.execute("DELETE FROM relations WHERE from_kind = 'evidence' AND from_id = ?", (eid,))
-            conn.execute("DELETE FROM relations WHERE to_kind = 'evidence' AND to_id = ?", (eid,))
-            conn.execute("DELETE FROM dependencies WHERE input_kind = 'evidence' AND input_id = ?", (eid,))
-            conn.execute("DELETE FROM evidence WHERE id = ?", (eid,))
+        # Relations reference evidence without cascading, so they go before the evidence rows
+        _delete_in(conn, "relations", "evidence_id", ev_ids)
+        _delete_in(conn, "relations", "from_id", ev_ids, "from_kind = 'evidence'")
+        _delete_in(conn, "relations", "to_id", ev_ids, "to_kind = 'evidence'")
+        _delete_in(conn, "dependencies", "input_id", ev_ids, "input_kind = 'evidence'")
+        _delete_in(conn, "evidence", "id", ev_ids)
 
-        for vid in ver_ids:
-            conn.execute(
-                "DELETE FROM dependencies WHERE input_kind = 'source_version' AND input_id = ?",
-                (vid,),
-            )
+        _delete_in(conn, "dependencies", "input_id", ver_ids, "input_kind = 'source_version'")
 
-        # Reset or remove episodes referencing affected sources
+        _delete_in(conn, "relations", "from_id", affected_sources, "from_kind = 'source'")
+        _delete_in(conn, "relations", "to_id", affected_sources, "to_kind = 'source'")
+        _delete_in(conn, "coverage_gaps", "record_id", affected_sources)
         for s_id in affected_sources:
-            conn.execute("DELETE FROM relations WHERE from_kind = 'source' AND from_id = ?", (s_id,))
-            conn.execute("DELETE FROM relations WHERE to_kind = 'source' AND to_id = ?", (s_id,))
-            conn.execute("DELETE FROM coverage_gaps WHERE record_id = ?", (s_id,))
             ep_rows = conn.execute(
                 "SELECT id FROM episodes WHERE primary_source_id = ?", (s_id,)
             ).fetchall()
@@ -236,6 +247,7 @@ def execute_purge(store: Store, request: PurgeRequest) -> PurgeReport:
                 conn.execute("DELETE FROM claims WHERE episode_id = ?", (epid,))
                 conn.execute("DELETE FROM episodes WHERE id = ?", (epid,))
 
+        for s_id in affected_sources:
             # Leave only a non-content source tombstone (`availability='redacted'`, `current_version_id=NULL`)
             conn.execute(
                 "UPDATE sources SET current_version_id = NULL, availability = 'redacted', last_seen_at_us = ? WHERE id = ?",
