@@ -186,6 +186,40 @@ def test_variable_length_query_respects_time_limit(tmp_path: Path, monkeypatch: 
         assert exc_info.value.message == "Graph query exceeded its time limit"
 
 
+def test_search_graph_regex_respects_time_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from codecontext import store as store_module
+
+    with _many_inits_memory(tmp_path) as mem:
+        assert mem.search_graph(SearchGraphRequest(name_pattern="load")).total_matched == 7
+        monkeypatch.setattr(graph, "GRAPH_TOOL_MAX_SECONDS", 0.0)
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.search_graph(SearchGraphRequest(name_pattern="load"))
+        assert exc_info.value.message == "Graph query exceeded its time limit"
+
+        # Let the connection open past the deadline so the SQL itself is what gets interrupted.
+        monkeypatch.setattr(store_module, "check_deadline", lambda: None)
+        monkeypatch.setattr(store_module, "remaining_timeout", lambda limit: limit)
+        with pytest.raises(CodeContextError) as exc_info:
+            mem.search_graph(SearchGraphRequest(name_pattern="load"))
+        assert exc_info.value.code == "INVALID_REQUEST"
+        assert exc_info.value.message == "Graph query exceeded its time limit"
+        assert "interrupted" in str(exc_info.value.__cause__.__cause__)
+
+
+def test_detect_changes_has_its_own_longer_limit() -> None:
+    assert graph.DETECT_CHANGES_MAX_SECONDS == 60.0
+    seen: list[float] = []
+
+    @graph._time_limited(lambda: graph.DETECT_CHANGES_MAX_SECONDS)
+    def probe() -> None:
+        from codecontext.deadline import remaining_timeout
+
+        seen.append(remaining_timeout(1000.0))
+
+    probe()
+    assert 10.0 < seen[0] <= 60.0
+
+
 def test_graph_time_limit_keeps_tighter_outer_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     from codecontext.deadline import check_deadline, sync_deadline
 

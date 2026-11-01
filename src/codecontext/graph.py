@@ -3,6 +3,7 @@ import itertools
 import os
 import posixpath
 import re
+import sqlite3
 import stat
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -14,6 +15,7 @@ from pydantic import Field
 from codecontext.deadline import (
     SyncDeadlineExceeded,
     check_deadline,
+    expired,
     remaining_timeout,
     sync_deadline,
 )
@@ -210,25 +212,40 @@ def _kind_to_label(sym_kind: str) -> str:
 
 
 GRAPH_TOOL_MAX_SECONDS = 10.0
+# Diffs up to a thousand files through git, which needs more room than an in-memory graph walk.
+DETECT_CHANGES_MAX_SECONDS = 60.0
 DEADLINE_CHECK_EVERY = 256
 
 
-def _bounded_by_graph_time_limit[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
-    """Run a graph tool under `GRAPH_TOOL_MAX_SECONDS`, keeping any tighter outer deadline."""
+def _time_limited[**P, R](limit_seconds: Callable[[], float]) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Run a graph tool under `limit_seconds()`, keeping any tighter outer deadline."""
 
-    @functools.wraps(fn)
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        try:
-            with sync_deadline(remaining_timeout(GRAPH_TOOL_MAX_SECONDS)):
-                return fn(*args, **kwargs)
-        except SyncDeadlineExceeded as exc:
-            raise CodeContextError(
-                code="INVALID_REQUEST",
-                message="Graph query exceeded its time limit",
-                retryable=False,
-            ) from exc
+    def decorate(fn: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                with sync_deadline(remaining_timeout(limit_seconds())):
+                    try:
+                        return fn(*args, **kwargs)
+                    except sqlite3.OperationalError as exc:
+                        # Store connections abort statements through a progress handler once
+                        # the deadline passes; that surfaces here as "interrupted".
+                        if expired():
+                            raise SyncDeadlineExceeded from exc
+                        raise
+            except SyncDeadlineExceeded as exc:
+                raise CodeContextError(
+                    code="INVALID_REQUEST",
+                    message="Graph query exceeded its time limit",
+                    retryable=False,
+                ) from exc
 
-    return wrapper
+        return wrapper
+
+    return decorate
+
+
+_bounded_by_graph_time_limit = _time_limited(lambda: GRAPH_TOOL_MAX_SECONDS)
 
 
 UNSAFE_REGEX_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=|\(\?<=|\(\?<!|\(\?=|\(\?!")
@@ -1498,7 +1515,7 @@ def _classify_symbol_changes(
     return out
 
 
-@_bounded_by_graph_time_limit
+@_time_limited(lambda: DETECT_CHANGES_MAX_SECONDS)
 def execute_detect_changes(
     store: Store,
     mirror: GitMirror,
