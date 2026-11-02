@@ -1,141 +1,111 @@
 # CodeContext
 
-Local project memory for coding agents. CodeContext preserves a repository's code, Git history, GitHub issues and pull request discussions, and documented decisions, then gives coding agents fast, cited access to the evidence relevant to their task.
+[![CI](https://github.com/iVamsi/codecontext/actions/workflows/ci.yml/badge.svg)](https://github.com/iVamsi/codecontext/actions/workflows/ci.yml)
 
-## Features and scope
+CodeContext is local project memory for coding agents. It stores a repository's code, Git history, and GitHub or GitLab discussions on your machine, then answers questions with citations. You can use the `codecontext` command, the `codecontext` Python package, or a Model Context Protocol (MCP) server.
 
-- **Three surfaces over one library:** Python SDK (`codecontext.Memory`), CLI (`codecontext` / `python -m codecontext`), and a read-only stdio MCP server with evidence tools, graph tools, repository discovery, and a `codecontext://status` resource. Supports `--auto-sync`, `--allow-sync`, and `--allow-enrich`.
-- **Blob-owned syntax extraction (21 AST languages + Gradle DSL):** Tree-sitter syntax extraction for Python, JavaScript, TypeScript, JSX, TSX, Kotlin, Gradle Kotlin/Groovy DSL, Java, Go, Rust, C, C++, C#, Ruby, PHP, Bash/Shell, Swift, Scala, SQL, Protobuf, and GraphQL. Unchanged blobs are parsed once per `(blob_oid, language, extractor_fingerprint)` rather than duplicated across commits.
-- **Structural code graph & architecture metrics:** Import- and receiver-type-aware candidate call resolution, exposed through `search_graph`, `trace_path`, `query_graph`, `get_architecture`, `detect_changes`, and `get_code_snippet`. Includes Louvain community clustering, Tarjan SCC cycle detection, module cohesion, and coupling metrics. `query_graph` supports a constrained, read-only Cypher subset.
-- **SCIP Protobuf Import:** Ingest industry-standard SCIP index files (`import-scip`) to enrich the code graph with compiler-precise definitions, references, and hover documentation.
-- **Architecture & ADR Ingestion:** Automatically ingests Architecture Decision Records (ADRs) and markdown documents from `docs/` and `architecture/` into structured evidence.
-- **GitHub & GitLab parity:** Automatic remote detection and full ingestion for both GitHub (Issues, PRs, Reviews, GraphQL backfill) and GitLab (Issues, Merge Requests, Discussions).
-- **Zero-dependency LLM & Vector Embedding Adapters:** Built-in adapters for OpenAI-compatible, Anthropic, Google Gemini, and Ollama services, supporting budgeted claim extraction and hybrid lexical/vector semantic search.
-- **Owned Git and SQLite/FTS5 store (v2 Schema):** Preserves raw Git objects in an owned bare repository (`repository.git/`) and metadata, source versions, claims, summaries, 15 high-performance indexes, and lexical/vector indexes in `memory.sqlite3`.
-- **Conservative rationale and applicability tracking:** Keeps `support`, `lifecycle`, `mapping`, and `applicability` independent. Historical rationale defaults to `historical_only` and is never upgraded to `corroborated` merely because code bytes are unchanged.
-- **Read-only query guarantee:** `search`, `get`, `context`, and `status` never contact remote providers, invoke a model, run a parser, run migrations, or perform durable writes.
-- **Workspace divergence detection:** Compares the prepared memory snapshot against the developer's workspace `HEAD`, staging index, and bounded working file bytes without executing Git hooks, `fsmonitor`, or clean/smudge filters.
-- **Uncommitted tracked code:** `sync` with the default `HEAD` revision captures tracked working files, including staged additions and deletions, in a synthetic revision inside the owned store. It never changes your checkout, index, or branch. Untracked file inclusion is optionally supported with `--include-untracked`.
+## Requirements
 
-## Requirements and installation
+- Linux or macOS (CI runs on both)
+- Python 3.12 or 3.13
+- Git 2.43 or newer
+- Python's SQLite with full-text search (FTS5) and JSON functions (CPython includes both)
 
-- **Operating systems:** Linux and macOS (Windows support is deferred).
-- **Python:** 3.12 or 3.13.
-- **Git:** `>= 2.43` with SQLite FTS5 and JSON extensions enabled.
-
-Install and verify with `uv`:
+## Install
 
 ```bash
-uv sync --frozen
-uv run pytest -q
-uv run ruff check src tests examples evals
+uv tool install git+https://github.com/iVamsi/codecontext
 ```
+
+To work on this repository:
+
+```bash
+git clone https://github.com/iVamsi/codecontext
+cd codecontext
+uv sync --frozen
+uv run ruff check src tests examples evals
+uv run pytest tests/unit tests/integration -q
+```
+
+CI runs that lint, those tests, and `uv build` on Ubuntu and macOS for Python 3.12 and 3.13. It runs on every push to `main` and every pull request.
 
 ## Quickstart
 
-### 1. Initialize and synchronize a store
+Keep the store outside the repository you index. `sync` reads a GitHub token from `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or a GitHub MCP config. It reads a GitLab token from `GITLAB_TOKEN`, `GLAB_TOKEN`, `glab`, or a GitLab MCP config on the same host. Pass tokens through those sources. CodeContext keeps them out of the store, logs, and exports.
 
 ```bash
-# Initialize a store outside the indexed repository checkout
-codecontext --store /abs/path/to/store init \
-  --repo /abs/path/to/project \
+codecontext --store /path/to/store init \
+  --repo /path/to/project \
   --github owner/repo
 
-# Focus-first synchronization for immediate use on a file/line
-codecontext --store /abs/path/to/store sync \
-  --path src/retry.py --line 18 \
-  --max-requests 100 --max-seconds 120
-
-# Optional budgeted model enrichment with a built-in provider.
-# The key comes from the environment; --model is required.
-export ANTHROPIC_API_KEY=...
-codecontext --store /abs/path/to/store enrich \
-  --provider anthropic --model YOUR_MODEL --concurrency 4 \
-  --max-input-tokens 100000 \
-  --max-output-tokens 20000 \
-  --max-calls 10
+codecontext --store /path/to/store sync
+codecontext --store /path/to/store search "retry"
+codecontext --store /path/to/store context \
+  "Why is the retry count limited?" \
+  --path src/retry.py --line 18
 ```
 
-`enrich` takes either `--provider` (`openai`, `anthropic`, `gemini`, `ollama`) with `--model`, or your own adapter with `--adapter MODULE:FACTORY`. There is no default model. `--concurrency` runs up to 16 model calls at once; it defaults to 4 with `--provider` and 1 with `--adapter`.
+`sync` indexes the revision you name (`HEAD` by default), including tracked files that differ from that commit. Your checkout stays as it is. `--include-untracked` adds untracked files. `--offline` skips the remote. `--use-graphql` backfills GitHub history in bulk.
 
-Keys and endpoints come only from environment variables:
-
-| Provider | Key | Endpoint override |
-| --- | --- | --- |
-| `openai` | `OPENAI_API_KEY` (optional for localhost) | `OPENAI_BASE_URL` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
-| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | none |
-| `ollama` | none | `OLLAMA_HOST` |
-
-To turn on hybrid vector search, add `--embedding-provider` (`openai`, `gemini`, `ollama`) and `--embedding-model` to `enrich` to store embeddings, and pass the same pair to `search` or `serve`.
-
-### 2. Query from CLI or Python SDK
-
-```bash
-codecontext --store /abs/path/to/store search "retry" --kind code
-codecontext --store /abs/path/to/store context "Why is retry count limited?" \
-  --path src/retry.py --line 18 \
-  --workspace /abs/path/to/project
-codecontext --store /abs/path/to/store status
-```
+The Python API matches these commands. `Memory.open(store, read_only=True)` is the query path:
 
 ```python
 from pathlib import Path
-from codecontext import ContextRequest, InitRequest, Memory, SyncRequest
+from codecontext import ContextRequest, Memory
 
-store_path = Path("/abs/path/to/store")
-repo_path = Path("/abs/path/to/project")
-
-with Memory.initialize(store_path, InitRequest(repo_path=repo_path)) as memory:
-    memory.sync(SyncRequest(revision="HEAD", offline=True))
-
-with Memory.open(store_path, read_only=True) as memory:
-    memory.configure_workspace(repo_path)
+with Memory.open(Path("/path/to/store"), read_only=True) as memory:
+    memory.configure_workspace(Path("/path/to/project"))
     pack = memory.context(
         ContextRequest(
             query="Explain the constraints behind the retry limit.",
             target={"kind": "path", "path": "src/retry.py", "line": 18},
         )
     )
-    print(pack.model_dump_json(indent=2))
 ```
 
-### 3. Configure MCP for coding agents
+## MCP server
 
-Add the server definition (see [`examples/mcp-config.json`](examples/mcp-config.json)) to your MCP host configuration:
+Add the server to your agent host. [`examples/mcp-config.json`](examples/mcp-config.json) is a full sample, and [`examples/agent-instructions.md`](examples/agent-instructions.md) is guidance you can give the agent.
 
 ```json
 {
-  "command": "/absolute/path/to/environment/bin/codecontext",
-  "args": [
-    "--store",
-    "/absolute/path/to/project-memory",
-    "serve",
-    "--workspace",
-    "/absolute/path/to/project"
-  ]
+  "command": "codecontext",
+  "args": ["--store", "/path/to/store", "serve", "--workspace", "/path/to/project"]
 }
 ```
 
-Add the guidance snippet in [`examples/agent-instructions.md`](examples/agent-instructions.md) to your project's agent instructions.
+`serve` reads the local store. `search`, `get`, `context`, `status`, and the graph tools do that read and nothing else: no remote calls, no model calls, and no parser runs. `--auto-init` creates a missing `.codecontext` store. `--allow-sync` exposes `sync`. `--allow-enrich` exposes `enrich`. Graph tools stay on unless you pass `--no-include-graph-tools`.
 
-Use `list_repositories` to discover configured roots and initialized submodules. Pass a returned absolute path in the optional `repository` argument of any query tool to select that store. With an explicit `--store` or `--workspace`, routing is limited to that repository and its initialized submodules. A globally launched server also accepts verified MCP client roots. Each repository has its own index, and submodule calls stay within their selected repository. Existing stores refresh with `sync`.
+`list_repositories` returns configured roots and initialized submodules. Pass one of those paths as `repository` on any query tool.
 
-The server is read-only by default. If a repository or submodule has no `.codecontext` store, its tools return `STORE_NOT_INITIALIZED` and nothing is written. Run `codecontext init` first, or pass `serve --auto-init` to have the server create and sync missing stores. Startup errors go to stderr, because stdout carries the MCP protocol.
+## Index
 
-`serve --allow-sync` exposes a `sync` tool. `serve --allow-enrich` exposes an `enrich` tool and needs the same `--provider`/`--model` or `--adapter` flags as the `enrich` command.
+Tree-sitter grammars ship for Python, JavaScript (including JSX), TypeScript, TSX, Kotlin (including `.kts`), Java, Go, Rust, C, and C++. C#, Ruby, PHP, shell, Swift, Scala, SQL, Protobuf, GraphQL, and Gradle Groovy use a structural extractor.
 
-Graph tools are enabled by default. `--include-graph-tools` remains accepted; use `--no-include-graph-tools` for only the evidence and repository-discovery tools.
+Graph tools search symbols (`search_graph`), trace calls (`trace_path`), run a bounded read-only subset of Cypher (`query_graph`), summarize modules (`get_architecture`), trace the callers of a change (`detect_changes`), and return source (`get_code_snippet`). `import-scip` loads a SCIP index (Sourcegraph's code-intelligence format) when you want compiler-precise references.
 
-## Export, privacy, and purge
+`sync` also reads Architecture Decision Records and design docs: `ARCHITECTURE.md`, `DESIGN.md`, `DECISIONS.md`, and Markdown under `adr/`, `docs/adr/`, `decisions/`, and `docs/architecture/`. `--no-ingest-docs` skips that.
 
-- **Untrusted source content:** Repository code and discussions are treated strictly as untrusted data. CodeContext never executes repository hooks, `fsmonitor`, filters, or instructions embedded in comments.
-- **Credentials and principal binding:** Tokens are never accepted as command-line flags. `GITHUB_TOKEN` (GitHub) and `GITLAB_TOKEN` (GitLab) are read from the environment during online `sync` only, and model API keys only when a built-in provider is called. None are written to `store.json`, `memory.sqlite3`, logs, model prompts, error messages, or exports. Private repository evidence is bound to the verified GitHub user principal ID.
-- **Portable export (`export`):** Scrubs machine-specific paths and principal bindings using `secure_delete=ON` and `VACUUM`, producing a read-only archive with `manifest.json` and `OVERVIEW.md`. Full exports include retained Git history and any tracked workspace content captured by earlier syncs, including private code or secrets in those files.
-- **Team share (`publish` / `join`):** `publish --to DIR` writes that same scrubbed snapshot plus `team.json` (origin identity, generation, and publish time). Teammates run `join --from DIR --repo PATH` into their own store, including `<repo>/.codecontext`. Join succeeds only when `origin` is the same project (HTTPS and SSH match). Pass `--merge` to perform a non-destructive union merge that incorporates remote claims, summaries, and Git objects without overwriting local progress. Tokens and machine paths stay out of the share; private Git content does not.
-- **Purge (`purge --source-id ID` or `purge --entire-store`):** Removes a discussion source and its entire reverse-dependency closure (versions, evidence, claims, summaries, and FTS documents) or deletes the entire owned store after validating the ownership marker. Copies exported prior to a purge cannot be recalled.
+`enrich` extracts claims with a budget. Pass `--provider` (`openai`, `anthropic`, `gemini`, or `ollama`) and `--model`, or `--adapter MODULE:FACTORY`. There is no default model. Keys come from `OPENAI_API_KEY` (optional for a localhost endpoint), `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` / `GOOGLE_API_KEY`. Ollama needs no key. Override endpoints with `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, or `OLLAMA_HOST`.
 
-## Known limitations
+For hybrid lexical and vector search, pass the same `--embedding-provider` (`openai`, `gemini`, or `ollama`) and `--embedding-model` to `enrich`, then to `search` or `serve`.
 
-- One active prepared snapshot is maintained per store (`REVISION_NOT_PREPARED` is returned when querying another branch until `sync --revision REF` is run).
-- Unavailable Git objects, shallow history boundaries, and unobserved prior comment edits cannot be reconstructed; they are surfaced explicitly in `coverage` and `gaps`.
+## Share or delete a store
+
+`export --destination DIR` writes a portable archive and strips machine paths and account bindings. A full export still contains the Git history that was synced.
+
+`publish --to DIR` writes that snapshot for teammates. `join --from DIR --repo PATH` copies it into a personal store when the checkout's origin is the same project. `--merge` unions the shared claims, summaries, and Git objects into the local store.
+
+`purge --source-id ID` removes one discussion and the records that depend on it. `purge --entire-store` deletes the store after the ownership check.
+
+Report security issues through [GitHub Security Advisories](https://github.com/iVamsi/codecontext/security/advisories/new). Details are in [SECURITY.md](SECURITY.md).
+
+## Limits
+
+Each store keeps one prepared snapshot. Another branch returns `REVISION_NOT_PREPARED` until you run `sync --revision REF`.
+
+Missing Git objects, a shallow clone, and comment edits that were never fetched stay listed as coverage gaps.
+
+## License
+
+[MIT](LICENSE)
