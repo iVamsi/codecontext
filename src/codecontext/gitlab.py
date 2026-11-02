@@ -131,6 +131,23 @@ def parse_gitlab_remote_url(raw_url: str) -> tuple[str, str] | None:
     return None
 
 
+# glab reads these before its per-host config, so passing them through would let it hand an
+# env token (or a GITLAB_HOST redirect) to whatever host the remote names.
+_GLAB_ENV_OVERRIDES = frozenset(
+    {
+        "GITLAB_TOKEN",
+        "GITLAB_ACCESS_TOKEN",
+        "OAUTH_TOKEN",
+        "GLAB_TOKEN",
+        "CI_JOB_TOKEN",
+        "GLAB_ENABLE_CI_AUTOLOGIN",
+        "GITLAB_HOST",
+        "GITLAB_URI",
+        "GL_HOST",
+    }
+)
+
+
 def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
     """Resolve a GitLab token for this exact host.
 
@@ -157,6 +174,7 @@ def resolve_gitlab_token(base_url: str = "https://gitlab.com") -> str | None:
                 text=True,
                 timeout=remaining_timeout(3),
                 check=False,
+                env={k: v for k, v in os.environ.items() if k not in _GLAB_ENV_OVERRIDES},
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 return proc.stdout.strip()

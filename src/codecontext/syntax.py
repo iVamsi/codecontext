@@ -25,6 +25,7 @@ from tree_sitter import Language, Node, Parser, Query
 from codecontext.deadline import SyncDeadlineExceeded, check_deadline
 from codecontext.git import GitMirror
 from codecontext.identity import (
+    LineByteIndex,
     byte_span_to_lines,
     canonical_json,
     make_extraction_id,
@@ -441,6 +442,7 @@ def _parse_structural_fallback(
     symbols: list[ExtractedSymbol] = []
     occurrences: list[ExtractedOccurrence] = []
     relations: list[CandidateRelation] = []
+    line_index = LineByteIndex(blob_bytes)
 
     def add_sym(
         name: str,
@@ -454,7 +456,7 @@ def _parse_structural_fallback(
         body_end: int | None = None,
     ) -> ExtractedSymbol:
         qname = qual_name or name
-        l_start, l_end = byte_span_to_lines(blob_bytes, byte_start, byte_end)
+        l_start, l_end = byte_span_to_lines(blob_bytes, byte_start, byte_end, line_index=line_index)
         if l_start is None or l_end is None:
             l_start, l_end = 1, 1
         sid = make_sym_id(
@@ -519,8 +521,10 @@ def _parse_structural_fallback(
             )
         )
 
+    # Blobs are repository-author text up to 2 MiB and a running regex ignores the deadline, so
+    # these patterns use possessive or bounded runs and [ \t] under MULTILINE to stay linear.
     if language == "c_sharp":
-        for m in re.finditer(r"\b(?:public|private|protected|internal|static|abstract|sealed|\s)*\b(class|interface|struct|enum|record)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s*:\s*([^{]+))?\s*\{", text):
+        for m in re.finditer(r"\b(?:public|private|protected|internal|static|abstract|sealed|\s++){0,16}\b(class|interface|struct|enum|record)\s++([A-Za-z_]\w*+)(?:<[^>]{1,512}+>)?(?:\s*+:\s*+([^{]{0,512}+))?\s*+\{", text):
             skind = "interface" if m.group(1) == "interface" else ("enum" if m.group(1) == "enum" else ("struct" if m.group(1) == "struct" else "class"))
             c_name = m.group(2)
             c_sym = add_sym(c_name, skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
@@ -529,38 +533,38 @@ def _parse_structural_fallback(
                     b_clean = b_cand.strip().split("<")[0]
                     if b_clean:
                         add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": b_clean})
-        for m in re.finditer(r"\b(?:public|private|protected|internal|static|async|virtual|override|abstract|\s)+\b([A-Za-z0-9_<>[\]?]+)\s+([A-Z]\w*)\s*\(([^)]*)\)\s*\{", text):
+        for m in re.finditer(r"\b(?:public|private|protected|internal|static|async|virtual|override|abstract|\s++){1,16}\b([A-Za-z0-9_<>[\]?]{1,256}+)\s++([A-Z]\w*+)\s*+\(([^)]{0,512}+)\)\s*+\{", text):
             fn_name = m.group(2)
             add_sym(fn_name, "method", m.start(), m.end(), sig=m.group(0).strip(" {"))
 
     elif language == "ruby":
-        for m in re.finditer(r"^\s*class\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s*<\s*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*))?", text, re.MULTILINE):
+        for m in re.finditer(r"^[ \t]*class[ \t]+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:[ \t]*<[ \t]*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*))?", text, re.MULTILINE):
             c_name = m.group(1)
             c_sym = add_sym(c_name, "class", m.start(), m.end(), sig=m.group(0).strip())
             if m.group(2):
                 add_occ(c_sym.id, "inherits", m.start(2), m.end(2), {"base_class": m.group(2)})
-        for m in re.finditer(r"^\s*module\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)", text, re.MULTILINE):
+        for m in re.finditer(r"^[ \t]*module[ \t]+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)", text, re.MULTILINE):
             add_sym(m.group(1), "namespace", m.start(), m.end(), sig=m.group(0).strip())
-        for m in re.finditer(r"^\s*def\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)", text, re.MULTILINE):
+        for m in re.finditer(r"^[ \t]*def[ \t]+(?:self\.)?([a-zA-Z_]\w*[?!=]?)", text, re.MULTILINE):
             add_sym(m.group(1), "method", m.start(), m.end(), sig=m.group(0).strip())
 
     elif language == "php":
-        for m in re.finditer(r"\b(?:abstract|final|\s)*\b(class|interface|trait|enum)\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z0-9_\\]+))?(?:\s+implements\s+([A-Za-z0-9_\\,\s]+))?\s*\{", text):
+        for m in re.finditer(r"\b(?:abstract|final|\s++){0,16}\b(class|interface|trait|enum)\s++([A-Za-z_]\w*+)(?:\s++extends\s++([A-Za-z0-9_\\]++))?(?:\s++implements\s++([A-Za-z0-9_\\,\s]{1,512}+))?\s*+\{", text):
             skind = "interface" if m.group(1) == "interface" else "class"
             c_name = m.group(2)
             c_sym = add_sym(c_name, skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
             if m.group(3):
                 add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": m.group(3)})
-        for m in re.finditer(r"\b(?:public|private|protected|static|abstract|final|\s)*\bfunction\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", text):
+        for m in re.finditer(r"\b(?:public|private|protected|static|abstract|final|\s++){0,16}\bfunction\s++([A-Za-z_]\w*+)\s*+\(([^)]{0,512}+)\)", text):
             add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
 
     elif language == "bash":
-        for m in re.finditer(r"^\s*(?:function\s+)?([a-zA-Z0-9_.-]+)\s*\(\s*\)\s*\{|^\s*function\s+([a-zA-Z0-9_.-]+)\s*\{", text, re.MULTILINE):
+        for m in re.finditer(r"^[ \t]*(?:function[ \t]+)?([a-zA-Z0-9_.-]+)[ \t]*\([ \t]*\)\s*\{|^[ \t]*function[ \t]+([a-zA-Z0-9_.-]+)\s*\{", text, re.MULTILINE):
             fn_name = m.group(1) or m.group(2)
             add_sym(fn_name, "function", m.start(), m.end(), sig=f"function {fn_name}()")
 
     elif language == "swift":
-        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|final|\s)*\b(class|struct|enum|protocol|actor|extension)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s*:\s*([^{]+))?\s*\{", text):
+        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|final|\s++){0,16}\b(class|struct|enum|protocol|actor|extension)\s++([A-Za-z_]\w*+)(?:<[^>]{1,512}+>)?(?:\s*+:\s*+([^{]{0,512}+))?\s*+\{", text):
             skind = "interface" if m.group(1) == "protocol" else "class"
             c_sym = add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
             if m.group(3):
@@ -568,16 +572,16 @@ def _parse_structural_fallback(
                     clean = b_part.strip().split("<")[0]
                     if clean:
                         add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": clean})
-        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|static|override|\s)*\bfunc\s+([a-zA-Z_]\w*)(?:<[^>]+>)?\s*\(([^)]*)\)", text):
+        for m in re.finditer(r"\b(?:public|private|fileprivate|internal|open|static|override|\s++){0,16}\bfunc\s++([a-zA-Z_]\w*+)(?:<[^>]{1,512}+>)?\s*+\(([^)]{0,512}+)\)", text):
             add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
 
     elif language == "scala":
-        for m in re.finditer(r"\b(?:abstract|sealed|final|\s)*\b(class|object|trait)\s+([A-Za-z_]\w*)(?:<[^>]+>)?(?:\s+extends\s+([A-Za-z0-9_.]+))?(?:\s+with\s+([^{]+))?\s*\{", text):
+        for m in re.finditer(r"\b(?:abstract|sealed|final|\s++){0,16}\b(class|object|trait)\s++([A-Za-z_]\w*+)(?:<[^>]{1,512}+>)?(?:\s++extends\s++([A-Za-z0-9_.]++))?(?:\s++with\s++([^{]{1,512}+))?\s*+\{", text):
             skind = "interface" if m.group(1) == "trait" else "class"
             c_sym = add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
             if m.group(3):
                 add_occ(c_sym.id, "inherits", m.start(3), m.end(3), {"base_class": m.group(3)})
-        for m in re.finditer(r"\bdef\s+([a-zA-Z_]\w*)\s*(?:\[[^\]]+\])?(?:\s*\(([^)]*)\))?", text):
+        for m in re.finditer(r"\bdef\s++([a-zA-Z_]\w*+)\s*+(?:\[[^\]]{1,512}+\])?(?:\s*+\(([^)]{0,512}+)\))?", text):
             add_sym(m.group(1), "function", m.start(), m.end(), sig=m.group(0).strip())
 
     elif language == "sql":
@@ -590,7 +594,7 @@ def _parse_structural_fallback(
         for m in re.finditer(r"\b(message|service|enum)\s+([A-Za-z_]\w*)\s*\{", text):
             skind = "interface" if m.group(1) == "service" else ("enum" if m.group(1) == "enum" else "class")
             add_sym(m.group(2), skind, m.start(), m.end(), sig=m.group(0).strip(" {"))
-        for m in re.finditer(r"\brpc\s+([A-Za-z_]\w*)\s*\(([^)]+)\)\s*returns\s*\(([^)]+)\)", text):
+        for m in re.finditer(r"\brpc\s++([A-Za-z_]\w*+)\s*+\(([^)]{1,512}+)\)\s*+returns\s*+\(([^)]{1,512}+)\)", text):
             add_sym(m.group(1), "method", m.start(), m.end(), sig=m.group(0).strip())
 
     elif language == "graphql":

@@ -23,8 +23,6 @@ from codecontext.models import (
 MAX_MODEL_RESPONSE_BYTES = 8 * 1024 * 1024
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 _OPEN_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n?")
-_CLOSE_FENCE_RE = re.compile(r"\r?\n?[ \t]*```$")
-_INLINE_FENCE_RE = re.compile(r"```(?:json|JSON)?[ \t]*\r?\n?([\s\S]*?)\r?\n?[ \t]*```")
 
 
 def strip_markdown_json_fences(text: str) -> str:
@@ -34,12 +32,17 @@ def strip_markdown_json_fences(text: str) -> str:
         return s
     if s.startswith("```"):
         inner = _OPEN_FENCE_RE.sub("", s, count=1)
-        inner = _CLOSE_FENCE_RE.sub("", inner, count=1)
+        if inner.endswith("```"):
+            inner = inner[:-3]
         return inner.strip()
+    # Plain string scans: provider text can be megabytes, and backtracking regexes go superlinear on it.
     if not (s.startswith("{") or s.startswith("[")) and "```" in s:
-        m = _INLINE_FENCE_RE.search(s)
-        if m is not None:
-            candidate = m.group(1).strip()
+        body_start = s.find("```") + 3
+        if s.startswith(("json", "JSON"), body_start):
+            body_start += 4
+        body_end = s.find("```", body_start)
+        if body_end != -1:
+            candidate = s[body_start:body_end].strip()
             if candidate:
                 return candidate
     return s

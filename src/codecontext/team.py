@@ -34,6 +34,7 @@ from codecontext.store import (
     Store,
     get_all_migrations,
     inspect_local_git_repository,
+    normalize_gitlab_base_url,
     now_us,
 )
 from codecontext.syntax import normalize_search_text
@@ -82,6 +83,10 @@ def project_remote_key(url: str) -> str:
 
 
 def detect_project_remote(repo_path: Path) -> str:
+    return project_remote_key(_origin_url(repo_path))
+
+
+def _origin_url(repo_path: Path) -> str:
     proc = run_safe_git(
         ["config", "--get", "remote.origin.url"],
         cwd=repo_path,
@@ -94,7 +99,7 @@ def detect_project_remote(repo_path: Path) -> str:
             message="The checkout needs a git remote named origin before its memory can be shared.",
             retryable=False,
         )
-    return project_remote_key(url)
+    return url
 
 
 def _read_team(share_dir: Path) -> dict[str, object]:
@@ -282,9 +287,6 @@ def _refuse_symlink(path: Path, message: str) -> None:
         raise CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
 
 
-_ALTERNATES_FILES = ("alternates", "http-alternates")
-
-
 def _invalid_share(message: str) -> CodeContextError:
     return CodeContextError(code="INVALID_REQUEST", message=message, retryable=False)
 
@@ -369,6 +371,7 @@ def _open_share_db(db_path: Path) -> sqlite3.Connection:
 
 
 _LOOSE_OBJECT = re.compile(r"[0-9a-f]{2}/[0-9a-f]{38}(?:[0-9a-f]{24})?")
+_PACK_FILE = re.compile(r"pack/[^/]+\.pack")
 
 
 def _object_file_is_intact(path: Path, rel: str, obj_fmt: str) -> bool:
@@ -399,10 +402,29 @@ def _object_file_is_intact(path: Path, rel: str, obj_fmt: str) -> bool:
     return True
 
 
+def _import_pack(src: Path, dest_file: Path, expected: str, rel: str, git_dir: Path) -> None:
+    """Copy a share pack and index it here, so object IDs come from the pack's content."""
+    # A private subdirectory: git looks for packs only directly under objects/pack.
+    incoming = Path(tempfile.mkdtemp(prefix=".incoming-", dir=dest_file.parent))
+    try:
+        pack = incoming / "share.pack"
+        idx = incoming / "share.idx"
+        _copy_verified(src, pack, expected, rel)
+        proc = run_safe_git(["index-pack", "-o", str(idx), str(pack)], git_dir=git_dir, timeout=300.0, check=False)
+        if proc.returncode != 0:
+            raise _invalid_share(f"Shared memory file {rel} is not a valid git pack.")
+        # Git uses a pack only once its index exists, so the index goes in last.
+        os.replace(pack, dest_file)
+        os.replace(idx, dest_file.with_suffix(".idx"))
+    finally:
+        shutil.rmtree(incoming, ignore_errors=True)
+
+
 def _copy_regular_tree(
     src: Path, dst: Path, files: dict[str, str], rel_prefix: str, obj_fmt: str
 ) -> None:
     _refuse_symlink(src, "Shared snapshot contains a symlink.")
+    in_objects = rel_prefix.endswith("/objects/")
     if not src.is_dir():
         return
     dst.mkdir(parents=True, exist_ok=True)
@@ -420,9 +442,12 @@ def _copy_regular_tree(
             _refuse_symlink(child, "Shared snapshot contains a symlink.")
             if not child.is_file():
                 continue
-            if name in _ALTERNATES_FILES and current.name == "info" and current.parent == dst:
-                continue
             rel_in_tree = child.relative_to(src).as_posix()
+            is_pack_file = in_objects and _PACK_FILE.fullmatch(rel_in_tree) is not None
+            if in_objects and not is_pack_file and not _LOOSE_OBJECT.fullmatch(rel_in_tree):
+                # Only objects whose IDs are checked here are taken. Everything else under objects/
+                # is share-authored metadata git would trust: alternates, pack indexes, commit-graph.
+                continue
             rel = rel_prefix + rel_in_tree
             expected = files.get(rel)
             if expected is None:
@@ -432,13 +457,19 @@ def _copy_regular_tree(
                 dest_file.is_file()
                 and not dest_file.is_symlink()
                 and _object_file_is_intact(dest_file, rel_in_tree, obj_fmt)
+                and (not is_pack_file or dest_file.with_suffix(".idx").is_file())
             ):
+                continue
+            if is_pack_file:
+                _import_pack(child, dest_file, expected, rel, dst.parent)
                 continue
             # Readers never see a half-written object: write beside it, then swap it in.
             fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", dir=current)
             os.close(fd)
             try:
                 _copy_verified(child, Path(tmp_name), expected, rel)
+                if in_objects and not _object_file_is_intact(Path(tmp_name), rel_in_tree, obj_fmt):
+                    raise _invalid_share(f"Shared memory object {rel} does not match its object ID.")
                 os.replace(tmp_name, dest_file)
             except BaseException:
                 Path(tmp_name).unlink(missing_ok=True)
@@ -468,15 +499,16 @@ def _import_share(share_dir: Path, store_path: Path, team: dict[str, object]) ->
         _refuse_symlink(src_git, "Shared snapshot contains a symlink.")
         dest_git = store_path / "repository.git"
         dest_git.mkdir(parents=True, exist_ok=True)
+        # Packs are indexed with git as they arrive, so the git dir must be valid first.
+        (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
         for name in ("HEAD", "packed-refs"):
             src = src_git / name
             if src.exists():
                 _copy_regular_file(src, dest_git / name, files, f"repository.git/{name}")
-        for name in ("objects", "refs"):
+        for name in ("refs", "objects"):
             src = src_git / name
             if src.exists():
                 _copy_regular_tree(src, dest_git / name, files, f"repository.git/{name}/", obj_fmt)
-        (dest_git / "config").write_text(sanitized_bare_git_config(obj_fmt), encoding="utf-8")
     (store_path / "tmp").mkdir(parents=True, exist_ok=True)
 
 
@@ -536,15 +568,66 @@ def _db_file_stamps(store_path: Path) -> tuple[tuple[int, int] | None, ...]:
     return tuple(stamps)
 
 
-def _rebind(store_path: Path, repo_path: Path, *, floor_generation: int = 0) -> None:
+def _https_port(port: int | None) -> int | None:
+    return None if port == 443 else port
+
+
+def _bind_providers_to_origin(raw: dict, origin_url: str) -> None:
+    """Tie share-authored provider fields to this checkout's origin and drop the issue allowlist.
+
+    Sync calls these providers with the joiner's token, so the share must not pick the repository.
+    """
+    origin_key = project_remote_key(origin_url)
+    origin_hostport, _, origin_path = origin_key.partition("/")
+    origin = f"{origin_hostport.split(':')[0]}/{origin_path}".lower()
+    github = raw.get("github_repository")
+    if github:
+        if f"github.com/{github}".lower() != origin:
+            raise _invalid_share("Shared memory names a different GitHub repository than this checkout's origin.")
+        raw["github_repository"] = origin_path
+    gitlab = raw.get("gitlab_repository")
+    if gitlab or raw.get("gitlab_base_url"):
+        base = urllib.parse.urlparse(normalize_gitlab_base_url(raw.get("gitlab_base_url") or "https://gitlab.com"))
+        host = (base.hostname or "").lower().rstrip(".")
+        try:
+            port = base.port
+        except ValueError as exc:
+            raise _invalid_share("Shared memory has a malformed GitLab base URL.") from exc
+        port = _https_port(port)
+        # An https origin pins the web port. An ssh origin's port is the ssh port, so any https port goes.
+        port_ok = True
+        if origin_url.strip().lower().startswith("https://"):
+            origin_port = urllib.parse.urlparse(origin_url.strip()).port
+            port_ok = port == _https_port(origin_port)
+        if (
+            not gitlab
+            or f"{host}/{gitlab}".lower() != origin
+            or not port_ok
+            or base.path
+            or base.username
+            or base.query
+            or base.fragment
+        ):
+            raise _invalid_share("Shared memory names a different GitLab project than this checkout's origin.")
+        raw["gitlab_base_url"] = f"https://{host}" + (f":{port}" if port else "")
+        raw["gitlab_repository"] = origin_path
+    raw["allowed_issue_repositories"] = []
+
+
+def _rebind(
+    store_path: Path, repo_path: Path, *, floor_generation: int = 0, share_origin_url: str | None = None
+) -> None:
     """Point the store at `repo_path` and move its generation past `floor_generation`.
 
     Graph and ancestor caches are keyed by path, revision and generation, so a database swapped
-    in at a path must not reuse its predecessor's generation.
+    in at a path must not reuse its predecessor's generation. Pass `share_origin_url` when
+    store.json was just copied from a share.
     """
     resolved_repo, common_real, st_dev, st_ino, _obj_fmt = inspect_local_git_repository(repo_path)
     store_json_path = store_path / "store.json"
     raw = json.loads(store_json_path.read_text(encoding="utf-8"))
+    if share_origin_url is not None:
+        _bind_providers_to_origin(raw, share_origin_url)
     raw["read_only_archive"] = False
     raw["repo_path"] = str(resolved_repo)
     tmp_json = store_json_path.with_name(".store.json.tmp")
@@ -580,7 +663,8 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
         )
     share = raw_share.resolve()
     team = _read_team(share)
-    remote_key = detect_project_remote(repo_path)
+    origin_url = _origin_url(repo_path)
+    remote_key = project_remote_key(origin_url)
     if team["project_remote"] != remote_key:
         raise CodeContextError(
             code="REPOSITORY_MISMATCH",
@@ -646,7 +730,7 @@ def execute_join(store_path: Path, share_dir: Path, repo_path: Path) -> None:
     staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}.joining-", dir=dest.parent))
     try:
         _import_share(share, staging, team)
-        _rebind(staging, repo_path, floor_generation=local_gen or 0)
+        _rebind(staging, repo_path, floor_generation=local_gen or 0, share_origin_url=origin_url)
         _ensure_checkout_ignore(staging, dest, resolved_repo)
         if dest.exists():
             if _dir_is_empty(dest):
@@ -688,11 +772,61 @@ MERGE_TABLE_ORDER: tuple[str, ...] = (
     "syntax_occurrences",
     "episodes",
     "claims",
+    "summaries",
     "claim_evidence",
     "dependencies",
     "relations",
-    "summaries",
 )
+
+# Record kinds a link row can hang off, with the table and key that hold them.
+_RECORD_TABLES: dict[str, tuple[str, str]] = {
+    "sources": ("source", "id"),
+    "evidence": ("evidence", "id"),
+    "commits": ("commit", "oid"),
+    "changes": ("change", "id"),
+    "symbols": ("symbol", "id"),
+    "episodes": ("episode", "id"),
+    "claims": ("claim", "id"),
+    "summaries": ("summary", "id"),
+}
+
+# Link table -> (owner kind, owner id, other end kind, other end id) columns. claim_evidence only
+# links claims, so its kind columns are None.
+_LINK_OWNERS: dict[str, tuple[str | None, str, str | None, str | None]] = {
+    "claim_evidence": (None, "claim_id", None, None),
+    "dependencies": ("dependent_kind", "dependent_id", "input_kind", "input_id"),
+    "relations": ("from_kind", "from_id", "to_kind", "to_id"),
+}
+
+# Links decide whether these records are shown and what backs them, so a share may only link
+# the ones it brought in this merge.
+_DERIVED_KINDS = frozenset({"claim", "summary"})
+
+
+def _new_link_rows(rows: list, cols: list[str], table: str, new_ids: dict[str, set[str]]) -> list:
+    """Link rows a share may add: owned by a claim or summary new from the share, or for other
+    owners (commits, symbols and the like, which the joiner usually has from git) with either end new."""
+    kind_col, id_col, other_kind_col, other_id_col = _LINK_OWNERS[table]
+    try:
+        id_at = cols.index(f'"{id_col}"')
+        kind_at = cols.index(f'"{kind_col}"') if kind_col else None
+        other_id_at = cols.index(f'"{other_id_col}"') if other_id_col else None
+        other_kind_at = cols.index(f'"{other_kind_col}"') if other_kind_col else None
+    except ValueError:
+        return []
+    kept = []
+    for r in rows:
+        kind = "claim" if kind_at is None else r[kind_at]
+        if r[id_at] in new_ids.get(kind, ()):
+            kept.append(r)
+        elif (
+            kind not in _DERIVED_KINDS
+            and other_kind_at is not None
+            and other_id_at is not None
+            and r[other_id_at] in new_ids.get(r[other_kind_at], ())
+        ):
+            kept.append(r)
+    return kept
 
 
 def _merge_columns(local: sqlite3.Connection, share: sqlite3.Connection, table: str) -> list[str]:
@@ -862,6 +996,7 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
                     # symbols reference their parent symbol; rows arrive in arbitrary order.
                     conn.execute("PRAGMA defer_foreign_keys = ON")
                     counts: dict[str, int] = {}
+                    new_ids: dict[str, set[str]] = {}
                     for tbl in MERGE_TABLE_ORDER:
                         cols = _merge_columns(conn, share_conn, tbl)
                         if not cols:
@@ -870,12 +1005,20 @@ def execute_team_merge(store_path: Path, share_dir: Path, repo_path: Path) -> Te
                         placeholders = ", ".join("?" for _ in cols)
                         c_before = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                         rows = share_conn.execute(f"SELECT {col_names} FROM {tbl}").fetchall()
+                        if tbl in _LINK_OWNERS:
+                            rows = _new_link_rows(rows, cols, tbl, new_ids)
+                        max_rowid = conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {tbl}").fetchone()[0]
                         if rows:
                             conn.executemany(
                                 f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})",
                                 rows,
                             )
                         counts[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] - c_before
+                        if tbl in _RECORD_TABLES:
+                            kind, key = _RECORD_TABLES[tbl]
+                            new_ids[kind] = {
+                                r[0] for r in conn.execute(f"SELECT {key} FROM {tbl} WHERE rowid > ?", (max_rowid,))
+                            }
                     _index_merged_records(conn, share_conn)
             except sqlite3.IntegrityError as exc:
                 raise _invalid_share(
