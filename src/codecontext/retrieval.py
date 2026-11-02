@@ -5,7 +5,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -258,7 +258,56 @@ def check_derivation_cutoff_eligible(
     """Check whether all dependencies of a claim or summary satisfy `cutoff_us` and ancestry."""
     if cutoff_us is None and ancestor_commits is None:
         return (True, None)
+    return _derivation_eligible(conn, dependent_kind, dependent_id, cutoff_us, ancestor_commits)
 
+
+_IN_PROGRESS = (False, "dependency_cycle")
+
+_EligibilityResult = tuple[bool, str | None]
+
+
+def _derivation_eligible(
+    conn: sqlite3.Connection,
+    dependent_kind: str,
+    dependent_id: str,
+    cutoff_us: int | None,
+    ancestor_commits: set[str] | frozenset[str] | None,
+) -> _EligibilityResult:
+    # Shared claim graphs can be deep, cyclic, or diamond-shaped. An explicit stack avoids
+    # RecursionError, the memo makes each node cost one visit, and a node met again while still
+    # being checked is a cycle, which fails closed.
+    root = (dependent_kind, dependent_id)
+    memo: dict[tuple[str, str], _EligibilityResult] = {root: _IN_PROGRESS}
+    stack = [(root, _node_eligibility(conn, dependent_kind, dependent_id, cutoff_us, ancestor_commits))]
+    sent: Any = None  # a fresh generator must be started with None
+    while True:
+        key, node = stack[-1]
+        try:
+            child_id = node.send(sent)
+        except StopIteration as done:
+            memo[key] = done.value
+            stack.pop()
+            if not stack:
+                return done.value
+            sent = done.value
+            continue
+        child = ("claim", child_id)
+        if child in memo:
+            sent = memo[child]
+        else:
+            memo[child] = _IN_PROGRESS
+            stack.append((child, _node_eligibility(conn, "claim", child_id, cutoff_us, ancestor_commits)))
+            sent = None
+
+
+def _node_eligibility(
+    conn: sqlite3.Connection,
+    dependent_kind: str,
+    dependent_id: str,
+    cutoff_us: int | None,
+    ancestor_commits: set[str] | frozenset[str] | None,
+) -> Generator[str, _EligibilityResult, _EligibilityResult]:
+    """Check one node. Yields each ready claim input and receives that claim's result."""
     dep_rows = conn.execute(
         "SELECT input_kind, input_id FROM dependencies WHERE dependent_kind = ? AND dependent_id = ?",
         (dependent_kind, dependent_id),
@@ -294,9 +343,7 @@ def check_derivation_cutoff_eligible(
             cl_row = conn.execute("SELECT state FROM claims WHERE id = ?", (in_id,)).fetchone()
             if not cl_row or cl_row["state"] != "ready":
                 return (False, "dependent_claim_not_ready")
-            ok, reason = check_derivation_cutoff_eligible(
-                conn, "claim", in_id, cutoff_us, ancestor_commits
-            )
+            ok, reason = yield in_id
             if not ok:
                 return (False, reason)
 

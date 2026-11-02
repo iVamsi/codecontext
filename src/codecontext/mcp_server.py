@@ -8,6 +8,7 @@ import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 
+import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
@@ -107,6 +108,25 @@ def _with_writable_memory[T](mem: Memory, action: Callable[[Memory], T]) -> T:
     with Memory.open(mem._store.store_path, read_only=False) as rw_mem:
         rw_mem.configure_embedding_adapter(mem._embedding_adapter)
         return action(rw_mem)
+
+
+async def _run_in_thread[T](func: Callable[..., T], /, *args: object) -> T:
+    """Run `func` on a worker thread and finish waiting for it even if this call is cancelled.
+
+    A worker thread cannot be stopped, so returning on cancellation would release the caller's
+    concurrency slot while the work keeps running, letting cancel-and-retry stack up runs.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Shielded because anyio cancel scopes, which the MCP SDK uses, re-deliver cancellation.
+        with anyio.CancelScope(shield=True):
+            await asyncio.wait({task})
+        if not task.cancelled():
+            # Mark a worker error as seen so asyncio does not log it as never retrieved.
+            task.exception()
+        raise
 
 
 def _mtime_ns(path: Path) -> int:
@@ -252,7 +272,7 @@ class _DynamicMemoryHolder:
                         # Only hits are cached, so a later `git init` in a root is seen.
                         git_top = self._toplevel_cache.get(path)
                         if git_top is None:
-                            git_top = await asyncio.to_thread(_find_git_toplevel, path)
+                            git_top = await _run_in_thread(_find_git_toplevel, path)
                             if git_top is None:
                                 continue
                             self._toplevel_cache[path] = git_top
@@ -291,7 +311,7 @@ class _DynamicMemoryHolder:
                 self._submodule_cache[root] = (key, subs)
             return found
 
-        found = await asyncio.to_thread(with_submodules)
+        found = await _run_in_thread(with_submodules)
         if found:
             self._default_root = found[0]
         return found
@@ -347,7 +367,7 @@ class _DynamicMemoryHolder:
 
         async with self._root_locks.setdefault(root, asyncio.Lock()):
             if root not in self._memories:
-                self._memories[root] = await asyncio.to_thread(bootstrap)
+                self._memories[root] = await _run_in_thread(bootstrap)
             return self._memories[root]
 
     def _maybe_trigger_auto_sync(self, root: Path, mem: Memory) -> asyncio.Task[object] | None:
@@ -477,7 +497,7 @@ def create_mcp_server(
         async with semaphore:
             try:
                 mem = await holder.get_memory(ctx, repository)
-                return await asyncio.to_thread(mem.search, request)
+                return await _run_in_thread(mem.search, request)
             except CodeContextError as exc:
                 raise ToolError(exc.to_json(pretty=False)) from exc
             except Exception as exc:
@@ -498,7 +518,7 @@ def create_mcp_server(
         async with semaphore:
             try:
                 mem = await holder.get_memory(ctx, repository)
-                return await asyncio.to_thread(mem.get, request)
+                return await _run_in_thread(mem.get, request)
             except CodeContextError as exc:
                 raise ToolError(exc.to_json(pretty=False)) from exc
             except Exception as exc:
@@ -519,7 +539,7 @@ def create_mcp_server(
         async with semaphore:
             try:
                 mem = await holder.get_memory(ctx, repository)
-                return await asyncio.to_thread(mem.context, request)
+                return await _run_in_thread(mem.context, request)
             except CodeContextError as exc:
                 raise ToolError(exc.to_json(pretty=False)) from exc
             except Exception as exc:
@@ -541,7 +561,7 @@ def create_mcp_server(
         async with semaphore:
             try:
                 mem = await holder.get_memory(None)
-                st: Status = await asyncio.to_thread(mem.status)
+                st: Status = await _run_in_thread(mem.status)
                 return json.dumps(
                     st.model_dump(mode="json"),
                     sort_keys=True,
@@ -568,7 +588,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.search_graph, request)
+                    return await _run_in_thread(mem.search_graph, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -588,7 +608,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.trace_path, request)
+                    return await _run_in_thread(mem.trace_path, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -608,7 +628,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.query_graph, request)
+                    return await _run_in_thread(mem.query_graph, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -632,7 +652,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.get_architecture, request)
+                    return await _run_in_thread(mem.get_architecture, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -656,7 +676,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.detect_changes, request)
+                    return await _run_in_thread(mem.detect_changes, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -680,7 +700,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(mem.get_code_snippet, request)
+                    return await _run_in_thread(mem.get_code_snippet, request)
                 except CodeContextError as exc:
                     raise ToolError(exc.to_json(pretty=False)) from exc
                 except Exception as exc:
@@ -704,7 +724,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(
+                    return await _run_in_thread(
                         _with_writable_memory, mem, lambda rw: rw.sync(request)
                     )
                 except CodeContextError as exc:
@@ -731,7 +751,7 @@ def create_mcp_server(
             async with semaphore:
                 try:
                     mem = await holder.get_memory(ctx, repository)
-                    return await asyncio.to_thread(
+                    return await _run_in_thread(
                         _with_writable_memory,
                         mem,
                         lambda rw: rw.enrich(request, model=model_adapter, concurrency=enrich_concurrency),

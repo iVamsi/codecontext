@@ -44,7 +44,10 @@ RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
 COMMIT_PULLS_RECHECK_US = 24 * 3600 * 1_000_000
 
 LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
-ISSUE_REF_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<num>[1-9]\d*)")
+# The lookbehind stops the repo group restarting at every offset of a long name-like run.
+ISSUE_REF_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_.-])(?P<repo>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}))?#(?P<num>[1-9]\d*)"
+)
 
 
 def parse_link_next(link_header: str | None) -> str | None:

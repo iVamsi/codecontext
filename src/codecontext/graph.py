@@ -1205,6 +1205,7 @@ def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
     on_stack: set[str] = set()
     stack: list[str] = []
     cycles: list[list[str]] = []
+    steps = 0
 
     for root in sorted(adj.keys()):
         if root in indices:
@@ -1216,6 +1217,9 @@ def find_scc_cycles(adj: dict[str, set[str]]) -> list[list[str]]:
         on_stack.add(root)
         work.append((root, iter(sorted(adj.get(root, set())))))
         while work:
+            steps += 1
+            if steps % DEADLINE_CHECK_EVERY == 0:
+                check_deadline()
             v, successors = work[-1]
             descended = False
             for w in successors:
@@ -1281,7 +1285,9 @@ def detect_louvain_communities(
     while improved and passes < 10:
         improved = False
         passes += 1
-        for u in sorted(nodes):
+        for step, u in enumerate(sorted(nodes)):
+            if step % DEADLINE_CHECK_EVERY == 0:
+                check_deadline()
             c_u = community[u]
             k_u = degrees[u]
             neigh_comms: dict[str, float] = {}
@@ -1361,7 +1367,9 @@ def _cluster_files(
         for fs in members:
             file_to_cluster[fs] = cid
 
-    for g in groups:
+    for step, g in enumerate(groups):
+        if step % DEADLINE_CHECK_EVERY == 0:
+            check_deadline()
         rest = [fs for fs in (path_bytes_to_display(fb)[0] for fb in g.files) if fs not in file_to_cluster]
         if not rest:
             continue
@@ -1421,7 +1429,9 @@ def execute_get_architecture(
                 cluster_deps[c_from].add(c_to)
 
     clusters_out: list[ArchitectureCluster] = []
-    for cid, (s_kind, p_disp) in cluster_meta.items():
+    for step, (cid, (s_kind, p_disp)) in enumerate(cluster_meta.items()):
+        if step % DEADLINE_CHECK_EVERY == 0:
+            check_deadline()
         c_nodes = [
             gn
             for fs in cluster_files.get(cid, [])
@@ -1453,11 +1463,17 @@ def execute_get_architecture(
         key=lambda n: (-(n.inbound_degree + n.outbound_degree), -n.line_count, n.id),
     )[:15]
 
-    scc_cycles = find_scc_cycles(cluster_deps)
+    returned_clusters = clusters_out[: request.max_clusters]
+    scc_cycles = find_scc_cycles(cluster_deps)[: request.max_clusters]
+    afferent: dict[str, int] = {}
+    for deps in cluster_deps.values():
+        for dep in deps:
+            afferent[dep] = afferent.get(dep, 0) + 1
     coupling: dict[str, dict[str, float]] = {}
-    for cid in cluster_meta:
+    for cluster in returned_clusters:
+        cid = cluster.id
         ce = float(len(cluster_deps[cid]))
-        ca = float(sum(1 for other, deps in cluster_deps.items() if cid in deps))
+        ca = float(afferent.get(cid, 0))
         instability = round(ce / (ca + ce), 4) if (ca + ce) > 0 else 0.0
         coupling[cid] = {"ca": ca, "ce": ce, "instability": instability}
 
@@ -1468,7 +1484,7 @@ def execute_get_architecture(
         total_symbols=len(nodes),
         total_call_edges=total_call_edges,
         languages=lang_counts,
-        clusters=clusters_out[: request.max_clusters],
+        clusters=returned_clusters,
         hotspots=hotspots,
         cycles=scc_cycles,
         coupling=coupling,

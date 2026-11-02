@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from codecontext.adapters import pack_f32_vector
+from codecontext.deadline import check_deadline
 from codecontext.errors import CodeContextError
 from codecontext.git import GitMirror
 from codecontext.identity import (
@@ -1744,15 +1745,20 @@ def compute_snapshot_groups(
             ):
                 package_roots.add(dir_b)
 
-    sorted_pkg_roots = sorted(package_roots, key=lambda b: (-b.count(b"/"), -len(b), b))
     groups_map: dict[tuple[str, bytes], list[bytes]] = {}
 
-    for p in all_paths:
+    for i, p in enumerate(all_paths):
+        if i % 1024 == 0:
+            check_deadline()
+        # Every root containing p is a proper ancestor directory of p, so walking up from the
+        # deepest parent finds the deepest root without scanning all roots per file.
         matched_pkg: bytes | None = None
-        for pkg_root in sorted_pkg_roots:
-            if p.startswith(pkg_root + b"/"):
-                matched_pkg = pkg_root
+        cut = p.rfind(b"/")
+        while cut > 0:
+            if p[:cut] in package_roots:
+                matched_pkg = p[:cut]
                 break
+            cut = p.rfind(b"/", 0, cut)
         if matched_pkg is not None:
             groups_map.setdefault(("package", matched_pkg), []).append(p)
         elif b"/" in p:

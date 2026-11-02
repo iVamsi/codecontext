@@ -19,7 +19,8 @@ from codecontext.identity import (
 from codecontext.store import Store, now_us
 from codecontext.syntax import MAX_PARSE_BYTES, chunk_utf8_bytes, normalize_search_text
 
-H1_TITLE_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+# [ \t] keeps each try on one line and \S stops the two runs overlapping, so the scan stays linear.
+H1_TITLE_RE = re.compile(r"^[ \t]*#[ \t]+(\S.*)$", re.MULTILINE)
 BACKTICK_TOKEN_RE = re.compile(r"`([A-Za-z0-9_./:-]{2,120})`")
 
 DESIGN_DOC_EXACT_NAMES = {
