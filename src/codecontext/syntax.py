@@ -2613,6 +2613,10 @@ def _import_matches(module: str, imported: str, path: str) -> bool:
     return _module_spec_matches_path(module, path) or _module_spec_matches_path(f"{module}.{imported}", path)
 
 
+def _symbols_excluding_caller(symbols: list[dict[str, Any]], caller_id: str) -> list[dict[str, Any]]:
+    return [c for c in symbols if c["id"] != caller_id]
+
+
 def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
     """Resolve cross-file `calls_candidate` relations using:
     1. Explicit import target matching (`from a import save` binds `save()` ONLY to `a.py`'s `save`, never `b.py`'s `save`)
@@ -2670,7 +2674,16 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
 
     by_name_ext = index_by(lambda c: (c["extraction_id"],))
     by_name_dir = index_by(lambda c: (c["path"].rsplit("/", 1)[0] if "/" in c["path"] else "",))
-    by_name_module = index_by(lambda c: _path_module_keys(c["path"]))
+    path_keys_cache: dict[str, set[str]] = {}
+
+    def module_keys_cached(path: str) -> set[str]:
+        cached = path_keys_cache.get(path)
+        if cached is None:
+            cached = _path_module_keys(path)
+            path_keys_cache[path] = cached
+        return cached
+
+    by_name_module = index_by(lambda c: module_keys_cached(c["path"]))
     by_name_qname = index_by(lambda c: (c["qualified_name"],))
     by_name_qsuffix = index_by(lambda c: _segment_suffixes(c["qualified_name"], "."))
     by_name_parent = index_by(lambda c: (c["parent_symbol_id"],))
@@ -2734,11 +2747,17 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         if not isinstance(callee, str) or callee not in by_name:
             continue
 
-        def others(found: list[dict[str, Any]], enc_id: str = enc_id) -> list[dict[str, Any]]:
-            return [c for c in found if c["id"] != enc_id]
+        extraction_id = enc_info["extraction_id"]
+        same_file_named = by_name_ext.get((callee, extraction_id), [])
+        if not isinstance(receiver, str) or not receiver:
+            # Same-file definitions shadow imports; a bare recursive call cannot resolve cross-file.
+            if _symbols_excluding_caller(same_file_named, enc_id):
+                continue
+            if same_file_named and all(c["id"] == enc_id for c in same_file_named):
+                continue
 
         # A symbol id belongs to one extraction, so the caller's own rows all sit in that bucket.
-        own_rows = by_name_ext.get((callee, enc_info["extraction_id"]), [])
+        own_rows = same_file_named
         candidate_count = len(by_name[callee]) - sum(1 for c in own_rows if c["id"] == enc_id)
         if candidate_count == 0:
             continue
@@ -2746,20 +2765,19 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
         sym_imps, mod_aliases, wildcards = ext_parsed_imports.get(ext_id, ({}, {}, []))
         caller_path = enc_info["path"]
         caller_dir = caller_path.rsplit("/", 1)[0] if "/" in caller_path else ""
-
-        # Constructor-injected fields live in the parent class signature, so both signatures supply receiver types.
-        recv_types: dict[str, str] = {}
         parent_id = enc_info.get("parent_symbol_id")
-        if parent_id and str(parent_id) in sym_meta:
-            parent_info = sym_meta[str(parent_id)]
-            recv_types.update(_extract_receiver_types_from_signature(parent_info["signature"]))
-        recv_types.update(_extract_receiver_types_from_signature(enc_info["signature"]))
-        if isinstance(receiver, str) and "receiver_type" in det:
-            recv_types[re.split(r"[?.!]", receiver)[0]] = det["receiver_type"]
 
         resolved_targets: list[dict[str, Any]] = []
 
         if isinstance(receiver, str) and receiver:
+            # Constructor-injected fields live in the parent class signature, so both signatures supply receiver types.
+            recv_types: dict[str, str] = {}
+            if parent_id and str(parent_id) in sym_meta:
+                parent_info = sym_meta[str(parent_id)]
+                recv_types.update(_extract_receiver_types_from_signature(parent_info["signature"]))
+            recv_types.update(_extract_receiver_types_from_signature(enc_info["signature"]))
+            if "receiver_type" in det:
+                recv_types[re.split(r"[?.!]", receiver)[0]] = det["receiver_type"]
             clean_recv = receiver.replace("this.", "").replace("self.", "").strip()
             chain = re.sub(r"[?!]", "", clean_recv).split(".")
             root_types = ({recv_types[chain[0]]} if chain[0] in recv_types
@@ -2779,49 +2797,52 @@ def _resolve_cross_file_calls_and_imports(conn: sqlite3.Connection) -> None:
                     for owner in by_name.get(type_name.rsplit(".", 1)[-1], []) if owner["kind"] == "class"
                 }
                 resolved_targets = [
-                    c for owner_id in owner_ids for c in others(by_name_parent.get((callee, owner_id), []))
+                    c for owner_id in owner_ids
+                    for c in _symbols_excluding_caller(by_name_parent.get((callee, owner_id), []), enc_id)
                 ]
             # `a.save()` after `import a` or `from pkg import a`.
             if not resolved_targets and clean_recv in mod_aliases:
-                resolved_targets = others(module_matches(callee, mod_aliases[clean_recv]))
+                resolved_targets = _symbols_excluding_caller(module_matches(callee, mod_aliases[clean_recv]), enc_id)
             elif clean_recv in sym_imps:
                 # `Service.run()` where `Service` was imported.
-                resolved_targets = others(
+                resolved_targets = _symbols_excluding_caller(
                     by_name_qname.get((callee, f"{clean_recv}.{callee}"), [])
-                    + module_matches(callee, sym_imps[clean_recv])
+                    + module_matches(callee, sym_imps[clean_recv]),
+                    enc_id,
                 )
             # `api.getUser()` where `api: Api` is a parameter or field.
             if not resolved_targets and len(chain) == 1 and root_types:
                 resolved_targets = [
                     c for t_name in root_types
-                    for c in others(by_name_qsuffix.get((callee, f"{t_name}.{callee}"), []))
+                    for c in _symbols_excluding_caller(by_name_qsuffix.get((callee, f"{t_name}.{callee}"), []), enc_id)
                 ]
             # `self` and `this` can only reach methods of the same class.
             if not resolved_targets and receiver in ("self", "this") and parent_id and str(parent_id) in sym_meta:
                 p_qname = sym_meta[str(parent_id)]["qualified_name"]
-                resolved_targets = others(by_name_qname.get((callee, f"{p_qname}.{callee}"), []))
+                resolved_targets = _symbols_excluding_caller(
+                    by_name_qname.get((callee, f"{p_qname}.{callee}"), []), enc_id
+                )
         else:
-            # A same-file definition shadows imports and is already linked by `lexical_same_blob`.
-            if others(by_name_ext.get((callee, ext_id), [])):
-                continue
-
             # `from a import save` or `import { save } from './a'`.
             if callee in sym_imps:
-                resolved_targets = others(module_matches(callee, sym_imps[callee]))
+                resolved_targets = _symbols_excluding_caller(module_matches(callee, sym_imps[callee]), enc_id)
 
             # `from a import *`.
             if not resolved_targets and wildcards:
-                resolved_targets = [c for w in wildcards for c in others(module_matches(callee, w))]
+                resolved_targets = [
+                    c for w in wildcards
+                    for c in _symbols_excluding_caller(module_matches(callee, w), enc_id)
+                ]
 
             # Code often calls a sibling module without importing it (same Go or Java package).
             if not resolved_targets and caller_dir:
-                same_dir = others(by_name_dir.get((callee, caller_dir), []))
+                same_dir = _symbols_excluding_caller(by_name_dir.get((callee, caller_dir), []), enc_id)
                 if len(same_dir) == 1:
                     resolved_targets = same_dir
 
             # Only a globally unique name is safe; common names like `save` or `run` would create false edges.
             if not resolved_targets and candidate_count == 1:
-                resolved_targets = others(by_name[callee])
+                resolved_targets = _symbols_excluding_caller(by_name[callee], enc_id)
 
         for tgt in resolved_targets:
             rel_id = make_relation_id(
